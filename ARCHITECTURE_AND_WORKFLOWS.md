@@ -91,8 +91,13 @@ own transaction — this is what makes the guarantees atomic.
 
 ``` text
 User
-  id, name, email, password_hash
+  id, name, email, password_hash, created_at
   role            ENUM(STUDENT, FACULTY, ADMIN)
+
+-- All created_at are timestamptz. UNIQUE on users.email, courses.code.
+-- Indexed for the hot paths: gpu_reservations(user_id, status) for the
+-- quota SUM, enrollments(course_offering_id, status) for the roster,
+-- waitlist_entries(course_offering_id, created_at) for promotion.
 
 RoleQuota                      -- admin-editable policy, NOT per-user
   role            ENUM(STUDENT, FACULTY, ADMIN)
@@ -111,24 +116,37 @@ IdempotencyKey                 -- exactly-once
   UNIQUE (key, user_id)
 
 Resource
-  id, type, name, location
+  id, name
+  resource_type   ENUM(GPU, ROOM, COURSE)    -- polymorphic discriminator
   status          ENUM(AVAILABLE, BLOCKED)   -- admin-controlled
 
-Room            id, resource_id → Resource, building, room_number
-GPUCluster      id, resource_id → Resource, gpu_type, gpu_count, allocated
+Room            id → Resource.id, building, capacity
+                CHECK (capacity > 0)
+GPUCluster      id → Resource.id, gpu_count, allocated
+                CHECK (allocated >= 0 AND allocated <= gpu_count)
 
-Course          id, code, name, capacity
-CourseOffering  id, course_id → Course, semester, year,
-                start_time, end_time, days
+-- Joined-table inheritance: rooms.id and gpu_clusters.id ARE resources.id,
+-- not a separate resource_id column.
+-- The original design also had Resource.location, Room.room_number, and
+-- GPUCluster.gpu_type. None are in the models. Cosmetic, so either add them
+-- deliberately or drop them from the design — do not leave the gap open.
+
+Course          id, code, name
+CourseOffering  id, course_id → Course, instructor_id → User,
+                semester, year, start_time, end_time, days,
+                capacity, enrolled_count
 
 Reservation     id, resource_id → Resource, user_id → User,
                 start_time, end_time, status, created_at
 GPUReservation  id, gpu_cluster_id → GPUCluster, user_id → User,
-                gpu_count, start_time, end_time, status
+                gpu_count, status, created_at
+                -- NO start_time/end_time. Hold-until-release; see
+                -- DECISIONS.md. Do not re-add them.
 Enrollment      id, student_id → User, course_offering_id → CourseOffering,
                 status, created_at
 WaitlistEntry   id, student_id → User, course_offering_id → CourseOffering,
-                position, created_at
+                created_at                 -- FIFO order; no stored position
+                UNIQUE (student_id, course_offering_id)
 ```
 
 Note: `RoleQuota` has **no foreign key to User**. It is policy keyed on
@@ -141,6 +159,11 @@ Note: `RoleQuota` has **no foreign key to User**. It is policy keyed on
 ALTER TABLE gpu_clusters
   ADD CONSTRAINT gpu_capacity_sane
   CHECK (allocated >= 0 AND allocated <= gpu_count);
+
+-- same invariant for course seats
+ALTER TABLE course_offerings
+  ADD CONSTRAINT offering_enrollment_sane
+  CHECK (enrolled_count >= 0 AND enrolled_count <= capacity);
 
 -- no duplicate enrollment, ever
 ALTER TABLE enrollments
@@ -316,7 +339,7 @@ GET /api/v1/gpus/1/availability
 POST /api/v1/gpus/1/reservations
 Headers: Authorization: Bearer <JWT>
          Idempotency-Key: 7f3a-...
-Body:    { gpu_count: 2, start_time, end_time }
+Body:    { gpu_count: 2 }        -- no times: hold-until-release
 ```
 
 Server-side sequence:
@@ -392,10 +415,10 @@ POST /api/v1/courses/{id}/register        [STUDENT only → else 403]
       active enrollments = 5, quota 6      ✓ course-load quota
       no schedule overlap with existing    ✓ else 409
     LOCK course_offering row
-      enrolled 49 < capacity 50            ✓ else → waitlist
+      enrolled_count 49 < capacity 50      ✓ else → waitlist
     INSERT enrollment                      ← UNIQUE(student, offering)
                                              blocks duplicates
-    enrolled → 50
+    enrolled_count → 50                    ← same transaction, always
   COMMIT
   → 201
 ```

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Integer, Enum, ForeignKey, DateTime, func
+from sqlalchemy import Integer, Enum, ForeignKey, DateTime, Index, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database.base import Base
@@ -13,6 +13,11 @@ class Reservation(Base):
     the Alembic migration; autogenerate cannot produce it.
     """
     __tablename__ = "reservations"
+    __table_args__ = (
+        # "my reservations". Lookups by (resource_id, time) are already
+        # served by the GiST exclusion index, which is partial to ACTIVE.
+        Index("ix_reservations_user_id", "user_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     resource_id: Mapped[int] = mapped_column(ForeignKey("resources.id"), nullable=False)
@@ -24,7 +29,9 @@ class Reservation(Base):
         nullable=False,
         default=ReservationStatus.ACTIVE,
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
 
 
 class GPUReservation(Base):
@@ -34,6 +41,12 @@ class GPUReservation(Base):
     Quota = SUM(gpu_count) WHERE user_id=? AND status=ACTIVE.
     """
     __tablename__ = "gpu_reservations"
+    __table_args__ = (
+        # THE quota index. This SUM runs inside the hottest transaction
+        # while holding the user lock, so a seq scan here is lock time
+        # every other request from that user waits on.
+        Index("ix_gpu_reservations_user_status", "user_id", "status"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     gpu_cluster_id: Mapped[int] = mapped_column(ForeignKey("gpu_clusters.id"), nullable=False)
@@ -44,4 +57,6 @@ class GPUReservation(Base):
         nullable=False,
         default=ReservationStatus.ACTIVE,
     )
-    created_at: Mapped[datetime] = mapped_column(server_default=func.now(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

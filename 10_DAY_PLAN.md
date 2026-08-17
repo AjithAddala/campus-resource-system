@@ -219,12 +219,16 @@ invariant**. Both of you must be able to say this unprompted.
 ``` text
 A      promotion transaction. The race: two students drop the same
        offering simultaneously, and both promote the SAME waitlist entry.
-       LOCK the offering row -> read lowest-position ACTIVE entry
+       LOCK the offering row -> read oldest entry
+       (ORDER BY created_at, id -- no position column; the id tiebreak
+        is load-bearing, entries written in one transaction share a
+        created_at)
        -> check that student's course-load quota
        -> if it would breach, skip to the next eligible entry
-       -> promote exactly one, renumber positions
+       -> promote exactly one: DELETE its waitlist row, no renumbering
 B      waitlist endpoints: join on full course, leave, GET waitlist
-       FIFO position assignment
+       (position is a display value: ROW_NUMBER() OVER (ORDER BY
+        created_at, id) at read time, never stored)
        BENCHMARK 4 (waitlist): 2 concurrent drops on a course with 3
          waitlisted students
          no offering lock -> same entry promoted twice / seat lost
