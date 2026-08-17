@@ -15,16 +15,52 @@ access, and load testing rather than building a large frontend.
 
 ------------------------------------------------------------------------
 
+> ## Status of this document
+>
+> This is the **original project proposal**. It states the problem, the
+> motivation, and the success criteria, and those are still current.
+>
+> Its schema, API, and plan sections have been **synced to the schema at
+> head** (revision `1ca8b85b7626`) so they cannot be read as instructions
+> to rebuild something that was deliberately removed. Where the built
+> system diverges from the original design, the change is marked inline
+> with **`CHANGED:`** and a pointer to the revision and to `DECISIONS.md`,
+> which carries the reasoning.
+>
+> Three divergences are large enough to state here, because each one is a
+> thing the original design says to build and the current system says not
+> to:
+>
+> 1. **GPU reservations have no `start_time` / `end_time`.** They are
+>    hold-until-release. A scalar `allocated` counter cannot answer an
+>    interval question, and the two do not compose. Do not re-add them.
+> 2. **A third correctness guarantee was added: exactly-once**, keyed on
+>    the request via `UNIQUE(key, user_id)` on `idempotency_keys`. This
+>    document was written when there were two invariants; there are three,
+>    and the global lock order now begins with the idempotency key insert.
+> 3. **Course seats belong to a `CourseOffering`, not a `Course`.**
+>    Capacity, `enrolled_count`, and `instructor_id` all live on the
+>    offering, which is also the row that registration locks.
+>
+> **Precedence when documents disagree:** the models and migrations are
+> the truth; then `DECISIONS.md` (why, and what was reversed); then
+> `ARCHITECTURE_AND_WORKFLOWS.md` (what the system is now); then
+> `DAILY_LOG.md` and `10_DAY_PLAN.md`; then this file.
+
+------------------------------------------------------------------------
+
 ## 1. Project Overview
 
 The Campus Resource Allocation System provides a unified backend for
-three campus resource-management problems, governed by two independent
+three campus resource-management problems, governed by three independent
 classes of allocation rule:
 
 -   **Capacity rules** — a resource cannot be allocated beyond its total
-    capacity.
+    capacity. *Keyed on the resource.*
 -   **Entitlement rules** — a user cannot hold more than their role is
-    permitted (per-role quotas).
+    permitted (per-role quotas). *Keyed on the user.*
+-   **Exactly-once rules** — a retried request must not allocate twice.
+    *Keyed on the request.*
 
 ### Room Reservations
 
@@ -109,9 +145,13 @@ Additional rules include:
 
 This is not primarily a CRUD application.
 
-The central problem is **concurrent resource allocation under two
+The central problem is **concurrent resource allocation under three
 simultaneous invariants**: a capacity invariant keyed on the *resource*,
-and an entitlement (quota) invariant keyed on the *user*.
+an entitlement (quota) invariant keyed on the *user*, and an exactly-once
+invariant keyed on the *request*.
+
+Each is keyed on something different, so guarding one does nothing for
+the others — that is the claim the whole project rests on.
 
 A naïve implementation might do:
 
@@ -223,8 +263,15 @@ only in application code.
 -   **Python**
 -   **FastAPI**
 -   **Pydantic**
--   **SQLAlchemy 2.0**
+-   **SQLAlchemy 2.0 — sync, with psycopg. Not async.**
 -   **Alembic**
+
+**CHANGED — sync, deliberately.** `SELECT ... FOR UPDATE` semantics are
+identical either way, and the only place real concurrency is needed is
+the *test harness*, which is asyncio + httpx on the client side and
+unaffected by a sync server. An async server would buy throughput we are
+not measuring and double the debugging surface on the one thing we are.
+Do not convert the server to async.
 
 ## Database
 
@@ -244,9 +291,14 @@ PostgreSQL is responsible for:
 
 -   JWT
 -   OAuth2 password flow
--   Argon2 or bcrypt for password hashing
+-   **Argon2** for password hashing (chosen over bcrypt)
 -   Role claim embedded in the access token
 -   Role-based dependencies for endpoint authorization
+
+The role travels in the token, so authorization needs no database
+round-trip per request — which matters when 500 concurrent requests must
+not add user-lookup noise to lock measurements. Accepted tradeoff: a role
+change does not take effect until the token expires (60 minutes).
 
 ## Testing
 
@@ -256,7 +308,8 @@ PostgreSQL is responsible for:
 
 ## Load Testing
 
--   Locust
+-   ~~Locust~~ — **cut on Day 1**; see Section 17. The asyncio + httpx
+    concurrency harness carries the correctness claim.
 
 ## Development / Deployment
 
@@ -289,7 +342,7 @@ registration requests.
 The backend must guarantee:
 
 ``` text
-enrolled_count <= course_capacity
+course_offerings.enrolled_count <= course_offerings.capacity
 ```
 
 Similarly:
@@ -317,25 +370,38 @@ and constraint mechanisms.
 
 # 6. Concurrency Control
 
-## Two locking targets
+## Three serialization points
 
-This system enforces two invariants that live on **different keys**:
+> **CHANGED:** this section originally described two invariants. A third —
+> exactly-once — was added with the `idempotency_keys` table. See
+> `DECISIONS.md`.
 
-``` text
-Capacity invariant   → keyed on the resource   → lock the resource row
-Quota invariant      → keyed on the user       → lock the user quota row
-```
-
-A single allocation must satisfy both, so it acquires **two** locks. To
-avoid deadlock, the lock acquisition order is fixed globally:
+This system enforces three invariants that live on **different keys**:
 
 ``` text
-1. Lock the user quota row   (SELECT ... FOR UPDATE)
-2. Lock the resource row     (SELECT ... FOR UPDATE)
-3. Check capacity and quota
-4. Insert reservation / update counters
-5. COMMIT
+Capacity invariant     → keyed on the resource → lock the resource row
+Quota invariant        → keyed on the user     → lock the user row
+Exactly-once invariant → keyed on the request  → UNIQUE(key, user_id) insert
 ```
+
+Guarding one does nothing for the others, because each is a fact about a
+different thing. A single allocation must satisfy all three, so it takes
+two row locks plus a unique-constraint serialization point. To avoid
+deadlock, the acquisition order is fixed globally:
+
+``` text
+1. INSERT the idempotency key  (UNIQUE violation → replay stored response)
+2. Lock the user row           (SELECT ... FOR UPDATE)
+3. Lock the resource row       (SELECT ... FOR UPDATE)
+4. Check quota, then capacity
+5. Insert reservation / update counters / store the response on the key row
+6. COMMIT                       (key and allocation commit together)
+```
+
+The key insert and the allocation must land in the **same** transaction.
+Split them and the bug moves rather than disappearing: commit the
+allocation but lose the key and a retry double-books; store the key but
+roll back the allocation and a retry returns a fake success.
 
 Because every allocation path acquires locks in this same order, no two
 transactions can hold one lock while waiting for the other in the
@@ -350,6 +416,11 @@ Conceptually:
 
 ``` sql
 BEGIN;
+
+-- 0. Exactly-once gate (keyed on request)
+INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash)
+VALUES (:key, :user_id, 'gpu.reserve', :hash);
+-- UNIQUE violation → replay the stored response, return early
 
 -- 1. Quota gate (keyed on user)
 SELECT id FROM users
@@ -370,7 +441,12 @@ UPDATE gpu_clusters
 SET allocated = allocated + 2
 WHERE id = :cluster_id;
 
-INSERT INTO reservations (...);
+INSERT INTO gpu_reservations (...);   -- CHANGED: was `reservations`;
+                                      -- GPU holds live in their own table
+
+UPDATE idempotency_keys
+SET response_body = :resp, status_code = 201
+WHERE key = :key AND user_id = :user_id;
 
 COMMIT;
 ```
@@ -390,11 +466,16 @@ Room reservations are interval-based.
 A reservation contains:
 
 ``` text
-room_id
+resource_id         -- CHANGED: FK to resources.id, not a `room_id`.
+                    -- Joined-table inheritance means rooms.id IS resources.id,
+                    -- so a reservation points at a resource without needing to
+                    -- know which kind it is. Nothing at the database level stops
+                    -- it naming a GPU cluster — the service layer checks that.
 user_id
 start_time
 end_time
 status
+created_at
 ```
 
 A conflict exists when:
@@ -445,8 +526,8 @@ Example:
 ``` text
 GPU Cluster
 ----------------
-Type: NVIDIA A6000
-Total: 8
+Total:     8       -- gpu_count
+Allocated: 6       -- running count of active units
 ```
 
 A reservation contains:
@@ -455,48 +536,97 @@ A reservation contains:
 gpu_cluster_id
 user_id
 gpu_count
-start_time
-end_time
 status
+created_at
 ```
 
-The system calculates the available capacity for the requested time
-interval.
+> **CHANGED — GPU reservations are hold-until-release.** The original
+> design gave this table `start_time` and `end_time` *and* a scalar
+> `allocated` counter on the cluster. Those do not compose. If a booking
+> is time-bounded, capacity is a question about intervals — "at 3pm, how
+> many are allocated?" — and one integer cannot answer it. Two
+> non-overlapping 8-GPU bookings (10–12 and 14–16) should both succeed;
+> the counter says `8 + 8 > 8` and wrongly rejects the second. Worse in
+> the other direction: nothing decrements when an interval ends, so quota
+> is held forever.
+>
+> Resolved by dropping the intervals, not the counter — it matches how
+> quota is already defined ("concurrently held units"), and rooms still
+> carry the interval story. A reservation is held until it is explicitly
+> released. See `DECISIONS.md`. **Do not re-add the timestamps.**
 
-The two invariants that must hold simultaneously are:
+The three invariants that must hold simultaneously are:
 
 ``` text
-Capacity:  sum(active allocations on cluster) <= total GPU capacity
-Quota:     sum(active GPU units held by user) <= role quota for GPU
+Capacity:      gpu_clusters.allocated <= gpu_clusters.gpu_count
+Quota:         sum(active GPU units held by user) <= role quota for GPU
+Exactly-once:  a retried request allocates at most once
 ```
 
-The allocation operation runs inside a single database transaction that
-first locks the user quota row, then the cluster row, so neither
-concurrent capacity nor concurrent quota violations are possible.
+The allocation runs inside a single database transaction that inserts the
+idempotency key, then locks the user row, then the cluster row — so no
+concurrent capacity violation, quota violation, or double-booking on
+retry is possible. The capacity invariant additionally has a database
+backstop:
+
+``` sql
+CHECK (allocated >= 0 AND allocated <= gpu_count)   -- gpu_capacity_sane
+```
+
+The row lock is the mechanism; the constraint makes a locking bug fail
+loudly instead of silently overselling.
 
 ------------------------------------------------------------------------
 
 # 9. Course Registration Strategy
 
-Courses have:
+> **CHANGED — seats belong to an offering, not to a course.** The
+> original design put `capacity` and the schedule on `Course`. A course is
+> the catalogue entry and is stable across semesters, so a capacity there
+> says "CS101 has 50 seats, forever, in every section simultaneously,"
+> which is not a thing. Revision `268c10da1da4` split them.
+
+A course is split across two tables:
 
 ``` text
-course_id
-course_code
+Course              -- catalogue entry, stable across semesters
+------
+id
+code                -- UNIQUE
 name
-capacity
-start_time
-end_time
-days
+
+CourseOffering      -- one section, in one semester
+--------------
+id
+course_id
+instructor_id       -- the section has an owner, the catalogue entry does not
+semester
+year
+start_time          -- "HH:MM", zero-padded
+end_time            -- "HH:MM", zero-padded
+days                -- e.g. "MWF"
+capacity            -- seats belong HERE
+enrolled_count      -- the counter registration locks
 ```
 
-Student registration creates an enrollment.
+Student registration creates an enrollment **against an offering**.
 
 The critical invariant is:
 
 ``` text
-number_of_active_enrollments <= course_capacity
+course_offerings.enrolled_count <= course_offerings.capacity
 ```
+
+`enrolled_count` exists so that registration has a **row to lock**.
+Counting `enrollments` instead would mean counting rows in a table that
+concurrent registrations are inserting into — there is nothing for
+`FOR UPDATE` to take, and two registrations can both read 49 against a
+capacity of 50. Locking the offering row is what makes the 500-concurrent
+test winnable.
+
+It is therefore derived state, and the rule that keeps it honest is:
+**every write to `enrollments` happens in the same transaction as the
+matching `enrolled_count` update.**
 
 Registration must also enforce:
 
@@ -557,121 +687,214 @@ promotion would exceed the quota, the next eligible student is promoted
 instead. This feature should only be implemented after the core
 registration and concurrency logic is stable.
 
+> **CHANGED — the numbering above is a display value, not a column.**
+> `waitlist_entries.position` was dropped in revision `c86676652ca2`.
+> FIFO order comes from `ORDER BY created_at, id`, and a position is
+> computed at read time with `ROW_NUMBER()`.
+>
+> Storing it meant that promoting the first entry rewrote every remaining
+> position for that offering — a write-amplified O(n) UPDATE inside the
+> promotion transaction, while holding the offering lock, which is the
+> exact place where holding a lock longer costs the most. It also forced a
+> deferrable unique constraint, because `SET position = position - 1`
+> transiently collides mid-UPDATE. Dropping the column removed all of it:
+> a promotion now touches one row, there is no renumbering, so there is
+> nothing to defer.
+>
+> Because `enrollments` has an unconditional `UNIQUE(student_id,
+> course_offering_id)`, **promotion must UPDATE an existing enrollment
+> row, not INSERT one** — a promoted student who previously dropped still
+> owns a row.
+
+The waitlist is item 5 on the pre-agreed cut order in `10_DAY_PLAN.md`,
+and is cut whole rather than half if the schedule slips.
+
 ------------------------------------------------------------------------
 
 # 11. Database Model
 
-A simplified schema is:
+This is the schema **as built**, at revision `1ca8b85b7626` — 12 tables.
+Every `created_at` is `timestamptz`.
 
 ``` text
 User
 ----
 id
-name
-email
-password_hash
+name                -- CHANGED: `name`, not `full_name`
+email               -- UNIQUE, indexed
+password_hash       -- CHANGED: `password_hash`, not `hashed_password`
 role                -- ENUM: STUDENT | FACULTY | ADMIN
-
-Resource
---------
-id
-type
-name
-location
-status              -- e.g. AVAILABLE | BLOCKED (admin-controlled)
-
-Room
-----
-id
-resource_id
-building
-room_number
-
-GPUCluster
-----------
-id
-resource_id
-gpu_type
-gpu_count
-allocated           -- running count of active GPU units
-
-Course
-------
-id
-code
-name
-capacity
-
-CourseOffering
---------------
-id
-course_id
-semester
-year
-start_time
-end_time
-days
-
-Reservation
------------
-id
-resource_id
-user_id
-start_time
-end_time
-status
 created_at
 
-GPUReservation
+Resource            -- base table for anything bookable
+--------
+id
+name
+resource_type       -- ENUM: GPU | ROOM | COURSE  (polymorphic discriminator)
+status              -- ENUM: AVAILABLE | BLOCKED  (admin-controlled)
+                    -- CHANGED: no `location` column
+
+Room                -- joined-table inheritance: rooms.id IS resources.id
+----
+id                  -- CHANGED: FK to resources.id, NOT a `resource_id` column
+building
+capacity            -- CHECK (capacity > 0)
+                    -- CHANGED: no `room_number` column
+
+GPUCluster          -- joined-table inheritance: gpu_clusters.id IS resources.id
+----------
+id                  -- CHANGED: FK to resources.id, NOT a `resource_id` column
+gpu_count
+allocated           -- running count of active GPU units; THE locked counter
+                    -- CHECK (allocated >= 0 AND allocated <= gpu_count)
+                    -- CHANGED: no `gpu_type` column
+
+Course              -- catalogue entry; deliberately holds NO capacity
+------
+id
+code                -- UNIQUE
+name
+
+CourseOffering      -- one section, in one semester
 --------------
 id
-gpu_cluster_id
+course_id           -- FK → courses.id
+instructor_id       -- FK → users.id, NOT NULL, indexed
+semester
+year
+start_time          -- "HH:MM" string, zero-padded
+end_time            -- "HH:MM" string, zero-padded
+days                -- e.g. "MWF"
+capacity            -- CHECK (capacity > 0)
+enrolled_count      -- THE locked counter
+                    -- CHECK (enrolled_count >= 0 AND enrolled_count <= capacity)
+
+Reservation         -- ROOMS ONLY. Interval-based.
+-----------
+id
+resource_id         -- FK → resources.id
+user_id             -- FK → users.id
+start_time          -- timestamptz
+end_time            -- timestamptz
+status              -- ENUM: ACTIVE | CANCELLED
+created_at
+
+GPUReservation      -- hold-until-release. NO start_time / end_time.
+--------------
+id
+gpu_cluster_id      -- CHANGED: `gpu_cluster_id`, not `cluster_id`
 user_id
 gpu_count
-start_time
-end_time
-status
+status              -- ENUM: ACTIVE | CANCELLED
+created_at
 
 Enrollment
 ----------
 id
 student_id
 course_offering_id
-status
+status              -- ENUM: ACTIVE | DROPPED | WAITLISTED
 created_at
+UNIQUE (student_id, course_offering_id)
 
-WaitlistEntry
+WaitlistEntry       -- FIFO order is created_at; there is no stored position
 -------------
 id
 student_id
 course_offering_id
-position
-created_at
+created_at          -- CHANGED: `position` column dropped
+UNIQUE (student_id, course_offering_id)
 
-RoleQuota                       -- NEW: per-role entitlement policy
+RoleQuota                       -- per-role entitlement policy, NOT per-user
 ---------
 id
 role                -- ENUM: STUDENT | FACULTY | ADMIN
 resource_type       -- ENUM: GPU | ROOM | COURSE
 max_units           -- e.g. 2 for (STUDENT, GPU); NULL = unlimited
 UNIQUE (role, resource_type)
+
+IdempotencyKey                  -- NEW: the exactly-once guarantee
+--------------
+id
+key
+user_id             -- FK → users.id
+endpoint
+request_hash        -- detects key reuse with a different body
+response_body       -- JSONB, NULLABLE — filled in at commit
+status_code         -- NULLABLE — filled in at commit
+created_at
+UNIQUE (key, user_id)
+```
+
+## Database-level constraints (defense in depth)
+
+``` sql
+-- capacity can never go negative or exceed total
+ALTER TABLE gpu_clusters ADD CONSTRAINT gpu_capacity_sane
+  CHECK (allocated >= 0 AND allocated <= gpu_count);
+
+-- same invariant for course seats
+ALTER TABLE course_offerings ADD CONSTRAINT offering_enrollment_sane
+  CHECK (enrolled_count >= 0 AND enrolled_count <= capacity);
+
+-- no duplicate enrollment, ever
+ALTER TABLE enrollments ADD CONSTRAINT enrollment_unique
+  UNIQUE (student_id, course_offering_id);
+
+-- no overlapping room reservations, enforced by Postgres itself
+CREATE EXTENSION IF NOT EXISTS btree_gist;
+ALTER TABLE reservations ADD CONSTRAINT no_overlapping_room_reservations
+  EXCLUDE USING gist (
+    resource_id WITH =,
+    tstzrange(start_time, end_time, '[)') WITH &&
+  ) WHERE (status = 'ACTIVE');
+```
+
+`'[)'` is half-open — inclusive start, exclusive end — which is what
+allows the back-to-back `[10,12)` and `[12,14)` bookings of Section 7.
+The `WHERE (status = 'ACTIVE')` makes it partial, so a cancelled
+reservation does not block rebooking the slot it released.
+
+## Indexes
+
+Each one is tied to a specific hot-path query, not added speculatively:
+
+``` text
+ix_gpu_reservations_user_status  (user_id, status)              the quota SUM, under the user lock
+ix_enrollments_offering_status   (course_offering_id, status)   class roster, enrolled_count reconciliation
+ix_waitlist_entries_offering_created (course_offering_id, created_at)  promotion query, under the offering lock
+ix_reservations_user_id          (user_id)                      "my reservations"
+ix_course_offerings_instructor_id                               a faculty member's sections
+ix_users_email (UNIQUE) · ix_courses_code (UNIQUE) · ix_resources_resource_type
 ```
 
 Notes:
 
--   `role` is a PostgreSQL `ENUM` (or a `VARCHAR` with a `CHECK`
-    constraint) so invalid roles cannot be stored.
--   `RoleQuota` is a small, admin-editable policy table. A `NULL`
-    `max_units` means "no limit" (used for `ADMIN`).
--   The MVP computes a user's currently held units by aggregating active
-    reservations under a user-row lock — there is deliberately **no
-    denormalized per-user counter**, which avoids counter drift. A
-    denormalized `quota_account(user_id, resource_type, units_held)` row
-    with a `CHECK` constraint is a documented later optimization, to be
-    introduced only if load testing shows contention on the user row
-    (see Section 14).
-
-The exact schema may be simplified or adjusted during implementation.
+-   All five vocabularies (`Role`, `ResourceType`, `ResourceStatus`,
+    `ReservationStatus`, `EnrollmentStatus`) are **native PostgreSQL enum
+    types**, so invalid values cannot be stored. Two accepted costs:
+    adding a value later needs a migration, and `op.drop_table` does not
+    drop the type, so every downgrade must `DROP TYPE` explicitly or the
+    migration chain is not re-runnable.
+-   `RoleQuota` has **no foreign key to User**. It is policy keyed on
+    `(role, resource_type)`, resolved through the user's role at request
+    time.
+-   `IdempotencyKey.response_body` and `.status_code` are nullable, and
+    that is load-bearing. The sequence is: INSERT the key with a NULL
+    response → do the booking → UPDATE the key with the response →
+    COMMIT. The claim is staked before any work begins; the response is
+    filled in once it is known.
+-   **Enrollment uniqueness is unconditional**, which has a real
+    consequence: a student who dropped still owns a row, so
+    **re-registration and waitlist promotion must be UPDATEs, not
+    INSERTs.** A partial unique index (`WHERE status='ACTIVE'`) was
+    considered and rejected — it allows clean inserts but lets duplicate
+    DROPPED rows accumulate and loses the hard guarantee.
+-   Held units are computed by aggregation under the user-row lock, so
+    they cannot drift. There is deliberately **no denormalized per-user
+    counter**. A `quota_account(user_id, resource_type, units_held)` row
+    with a `CHECK` is a documented later optimization, introduced only if
+    load testing shows contention on the user row (see Section 14).
 
 ------------------------------------------------------------------------
 
@@ -714,18 +937,57 @@ POST   /api/v1/gpus/{gpu_id}/reservations     [STUDENT | FACULTY | ADMIN]
 DELETE /api/v1/reservations/{reservation_id}  [owner | ADMIN]
 ```
 
+`POST /gpus/{gpu_id}/reservations` takes an `Idempotency-Key` header and
+a body of `{ "gpu_count": N }` — **no times**, because GPU holds are
+hold-until-release. It is the only endpoint carrying idempotency keys.
+
 ## Courses
 
+> **CHANGED — course write paths are scoped to an offering, not a
+> course.** Capacity, `enrolled_count`, and the row that registration
+> locks all live on `course_offerings` (revision `268c10da1da4`), and one
+> course has many offerings. A route keyed on `course_id` therefore has no
+> single row to lock, which is the whole mechanism. Read paths stay on
+> `courses`, since browsing a catalogue is genuinely course-shaped.
+
 ``` text
-POST   /api/v1/courses                        [ADMIN | FACULTY]
-GET    /api/v1/courses                         [any authenticated]
-GET    /api/v1/courses/{course_id}             [any authenticated]
+POST   /api/v1/courses                                  [ADMIN | FACULTY]
+GET    /api/v1/courses                                  [any authenticated]
+GET    /api/v1/courses/{course_id}                      [any authenticated]
+GET    /api/v1/courses/{course_id}/offerings            [any authenticated]
 
-POST   /api/v1/courses/{course_id}/register    [STUDENT]
-DELETE /api/v1/courses/{course_id}/drop        [STUDENT]
+POST   /api/v1/offerings                                [ADMIN | FACULTY]
+GET    /api/v1/offerings/{offering_id}                  [any authenticated]
 
-GET    /api/v1/courses/{course_id}/waitlist    [any authenticated]
+POST   /api/v1/offerings/{offering_id}/register         [STUDENT]
+DELETE /api/v1/offerings/{offering_id}/drop             [STUDENT]
+
+GET    /api/v1/offerings/{offering_id}/waitlist         [any authenticated]
+POST   /api/v1/offerings/{offering_id}/waitlist         [STUDENT]
+DELETE /api/v1/offerings/{offering_id}/waitlist         [STUDENT]
 ```
+
+Waitlist position is a **display value**, computed at read time as
+`ROW_NUMBER() OVER (ORDER BY created_at, id)`. It is never stored.
+
+## Error semantics
+
+``` text
+401  missing / invalid / expired JWT
+403  authenticated but role not permitted
+404  resource does not exist
+409  CAPACITY_EXHAUSTED      the resource is full
+409  QUOTA_EXCEEDED          caller is at their personal limit
+409  room interval conflict
+409  duplicate enrollment
+422  malformed request body
+422  IDEMPOTENCY_KEY_REUSED  same key, different body
+200  idempotent replay       (original response, original status)
+```
+
+The two `409`s carry **distinct machine-readable codes** because the
+caller's remedy differs: capacity means wait or try another cluster,
+quota means release something you already hold.
 
 ## Administration (quota policy)
 
@@ -803,14 +1065,29 @@ Action                              STUDENT   FACULTY   ADMIN
 --------------------------------------------------------------
 Register / login                      ✓         ✓        ✓
 View resources & availability         ✓         ✓        ✓
-Reserve room                          ✓         ✓        ✓
+View own quota & usage                ✓         ✓        ✓
+Reserve a room                        ✓         ✓        ✓
 Reserve GPU capacity                  ✓         ✓        ✓
+Cancel own reservation                ✓         ✓        ✓
 Register for a course                 ✓         —        —
-Create a course                       —         ✓        ✓
-Create / modify / block a resource    —         —        ✓
-Modify resource availability          —         —        ✓
+Create a course / offering            —         ✓        ✓
+Create a resource                     —         —        ✓
+Modify resource availability/status   —         —        ✓
 Configure per-role quotas             —         —        ✓
+Cancel ANY user's reservation         —         —        ✓
 ```
+
+### Default quotas (seeded, admin-editable)
+
+``` text
+Resource   STUDENT   FACULTY   ADMIN
+─────────────────────────────────────────
+GPU           2         10     unlimited
+ROOM          2          5     unlimited
+COURSE        6          —     unlimited
+```
+
+Unlimited is stored as `max_units = NULL`, not as a large number.
 
 ## Requested feature: admin-only resource modification
 
@@ -827,8 +1104,7 @@ capacity changes safe and predictable.
 
 ## Security notes
 
--   Passwords are never stored directly; they are hashed with Argon2 (or
-    bcrypt).
+-   Passwords are never stored directly; they are hashed with Argon2.
 -   Authorization is enforced at the API boundary, but entitlement
     limits (quotas) are additionally enforced inside the database
     transaction — see Section 14. This is defense in depth: the API
@@ -867,9 +1143,15 @@ sum(user's active units for resource_type)
         <= role_quota(user.role, resource_type)
 ```
 
-"Active" means reservations that are currently allocated (and, for
-time-bounded resources, whose interval has not ended). Releasing or
+"Active" means `status = 'ACTIVE'` — nothing more. Releasing or
 cancelling a reservation frees the quota immediately.
+
+> **CHANGED:** this originally read "and, for time-bounded resources,
+> whose interval has not ended." Nothing expires on a timer any more.
+> GPU holds run until released, which is why `ReservationStatus` has
+> exactly two values and there is no `EXPIRED` — a third state would
+> force a decision about whether it counts toward quota, and an update to
+> every quota query.
 
 ## Why a resource lock is not enough
 
@@ -901,6 +1183,9 @@ user before it checks the quota:
 ``` sql
 BEGIN;
 
+-- Exactly-once gate first (see Section 6)
+INSERT INTO idempotency_keys (key, user_id, endpoint, request_hash) VALUES (...);
+
 -- Serialize all of this user's quota-bearing allocations
 SELECT id FROM users
 WHERE id = :user_id
@@ -912,14 +1197,19 @@ FROM gpu_reservations
 WHERE user_id = :user_id
   AND status = 'ACTIVE';        -- = current held units
 
--- if held + requested > role_quota → reject (409 Conflict)
+-- if held + requested > role_quota → reject (409 QUOTA_EXCEEDED)
 
 -- Capacity gate on the resource row (see Section 6)
 SELECT * FROM gpu_clusters WHERE id = :cluster_id FOR UPDATE;
--- ... capacity check + update + insert ...
+-- ... capacity check + update + insert + store response on the key row ...
 
 COMMIT;
 ```
+
+That `SUM` runs inside the hottest transaction *while holding the user
+lock*, so every millisecond it costs is a millisecond every other request
+from that user spends blocked. `ix_gpu_reservations_user_status` exists
+for exactly this query.
 
 Now T1 and T2 contend on the same user row. T2 blocks until T1 commits,
 re-reads held units as 2, computes `2 + 2 = 4 > 2`, and is rejected.
@@ -927,9 +1217,10 @@ re-reads held units as 2, computes `2 + 2 = 4 > 2`, and is rejected.
 ## Lock ordering (deadlock avoidance)
 
 Because a single allocation holds both the user lock and the resource
-lock, the acquisition order is fixed globally: **user quota row first,
-then resource row.** Every code path follows this order, so no cyclic
-wait can form. (See Section 6.)
+lock, the acquisition order is fixed globally: **idempotency key insert,
+then user row, then resource row.** Every code path follows this order —
+allocation, cancellation, course registration, and waitlist promotion
+alike — so no cyclic wait can form. (See Section 6.)
 
 ## Scope for the MVP
 
@@ -939,6 +1230,9 @@ wait can form. (See Section 6.)
 -   **Room and course quotas use the identical mechanism**
     (`RoleQuota` row + user-row lock + aggregate check). Rooms cap
     concurrent active reservations; courses cap active enrollments.
+    They are items 2 and 3 on the pre-agreed cut order — *because* the
+    mechanism is identical, cutting them costs a demonstration and no
+    understanding, so long as the README says so.
 -   The quota check reuses the same transaction that already performs
     the capacity check, so it adds one lock and one aggregate query — no
     new infrastructure.
@@ -979,9 +1273,13 @@ campus-resource-system/
 │   │   ├── service.py
 │   │   └── schemas.py
 │   │
-│   ├── quotas/                -- NEW: per-role limit policy + checks
+│   ├── quotas/                -- per-role limit policy + enforcement helper
 │   │   ├── router.py          -- admin quota configuration
 │   │   ├── service.py         -- quota lookup + enforcement helper
+│   │   └── schemas.py
+│   │
+│   ├── idempotency/           -- NEW: key storage + replay helper
+│   │   ├── service.py
 │   │   └── schemas.py
 │   │
 │   ├── rooms/
@@ -1008,15 +1306,14 @@ campus-resource-system/
 │   │   ├── session.py
 │   │   └── base.py
 │   │
-│   ├── models/
-│   └── core/
+│   └── models/
 │
 ├── tests/
 │   ├── unit/
 │   ├── integration/
-│   └── concurrency/           -- capacity, quota, and RBAC tests
+│   └── concurrency/           -- capacity, quota, exactly-once, RBAC
 │
-├── alembic/
+├── alembic/                   -- owned exclusively by one person; see below
 │
 ├── docker-compose.yml
 ├── Dockerfile
@@ -1024,6 +1321,29 @@ campus-resource-system/
 ├── .env.example
 └── README.md
 ```
+
+## Three kinds of file — know which you are writing
+
+``` text
+Transaction owners   gpus/service.py, courses/service.py,
+                     reservations/service.py
+                     -> these call BEGIN / COMMIT
+
+Helpers              quotas/service.py, idempotency/service.py
+                     -> called INSIDE another transaction.
+                        They NEVER open their own.
+
+Boundary             routers, dependencies.py, schemas
+                     -> decide who may attempt. Touch no business state.
+```
+
+If a helper opens its own transaction, the quota check commits separately
+from the booking and the guarantee evaporates. This is why `quotas/` and
+`idempotency/` have no `router.py` of their own for the enforcement path —
+they are called by the modules that own the transaction.
+
+Routers know HTTP; services know the domain. Transactions are therefore
+tested by calling services directly, never through HTTP.
 
 ------------------------------------------------------------------------
 
@@ -1079,8 +1399,14 @@ Expected:
 ``` text
 3 → SUCCESS
 4 → SUCCESS
-2 → FAILURE
+2 → FAILURE          -- 409 CAPACITY_EXHAUSTED
 ```
+
+> **CHANGED — fire this as FACULTY, not STUDENT.** A student's GPU quota
+> is 2, so a 3-unit or 4-unit request is rejected with `QUOTA_EXCEEDED`
+> before capacity is ever consulted, and the test would pass for entirely
+> the wrong reason. Faculty hold 10. Keeping the two invariants separable
+> in the harness is the point: this test must fail only on capacity.
 
 ## GPU quota test (per-role limit)
 
@@ -1106,6 +1432,38 @@ Student's held GPU units never exceeds 2
 This is the test that fails on the naive version (both succeed → held =
 4) and passes once the user-row lock is added. It is the primary
 demonstration of the quota feature.
+
+The fix is **not** "add a lock" — the resource lock was already there and
+already correct. It was the **wrong lock for that invariant.**
+
+## Exactly-once test (idempotency)
+
+``` text
+The same request, sent twice, with the same Idempotency-Key
+```
+
+Expected:
+
+``` text
+Without a key → 2 reservations          ❌
+With a key    → 1 reservation, and the second call returns the
+                 ORIGINAL response body and status code
+```
+
+And with the same key but a *different* body:
+
+``` text
+422 IDEMPOTENCY_KEY_REUSED
+```
+
+## Build the broken version first
+
+Each of these has a "before" number, and it must be **measured, not
+reconstructed.** Write `reserve_gpu()` without the user lock, run the
+quota test, record `held = 4`. Then add the lock and re-run. Two numbers
+side by side is the single most credible artifact the project produces;
+a "broken build" recreated afterwards to make a table look good is
+obvious and worthless.
 
 ## Authorization test (RBAC)
 
@@ -1142,7 +1500,17 @@ every invariant must always hold.
 
 # 17. Load Testing
 
-Locust will be used to simulate concurrent users.
+> **CHANGED — Locust is cut.** It is item 1 on the pre-agreed cut order
+> in `10_DAY_PLAN.md`, dropped on Day 1. The asyncio + httpx harness
+> already proves correctness under concurrency, which is the claim the
+> project makes. Throughput numbers we never optimise against invite the
+> question "so what did you do with that?" with no answer.
+>
+> This section is retained as the design for load testing, and belongs in
+> the README's **"Designed, not implemented"** section. A documented
+> deferral reads as judgment; a missing feature reads as failure.
+
+Locust would be used to simulate concurrent users.
 
 Example scenarios:
 
@@ -1209,11 +1577,12 @@ It is:
 ## Phase 3 — GPU Allocation
 
 -   GPU cluster management
--   Capacity-based reservations
+-   Capacity-based reservations (hold-until-release, no intervals)
 -   Transactions
 -   Row-level locking
 -   **Per-role GPU quota (RoleQuota table, user-row lock, quota check)**
--   Concurrent allocation tests (capacity **and** quota)
+-   **Exactly-once (IdempotencyKey, UNIQUE(key, user_id), replay path)**
+-   Concurrent allocation tests (capacity, quota, **and** exactly-once)
 
 ## Phase 4 — Course Registration
 
@@ -1227,16 +1596,19 @@ It is:
 ## Phase 5 — Testing and Benchmarking
 
 -   Concurrent tests
--   Locust load tests
--   Performance measurements
--   Correctness verification (capacity, quota, authorization)
+-   ~~Locust load tests~~ (cut — Section 17)
+-   Broken-vs-fixed measurements, recorded as they happen
+-   Correctness verification (capacity, quota, exactly-once, authorization)
 
 ## Optional Phase 6
 
 If time remains:
 
 -   Waitlists
--   Reservation expiration
+-   ~~Reservation expiration~~ — **do not build this.** It would
+    reintroduce time-bounded GPU holds through the back door, and the
+    scalar `allocated` counter cannot represent them (Section 8).
+    Expiring a hold is a schema change, not a feature.
 -   Denormalized quota counter (only if benchmarks justify it)
 -   Redis
 -   Celery
@@ -1248,6 +1620,13 @@ Optional features should not delay completion of the core system.
 ------------------------------------------------------------------------
 
 # 19. 15-Day Development Plan
+
+> **SUPERSEDED by `10_DAY_PLAN.md`.** This was written for one person
+> over 15 days. The project is being built by two people over 10, which
+> changes the ordering (rooms and courses run in parallel with the GPU
+> core rather than after it) and adds an ownership split. Retained for
+> the phase breakdown; use `10_DAY_PLAN.md` for what happens on a given
+> day.
 
 ### Days 1–2
 
@@ -1270,7 +1649,8 @@ Course registration, capacity enforcement, and course-load quota.
 
 ### Days 12–13
 
-Concurrency testing (capacity, quota, RBAC) and Locust load testing.
+Concurrency testing (capacity, quota, exactly-once, RBAC). ~~Locust load
+testing~~ — cut; see Section 17.
 
 ### Day 14
 
@@ -1389,15 +1769,36 @@ No two active reservations overlap.
 ### GPU
 
 ``` text
-For every time interval:
-allocated_gpu_capacity <= total_gpu_capacity
+For every cluster:
+gpu_clusters.allocated <= gpu_clusters.gpu_count
 ```
+
+> **CHANGED:** this originally read "for every time interval." That is
+> the invariant a scalar counter provably cannot enforce, and stating it
+> that way is what made the original design incoherent — see Section 8.
+> GPU holds are not time-bounded, so there is no interval to quantify
+> over.
 
 ### Course
 
 ``` text
 For every course offering:
-active_enrollments <= course_capacity
+course_offerings.enrolled_count <= course_offerings.capacity
+
+and, reconciling derived state against the source of truth:
+enrolled_count = COUNT(enrollments WHERE status = 'ACTIVE')
+```
+
+The second line is a real check to run after the 500-concurrent
+benchmark, not a restatement of the first — `enrolled_count` is derived
+state and can disagree with `enrollments` if any code path updates one
+without the other:
+
+``` sql
+SELECT o.id, o.enrolled_count, COUNT(e.id) FILTER (WHERE e.status = 'ACTIVE')
+FROM course_offerings o LEFT JOIN enrollments e ON e.course_offering_id = o.id
+GROUP BY o.id
+HAVING o.enrolled_count <> COUNT(e.id) FILTER (WHERE e.status = 'ACTIVE');
 ```
 
 ### Student
@@ -1420,6 +1821,13 @@ active_units_held(user, resource_type)
         <= role_quota(user.role, resource_type)
 ```
 
+### Exactly-once
+
+``` text
+For every (idempotency key, user):
+at most one allocation is created, however many times it is retried.
+```
+
 ### Authorization
 
 ``` text
@@ -1431,7 +1839,16 @@ all others are rejected with 403 before any state change.
 
 ``` text
 Promotion follows waitlist priority (and respects the quota invariant).
+FIFO order is ORDER BY created_at, id -- the id tiebreak is load-bearing.
 ```
+
+`func.now()` returns the *transaction's* start timestamp, not the
+statement's, so several entries written in one transaction share a
+`created_at` and `ORDER BY created_at` alone leaves their order
+undefined. This never happens on the real path — each join is its own
+request and its own transaction — but it happens in a seed script that
+inserts several entries at once, which would make the waitlist benchmark
+flap for a reason that has nothing to do with locking.
 
 These invariants form the core correctness specification of the system.
 
@@ -1458,7 +1875,7 @@ This project focuses on a harder problem:
                      │
                      ▼
           Concurrent allocation
-          under two invariants
+         under three invariants
                      │
                      ▼
           Correctness guarantees
@@ -1486,13 +1903,15 @@ The project therefore provides practical experience with:
 
 > **Campus Resource Allocation System** — A concurrency-safe backend for
 > managing room reservations, GPU capacity allocation, and course
-> registration using FastAPI and PostgreSQL. It enforces two classes of
-> invariant under concurrent load: resource-capacity limits (keyed on
-> the resource) and per-role user quotas (keyed on the user), using
-> database transactions, row-level locking with a fixed lock ordering,
-> and constraints. Access is governed by JWT-based role-based
+> registration using FastAPI and PostgreSQL. It enforces three classes of
+> invariant under concurrent load: resource-capacity limits (keyed on the
+> resource), per-role user quotas (keyed on the user), and exactly-once
+> request handling (keyed on the request), using database transactions,
+> row-level locking with a fixed global lock ordering, and exclusion and
+> unique constraints. Access is governed by JWT-based role-based
 > authorization (Student / Faculty / Admin), and correctness is verified
-> with concurrent integration tests and Locust load tests.
+> with a concurrent integration harness reporting measured
+> broken-vs-fixed results.
 
 ### One-line description
 
@@ -1518,11 +1937,17 @@ The project is considered successful if it can demonstrate:
 ✓ Course capacity cannot be exceeded
 ✓ Duplicate registrations are rejected
 ✓ Course schedule conflicts are detected
+✓ A retried request allocates exactly once, and replays the original
+  response
 ✓ Concurrent requests do not violate any invariant
-✓ Automated tests verify correctness (capacity, quota, RBAC)
-✓ Locust measures system performance
-✓ Entire backend can run using Docker Compose
+✓ Automated tests verify correctness (capacity, quota, exactly-once, RBAC)
+✓ Each of those has a broken-vs-fixed table with real measured numbers
+✓ Entire backend can run using Docker Compose on a clean machine
 ```
+
+> **CHANGED:** "Locust measures system performance" is removed — Locust
+> is cut (Section 17). The two lines added in its place are the ones the
+> project is actually judged on.
 
 The primary success criterion is:
 

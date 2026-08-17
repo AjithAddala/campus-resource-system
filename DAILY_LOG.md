@@ -136,6 +136,100 @@ still described renumbering positions.
 
 ---
 
+## Day 2 (continued) — 2026-08-17 — B
+
+**Plan:** B's Day 2 column (seed script, read endpoints). **Actually spent
+on reconciling the documentation against A's three schema revisions**,
+which is open item 1 from the entry above — "B has not seen any of this."
+
+**Shipped — documentation only. No code, no schema, no migration.**
+
+- `INIT_PLAN.md` synced to the schema at head. Its §11 data model was the
+  pre-amendment design: GPU `start_time`/`end_time`, `Course.capacity`,
+  `waitlist_entries.position`, and the `location`/`room_number`/`gpu_type`
+  columns — every one of which the project has deliberately removed. It
+  also predated the exactly-once guarantee entirely. Divergences are now
+  marked inline with `CHANGED:` and a revision pointer.
+- `ARCHITECTURE_AND_WORKFLOWS.md`: closed the
+  `location`/`room_number`/`gpu_type` gap the doc itself flagged as "do
+  not leave open"; recorded the dropped-enrollment-row trap next to the
+  unique constraint; moved Workflow D onto an offering-keyed route.
+- `10_DAY_PLAN.md`: Locust marked cut in the scope block (it was only
+  marked in the cut order); Day 3 no longer asks A for a migration that
+  shipped on Day 1; Day 2 seed now says capacity and `instructor_id` go
+  on the offering, and warns about `func.now()` on seeded waitlist rows.
+- `DECISIONS.md`: document precedence written down; the course-vs-offering
+  API decision recorded; open items 6 and 7 restated as still open.
+- `DECISIONS.md` and this file were **not** rewritten to match today's
+  schema. They are append-only records; only resolution markers added.
+
+**Decision recorded: course write paths are keyed on the offering.**
+`POST /courses/{id}/register` is not implementable as specified now that
+`enrolled_count` lives on `course_offerings` — one course has many
+offerings, so there is no single row to lock. Registration, drop, and
+waitlist move to `/offerings/{id}/...`; catalogue reads stay on
+`/courses`. This lands in B's Day 4 column.
+
+**Also shipped — Day 1's last checkpoint, actually closed on B's machine**
+
+The database on B's machine had **zero tables and no `alembic_version`
+row** — the chain had never been applied to this volume. Both containers
+were up and healthy the whole time. Applied all five revisions from
+empty, which is the clean-DB test Day 1 asked for and the only version of
+it that proves anything.
+
+**Verification run**
+
+```
+alembic upgrade head        -> 5 revisions applied from base, clean
+alembic current             -> 1ca8b85b7626 (head)
+alembic check               -> No new upgrade operations detected
+information_schema.tables   -> 13 (12 + alembic_version)
+Base.metadata               -> 12 tables
+pg_extension                -> btree_gist present
+pg_constraint               -> 9 non-FK constraints, all present:
+                               no_overlapping_room_reservations (type x)
+                               gpu_capacity_sane, room_capacity_positive,
+                               offering_capacity_positive,
+                               offering_enrollment_sane,
+                               enrollment_unique, waitlist_unique,
+                               idempotency_key_user_unique, role_quota_unique
+created_at (6 tables)       -> all `timestamp with time zone`
+indexes                     -> ix_gpu_reservations_user_status,
+                               ix_enrollments_offering_status,
+                               ix_waitlist_entries_offering_created,
+                               ix_reservations_user_id, ix_courses_code,
+                               ix_course_offerings_instructor_id
+/health, /health/db         -> 200, both ok
+argon2 / jose / multipart   -> import OK in the container
+```
+
+No test rows inserted, so the database is at head and empty — the state
+the Day 2 seed script expects.
+
+**Cost incurred**
+
+- Day 2's actual B column (seed script, read endpoints) is still not
+  started. Both people are now behind their Day 2 plan.
+
+**Open / carried forward**
+
+0. **A must run `alembic upgrade head` from empty on their machine too.**
+   Day 1 says "verify on a clean DB on BOTH machines"; only B's is
+   verified. Likely fine — A wrote the revisions — but the checkpoint is
+   not met on assertion.
+1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Day 7.
+2. `Resource.polymorphic_identity = ResourceType.COURSE` on the base
+   class — needs both people, since `models/` is frozen.
+3. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Day 5 has nothing to build on.
+4. `python-jose==3.3.0` carries known advisories and A is about to write
+   `core/security.py` against it. Worth switching to `PyJWT` before the
+   code exists rather than after.
+5. A's Day 2 auth work still not started.
+
+---
+
 ## Template
 
 ```markdown

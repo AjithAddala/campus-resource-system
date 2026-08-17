@@ -12,13 +12,18 @@ IN SCOPE
   GPU:     capacity + quota + idempotency      <- flagship transaction
   Rooms:   exclusion-constraint intervals + room quota
   Courses: capacity + duplicate + schedule overlap + course-load quota
-  Waitlist: FIFO, quota-aware promotion, concurrency-safe
+           (registration is keyed on the OFFERING -- that is the row
+            holding enrolled_count, and therefore the row that is locked)
+  Waitlist: FIFO by (created_at, id), quota-aware promotion,
+            concurrency-safe, no stored position
   Four broken-vs-fixed benchmarks
-  asyncio concurrency harness + Locust load scenarios
+  asyncio concurrency harness
   Docker Compose one-command startup
 
 DELIBERATELY EXCLUDED (design decision, not a scope cut)
   Denormalized quota counter
+  Locust load scenarios          <- cut Day 1; item 1 on the cut order
+  GPU reservation start/end times <- do not re-add; see DECISIONS.md
 ```
 
 **Why the counter stays out.** The MVP recomputes held units by `SUM`
@@ -26,8 +31,9 @@ under the user lock, which cannot drift. A counter is an optimization,
 and your stated principle is that complexity is earned by measurement.
 Building it with no benchmark showing user-row contention invites the
 question "what did it improve?" with no answer. Leaving it out, and
-saying *why*, is the stronger position. Revisit only if Locust shows the
-user row is the bottleneck.
+saying *why*, is the stronger position. Revisit only if the concurrency
+harness shows the user row is the bottleneck — which, with Locust cut, is
+now the only instrument that could show it.
 
 ## 0.1 Pre-Agreed Cut Order
 
@@ -37,7 +43,8 @@ pressure. If you are behind at any checkpoint, drop strictly in this
 order:
 
 ``` text
-1. Locust                    (asyncio harness already proves correctness)
+1. Locust                    CUT ON DAY 1 -- the asyncio harness already
+                             proves correctness, which is the claim
 2. Room quota                (mechanism identical to GPU; document it)
 3. Course-load quota         (same)
 4. Schedule-overlap check    (orthogonal to the concurrency story)
@@ -71,7 +78,7 @@ quotas/            (RoleQuota)       waitlist/  (endpoints, FIFO order)
 idempotency/       (keys, replay)    Docker + docker-compose
 gpus/              (THE transaction) seed script
 waitlist promotion transaction       tests/concurrency/ (harness)
-admin quota endpoints                all four benchmarks + Locust
+admin quota endpoints                all four benchmarks
                                      README assembly
 ```
 
@@ -131,8 +138,17 @@ applies cleanly for both.
 ``` text
 A      Argon2 hashing, JWT encode/decode, role as a token claim
        POST /auth/register, POST /auth/login
+       duplicate-email registration -> 409, not 500: catch the
+       IntegrityError, because two simultaneous registrations can both
+       pass a "does this email exist?" check
 B      seed script: 3 users (one per role), 2 GPU clusters, 2 rooms,
        1 course + offering
+         capacity and instructor_id go on the OFFERING, not the course
+         seed RoleQuota rows: (STUDENT,GPU)=2 (FACULTY,GPU)=10
+                              (ADMIN,*)=NULL, ROOM 2/5, COURSE 6
+         any waitlist rows must be committed separately or given explicit
+         created_at -- func.now() is TRANSACTION start time, so rows
+         seeded in one transaction share it and their FIFO order is undefined
        GET /gpus, /rooms, /courses, /{id}/availability (against the stub)
 ```
 
@@ -146,8 +162,14 @@ A      require_role dependency; apply to all admin-only routes
        verify 403 fires BEFORE the handler body executes
        hand the real dependency to B, delete the stub
 B      room reservation POST
-       EXCLUDE USING gist constraint (A generates the migration)
+       the EXCLUDE USING gist constraint already exists -- shipped Day 1
+       in revision e0fbfe421403, along with the btree_gist extension.
+       B writes the endpoint against it; no migration needed.
+       include the resources.status gate while writing the lock (below)
        adjacent-interval test: [10,12) and [12,14) both succeed
+       reservations.resource_id points at `resources`, so nothing at the
+       DB level stops a "room" booking naming a GPU cluster -- check the
+       resource_type in the service layer
 ```
 
 **Checkpoint:** student token on `POST /gpus` returns 403; overlapping
@@ -158,10 +180,16 @@ room booking returns 409.
 ``` text
 A      quotas/ module: RoleQuota table + seeded defaults
        GPU transaction: LOCK user -> SUM held -> quota check
-                        LOCK cluster -> capacity check -> write
+                        LOCK cluster -> status check -> capacity check
+                                     -> write
        lock order recorded in a code comment
-B      course registration: LOCK offering -> capacity -> insert
-       UNIQUE(student_id, course_offering_id)
+B      course registration: POST /offerings/{id}/register
+       LOCK offering -> capacity -> upsert enrollment -> enrolled_count++
+       UNIQUE(student_id, course_offering_id) is unconditional, so a
+       student who dropped still owns a row: re-registration is an
+       UPDATE, not an INSERT
+       every write to enrollments happens in the SAME transaction as the
+       matching enrolled_count update -- it is derived state
        schedule-overlap check against existing enrollments
        DELETE /reservations/{id} with owner-or-admin check
 ```
@@ -170,6 +198,33 @@ Both people write a locking transaction for the first time on the same
 day. If by midday A's GPU path is clearly not landing, **B stops courses
 and pairs on it.** The GPU path is the project; courses are supporting
 evidence.
+
+### The `resources.status` gate — one line, written on Days 3 and 4
+
+`Resource.status` (AVAILABLE / BLOCKED) already exists on every resource
+row. Nothing reads it yet. The check belongs **inside the transaction,
+against the row you just locked** — not at the boundary — because it is
+mutable state on the resource, so an admin can flip it between a boundary
+read and the write:
+
+``` text
+LOCK resource row FOR UPDATE
+  if status == BLOCKED            -> 409 RESOURCE_BLOCKED
+  if allocated + req > gpu_count  -> 409 CAPACITY_EXHAUSTED
+```
+
+Both gates read the same locked row, so this costs nothing extra. Adding
+it after the Day 8 freeze means reopening the flagship transaction, which
+is what the freeze exists to prevent — hence writing it now.
+
+**Proposed semantics, still needs ratifying (open item 6 in
+DECISIONS.md):** blocking stops *new* allocations and does not evict
+existing ones, matching the capacity-reduction rule already agreed in
+`ARCHITECTURE_AND_WORKFLOWS.md` §13. Distinct code `RESOURCE_BLOCKED`,
+because the remedy differs again: try a different resource — do not wait,
+and do not release anything you hold. Note the database enforces none of
+this; the GiST constraint is partial on the *reservation's* status, not
+the resource's, so the service layer is the whole guarantee here.
 
 **Checkpoint:** 2 GPUs reserve; a 3rd unit returns `QUOTA_EXCEEDED`.
 Duplicate registration rejected; overlapping courses rejected.
@@ -183,6 +238,8 @@ A      idempotency/ module: IdempotencyKey, UNIQUE(key, user_id)
        replay path returns the stored response and status
 B      tests/concurrency/harness.py - asyncio + httpx, fires N
        simultaneous requests, collects status codes
+       BLOCKER: tests/ does not exist and pytest-asyncio is not in
+       requirements.txt. Add it before starting.
        BENCHMARK 1 (capacity): 500 concurrent registrations, capacity 50
          unlocked build -> record over-allocation
          locked build   -> exactly 50, zero over-allocation
@@ -197,6 +254,12 @@ A      apply the quota helper inside B's modules:
          room quota  (concurrent active reservations per user)
          course-load quota (active enrollments per user)
        admin quota endpoints: GET/PUT /admin/quotas/{role}/{resource}
+       admin resource-status endpoints (same shape, same ADMIN gate):
+         PATCH /rooms/{id}   -- block a room for maintenance
+         PATCH /gpus/{id}    -- change capacity / status
+         these were in ARCHITECTURE_AND_WORKFLOWS.md Workflow E but had
+         no day assigned. They only WRITE resources.status; the gates on
+         Days 3 and 4 are what READ it.
        fix whatever B's benchmarks break
 B      BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
          DIFFERENT clusters
@@ -247,7 +310,8 @@ BOTH   no new features from here. None.
        QUOTA_EXCEEDED (different caller remedy)
        fix all bugs surfaced by the four benchmarks
        re-run all four, record final numbers
-B      Locust scenarios if and only if the above is done
+B      enrolled_count reconciliation query after Benchmark 1 -- prove the
+       counter and the enrollments table agree (see DECISIONS.md)
 ```
 
 If you are behind here, apply the Section 0.1 cut order. Do not extend

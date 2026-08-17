@@ -376,8 +376,20 @@ models, not the plan: `users.name` (not `full_name`),
    **DONE — `1ca8b85b7626`.** Five tables, not four: `idempotency_keys`
    was missed by this note.
 5. ~~`users` has no `created_at` at all.~~ **DONE — `1ca8b85b7626`.**
-6. Confirm what `ResourceStatus` (AVAILABLE / BLOCKED) is for — it
-   appeared during the model session and is not in the original design.
+6. ~~Confirm what `ResourceStatus` (AVAILABLE / BLOCKED) is for — it
+   appeared during the model session and is not in the original design.~~
+   **Premise corrected: it IS in the original design** — `INIT_PLAN.md`
+   §11 (`status -- AVAILABLE | BLOCKED (admin-controlled)`), §12
+   (`PATCH /rooms/{id} -- modify availability/status`), and §13, which
+   titles it *"Requested feature: admin-only resource modification."* It
+   is admin-blocks-a-room-for-maintenance, and it was asked for.
+   **Still open, and narrower: the enforcement semantics.** Does blocking
+   evict existing reservations (proposed: no, matching the
+   capacity-reduction rule), and what error code? Proposal written up in
+   `10_DAY_PLAN.md` under Day 4. **Deadline is Day 3, not Day 8** — the
+   gate that reads the flag is one line inside the room and GPU
+   transactions, and those are frozen on Day 8. The PATCH endpoints that
+   write it are now scheduled on Day 6; they had no day at all before.
 7. Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
    entries live in their own table, so a student on the waitlist should
    have a row there, not an enrollment. Matters for Day 7 promotion.
@@ -595,6 +607,9 @@ Two consequences, both cheap:
 > item 4). It is now an ordering key, which does not break — every value
 > comes from the same server clock — but item 4 is worth doing before it
 > is also a value we return in API responses.
+>
+> **RESOLVED later the same day in `1ca8b85b7626`** — see "Schema hygiene"
+> below. Left in place because it is why that revision happened.
 
 **Verified:**
 
@@ -667,3 +682,114 @@ users.created_at  → 2026-08-17 10:15:29.001829+00, tz-aware
 all 6 created_at  → timestamp WITH time zone
 downgrade base → upgrade head, twice (5 revisions each way), alembic check clean
 ```
+
+---
+
+## Documentation reconciled against the schema at head
+
+No code or schema change. The five `.md` files had drifted apart, in the
+specific direction the Day 1 GPU note warned about: *"a stale doc is what
+makes someone 'helpfully' re-add the column on Day 6."*
+
+**Document precedence, now written down.** The models and migrations are
+the truth. Then this file (why, and what was reversed), then
+`ARCHITECTURE_AND_WORKFLOWS.md` (what the system is now), then
+`DAILY_LOG.md` and `10_DAY_PLAN.md`, then `INIT_PLAN.md`.
+
+**`INIT_PLAN.md` was corrected in place rather than deleted.** Its §11
+data model was the pre-amendment design and described four things the
+project has deliberately removed — GPU `start_time`/`end_time`,
+`Course.capacity`, `waitlist_entries.position`, and the
+`location`/`room_number`/`gpu_type` columns. It also predates the
+exactly-once guarantee entirely: no `IdempotencyKey` table, no
+`idempotency/` module, and a two-step lock order.
+
+Deleting it was considered and rejected — it is the only document that
+states the problem and the motivation, and those have not changed. Every
+divergence is now marked inline with `CHANGED:` and a pointer to the
+revision, so the file reads as a record of what was decided differently
+rather than as a competing specification.
+
+**`DECISIONS.md` and `DAILY_LOG.md` were deliberately NOT rewritten.**
+They are append-only records whose value is that they were written as
+things happened. Retrofitting today's schema onto Day 1's entries would
+destroy the one property that makes them credible. Only resolution
+markers were added, in the style the files already use.
+
+### Course write paths are keyed on the offering, not the course
+
+The one genuine design decision surfaced by the sync, and a direct
+consequence of `268c10da1da4` that nothing had recorded.
+
+The original API put registration at
+`POST /api/v1/courses/{course_id}/register`. Once `capacity`,
+`enrolled_count`, and `instructor_id` moved to `course_offerings`, that
+route stopped being implementable as specified: **one course has many
+offerings, so a course-keyed route has no single row to lock** — and
+locking the row that holds the counter is the entire mechanism that makes
+Benchmark 1 winnable.
+
+Resolved by splitting the API the same way the schema was split:
+
+``` text
+read paths stay course-shaped     GET /courses
+                                  GET /courses/{id}
+                                  GET /courses/{id}/offerings
+
+write paths become offering-shaped  POST   /offerings/{id}/register
+                                    DELETE /offerings/{id}/drop
+                                    GET    /offerings/{id}/waitlist
+```
+
+Browsing a catalogue is genuinely course-shaped; allocating a seat is
+not. Affects B's Day 4 column.
+
+### Left open on purpose
+
+Outstanding items 6 and 7 above are unchanged — both are joint calls and
+neither is a documentation problem:
+
+- what `ResourceStatus` (AVAILABLE / BLOCKED) is actually for;
+- whether `EnrollmentStatus.WAITLISTED` is ever used, given waitlist
+  entries live in their own table. **This blocks Day 7 promotion.**
+
+Related, and the same confusion: `Resource` sets
+`polymorphic_identity = ResourceType.COURSE` on the base class, so a bare
+`Resource()` is typed COURSE while courses never appear in `resources` at
+all. Recorded here rather than fixed, because `models/` needs both people.
+
+---
+
+## Incident — a healthy stack on an empty database
+
+B's database had **zero tables and no `alembic_version` row**. The chain
+had never been applied to that volume. Both containers were up, the `db`
+container was reporting `healthy`, and `/health/db` was returning
+`{"database":"ok"}` throughout.
+
+It returns ok because it runs `SELECT 1`. That proves the connection
+works, the credentials are right, and the server is accepting queries —
+and says nothing whatsoever about whether the schema exists. A green
+health check and a green `docker compose ps` were both true and both
+irrelevant.
+
+> Sharpening the Day 1 and Day 2 lessons, which were about not trusting a
+> *command's* success: do not trust a **health check** either. `/health/db`
+> answers "can I reach Postgres", not "is this database usable". The check
+> that would have caught this is `alembic current`, and it costs nothing:
+>
+>     docker compose exec app alembic current   # expect: <rev> (head)
+>     docker compose exec app alembic check     # expect: no new operations
+>
+> Worth running at the start of any session that has been away from the
+> repo, before concluding anything from the app's behaviour.
+
+Fixing it was a single `alembic upgrade head`, and it had a silver
+lining: because the database was at base rather than incrementally built,
+that upgrade **was** the clean-DB test Day 1 asked for. All five
+revisions applied from empty, `alembic check` clean, 9 non-FK constraints
+and 6 hot-path indexes verified by querying `pg_constraint` and
+`pg_indexes` directly. Full output in `DAILY_LOG.md`.
+
+Still outstanding: the same run on A's machine. "Verify on a clean DB on
+**both** machines" is not met by verifying one.

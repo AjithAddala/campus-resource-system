@@ -19,7 +19,7 @@ point:
 ``` text
 ┌─────────────────────────────────────────────────────────┐
 │  CLIENT                                                  │
-│  Swagger UI / HTTP / Locust                              │
+│  Swagger UI / HTTP / asyncio + httpx harness             │
 │  Sends: Authorization: Bearer <JWT>                      │
 │         Idempotency-Key: <uuid>   (mutations only)       │
 └────────────────────────┬────────────────────────────────┘
@@ -128,8 +128,9 @@ GPUCluster      id → Resource.id, gpu_count, allocated
 -- Joined-table inheritance: rooms.id and gpu_clusters.id ARE resources.id,
 -- not a separate resource_id column.
 -- The original design also had Resource.location, Room.room_number, and
--- GPUCluster.gpu_type. None are in the models. Cosmetic, so either add them
--- deliberately or drop them from the design — do not leave the gap open.
+-- GPUCluster.gpu_type. RESOLVED: dropped from the design, not added to the
+-- models. They are labels, carry no invariant, and nothing in the system
+-- reads them. INIT_PLAN.md §11 has been corrected to match.
 
 Course          id, code, name
 CourseOffering  id, course_id → Course, instructor_id → User,
@@ -144,6 +145,9 @@ GPUReservation  id, gpu_cluster_id → GPUCluster, user_id → User,
                 -- DECISIONS.md. Do not re-add them.
 Enrollment      id, student_id → User, course_offering_id → CourseOffering,
                 status, created_at
+                UNIQUE (student_id, course_offering_id) -- unconditional, so a
+                -- dropped student STILL OWNS A ROW. Re-registration and
+                -- waitlist promotion must therefore be UPDATEs, not INSERTs.
 WaitlistEntry   id, student_id → User, course_offering_id → CourseOffering,
                 created_at                 -- FIFO order; no stored position
                 UNIQUE (student_id, course_offering_id)
@@ -408,7 +412,7 @@ cancel would double-decrement and require its own guard.
 ## 12. Workflow D — Student registers for a course
 
 ``` text
-POST /api/v1/courses/{id}/register        [STUDENT only → else 403]
+POST /api/v1/offerings/{id}/register      [STUDENT only → else 403]
 
   BEGIN
     LOCK user row
@@ -416,12 +420,22 @@ POST /api/v1/courses/{id}/register        [STUDENT only → else 403]
       no schedule overlap with existing    ✓ else 409
     LOCK course_offering row
       enrolled_count 49 < capacity 50      ✓ else → waitlist
-    INSERT enrollment                      ← UNIQUE(student, offering)
-                                             blocks duplicates
+    UPSERT enrollment                      ← UNIQUE(student, offering)
+                                             blocks duplicates; a student
+                                             who dropped still owns a row,
+                                             so this is an UPDATE not an
+                                             INSERT (see §3)
     enrolled_count → 50                    ← same transaction, always
   COMMIT
   → 201
 ```
+
+**The route is keyed on the offering, not the course.** Capacity,
+`enrolled_count`, and the locked row all live on `course_offerings`, and
+one course has many offerings — so `/courses/{id}/register` would have no
+single row to lock, which is the entire mechanism. Read paths stay
+course-shaped (`GET /courses`, `GET /courses/{id}/offerings`); write paths
+are offering-shaped.
 
 Under 500 concurrent registrations for 50 seats: exactly 50 succeed, 450
 receive `409`, over-allocation is zero.
