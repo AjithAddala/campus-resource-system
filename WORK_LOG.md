@@ -1,4 +1,4 @@
-# Daily Log
+# Work Log
 
 A running record of **what happened, when, and by whom.**
 
@@ -8,7 +8,8 @@ questions, and keeping them separate is what stops both from rotting:
 | File | Answers | Written when |
 |---|---|---|
 | `DECISIONS.md` | *why* the system is shaped this way | a decision is made or reversed |
-| `DAILY_LOG.md` | *what* we did on a given day, and what it cost | end of each working day |
+| `WORK_LOG.md` | *what* we did in a given session, and what it cost | end of each working session |
+| `EXECUTION_PLAN.md` | what must be true to call a **Deadline** met | the plan changes |
 | `ARCHITECTURE_AND_WORKFLOWS.md` | what the system *is*, right now | the models or endpoints change |
 
 Rule: if an entry here starts explaining *why*, it belongs in
@@ -16,12 +17,35 @@ Rule: if an entry here starts explaining *why*, it belongs in
 
 Entries are chronological — oldest first, newest appended at the bottom.
 
+## Sessions are not Deadlines
+
+**A session is one sitting. A Deadline is a milestone in
+`EXECUTION_PLAN.md`.** They are numbered separately and on purpose.
+
+This file previously numbered its entries "Day 1, Day 2, Day 3", which
+silently implied three deadlines had been met. They had not: sessions 2,
+3 and 4 were all still finishing **Deadline 1's** checkpoints — the
+schema items, the documentation sync, and the clean-DB migration run.
+Nothing from Deadline 2 has been started.
+
+So every entry names the Deadline it advanced, and says whether that
+Deadline is now met. A deadline may take several sessions; a session may
+touch more than one deadline; neither implies the other.
+
+**As of session 4 (2026-08-18): Deadline 1 MET. Deadline 2 not started.**
+
+It took four sessions to meet the first of ten deadlines. That is the
+number worth looking at, and it was invisible while sessions and
+deadlines shared a numbering scheme.
+
 ---
 
-## Day 1 — 2026-08-15 — JOINT
+## Session 1 — 2026-08-15 — JOINT
+
+**Advances:** Deadline 1 (Foundation)
 
 **Plan:** foundation. Repo, Docker, all models, first migration, frozen
-interfaces, agreed error codes. The one day the plan says not to
+interfaces, agreed error codes. The one deadline the plan says not to
 parallelize.
 
 **Shipped**
@@ -40,7 +64,7 @@ parallelize.
 - Agreed error-code table (401 / 403 / 409 `CAPACITY_EXHAUSTED` /
   409 `QUOTA_EXCEEDED` / 422 `IDEMPOTENCY_KEY_REUSED`)
 - Ownership settled: Alembic is A's exclusively; `models/` needs both
-  people present after today
+  people present from here on
 
 **Cost incurred**
 
@@ -50,16 +74,22 @@ parallelize.
 - Port 5432 held by containers from an earlier project directory.
 
 **Carried forward:** 7 outstanding schema items, listed in `DECISIONS.md`.
+**Deadline 1 status:** not met — the outstanding schema items are part of
+it, and the clean-DB checkpoint had only been tested incrementally.
 
 ---
 
-## Day 2 — 2026-08-17 — A (solo)
+## Session 2 — 2026-08-17 — A (solo)
 
-**Plan:** A takes auth (Argon2, JWT, register/login); B takes the seed
-script and read endpoints.
+**Advances:** Deadline 1 (schema items carried forward), *not* Deadline 2
 
-**Actually spent on schema amendments and Day 1 verification**, before any
-auth code. Three revisions plus a fix to Day 1's migration.
+**Plan as written:** A takes auth (Argon2, JWT, register/login); B takes
+the seed script and read endpoints — i.e. Deadline 2. What actually
+happened was Deadline 1 cleanup, which is why the numbering here stopped
+matching the plan.
+
+**Actually spent on schema amendments and Deadline 1 verification**, before any
+auth code. Three revisions plus a fix to Deadline 1's migration.
 
 **Shipped — `268c10da1da4`, course capacity moves to the offering**
 
@@ -89,9 +119,9 @@ auth code. Three revisions plus a fix to Day 1's migration.
 - `ix_gpu_reservations_user_status`, `ix_enrollments_offering_status`,
   `ix_reservations_user_id`.
 
-**Fixed — Day 1's migration chain could not be re-run from empty**
+**Fixed — Deadline 1's migration chain could not be re-run from empty**
 
-Day 1's "verify on a clean DB" checkpoint had only ever been tested
+Deadline 1's "verify on a clean DB" checkpoint had only ever been tested
 incrementally. `downgrade base` → `upgrade head` failed on
 `type "resource_type_enum" already exists`. Two bugs in `705b757e5df2`:
 enum types survived `downgrade base` (`op.drop_table` does not drop them),
@@ -113,33 +143,40 @@ duplicate waitlist join, duplicate course code → both rejected
 
 **Docs synced:** `ARCHITECTURE_AND_WORKFLOWS.md` data model, the GPU
 request body (still showed `start_time`/`end_time` — the exact stale line
-Day 1 flagged as an ACTION), and Day 7's block in `10_DAY_PLAN.md`, which
+Deadline 1 flagged as an ACTION), and Deadline 7's block in `EXECUTION_PLAN.md`, which
 still described renumbering positions.
 
-**Day 1 status: complete**, all five checklist items verified.
+**Deadline 1 status:** still not met. All five carried schema items are
+verified, but the "migration applies cleanly on a clean DB **on both
+machines**" checkpoint is only done on B's. That is item 0 below and it
+is what session 4 closes.
 
 **Open / carried forward**
 
 1. **B has not seen any of this.** `models/` changed solo, which the
-   shared-file protocol does not allow after Day 1. B's Day 2 column is
+   shared-file protocol does not allow after Deadline 1. B's Deadline 2 column is
    exactly what these changes break: `capacity` is no longer on `courses`,
    `instructor_id` is `NOT NULL`, `courses.code` is UNIQUE.
 2. Outstanding items 6 and 7 are still open — decisions, not code, and
-   both need B. Item 7 blocks Day 7 promotion.
+   both need B. Item 7 blocks Deadline 7 promotion.
 3. `Resource` sets `polymorphic_identity = ResourceType.COURSE` on the
    base class, so a bare `Resource()` is typed COURSE while courses never
    appear in `resources`. Same confusion as item 6.
-4. A's Day 2 auth work not started: `core/security.py` → `auth/schemas.py`
+4. A's Deadline 2 auth work not started: `core/security.py` → `auth/schemas.py`
    → `auth/service.py` → `auth/router.py`.
 5. `tests/` is empty and `pytest-asyncio` is not in `requirements.txt` —
-   Day 5's harness has nothing to build on.
+   Deadline 5's harness has nothing to build on.
 
 ---
 
-## Day 2 (continued) — 2026-08-17 — B
+## Session 3 — 2026-08-17 — B
 
-**Plan:** B's Day 2 column (seed script, read endpoints). **Actually spent
-on reconciling the documentation against A's three schema revisions**,
+**Advances:** Deadline 1 (documentation reconciled to the schema), *not*
+Deadline 2
+
+**Plan as written:** B's Deadline 2 column (seed script, read endpoints).
+**Actually spent on reconciling the documentation against A's three
+schema revisions**,
 which is open item 1 from the entry above — "B has not seen any of this."
 
 **Shipped — documentation only. No code, no schema, no migration.**
@@ -154,9 +191,9 @@ which is open item 1 from the entry above — "B has not seen any of this."
   `location`/`room_number`/`gpu_type` gap the doc itself flagged as "do
   not leave open"; recorded the dropped-enrollment-row trap next to the
   unique constraint; moved Workflow D onto an offering-keyed route.
-- `10_DAY_PLAN.md`: Locust marked cut in the scope block (it was only
-  marked in the cut order); Day 3 no longer asks A for a migration that
-  shipped on Day 1; Day 2 seed now says capacity and `instructor_id` go
+- `EXECUTION_PLAN.md`: Locust marked cut in the scope block (it was only
+  marked in the cut order); Deadline 3 no longer asks A for a migration that
+  shipped on Deadline 1; Deadline 2 seed now says capacity and `instructor_id` go
   on the offering, and warns about `func.now()` on seeded waitlist rows.
 - `DECISIONS.md`: document precedence written down; the course-vs-offering
   API decision recorded; open items 6 and 7 restated as still open.
@@ -168,14 +205,14 @@ which is open item 1 from the entry above — "B has not seen any of this."
 `enrolled_count` lives on `course_offerings` — one course has many
 offerings, so there is no single row to lock. Registration, drop, and
 waitlist move to `/offerings/{id}/...`; catalogue reads stay on
-`/courses`. This lands in B's Day 4 column.
+`/courses`. This lands in B's Deadline 4 column.
 
-**Also shipped — Day 1's last checkpoint, actually closed on B's machine**
+**Also shipped — Deadline 1's last checkpoint, actually closed on B's machine**
 
 The database on B's machine had **zero tables and no `alembic_version`
 row** — the chain had never been applied to this volume. Both containers
 were up and healthy the whole time. Applied all five revisions from
-empty, which is the clean-DB test Day 1 asked for and the only version of
+empty, which is the clean-DB test Deadline 1 asked for and the only version of
 it that proves anything.
 
 **Verification run**
@@ -205,32 +242,35 @@ argon2 / jose / multipart   -> import OK in the container
 ```
 
 No test rows inserted, so the database is at head and empty — the state
-the Day 2 seed script expects.
+the Deadline 2 seed script expects.
 
 **Cost incurred**
 
-- Day 2's actual B column (seed script, read endpoints) is still not
-  started. Both people are now behind their Day 2 plan.
+- Deadline 2's actual B column (seed script, read endpoints) is still not
+  started. Both people are now behind their Deadline 2 plan.
 
 **Open / carried forward**
 
 0. **A must run `alembic upgrade head` from empty on their machine too.**
-   Day 1 says "verify on a clean DB on BOTH machines"; only B's is
+   Deadline 1 says "verify on a clean DB on BOTH machines"; only B's is
    verified. Likely fine — A wrote the revisions — but the checkpoint is
    not met on assertion.
-1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Day 7.
+1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Deadline 7.
 2. `Resource.polymorphic_identity = ResourceType.COURSE` on the base
    class — needs both people, since `models/` is frozen.
 3. `tests/` still absent, `pytest-asyncio` still not in
-   `requirements.txt`. Day 5 has nothing to build on.
+   `requirements.txt`. Deadline 5 has nothing to build on.
 4. `python-jose==3.3.0` carries known advisories and A is about to write
    `core/security.py` against it. Worth switching to `PyJWT` before the
    code exists rather than after.
-5. A's Day 2 auth work still not started.
+5. A's Deadline 2 auth work still not started.
 
 ---
 
-## Day 3 — 2026-08-18 — A (solo)
+## Session 4 — 2026-08-18 — A (solo)
+
+**Advances:** Deadline 1 — and **closes it**. First session where the
+work done matches the deadline claimed.
 
 **Plan:** clear the two items blocking `core/security.py` — the clean-DB
 checkpoint on A's machine (carried item 0) and the `python-jose` swap
@@ -246,6 +286,15 @@ checkpoint on A's machine (carried item 0) and the `python-jose` swap
   `requirements.txt`, image rebuilt. Carried item 4 closed. Nothing
   imported `jose`, so this was a one-line change with no call sites to
   migrate — which was the entire point of doing it before `security.py`.
+- `scripts/check_jwt.py` — 9 assertions covering the swap, exits
+  non-zero on failure so it is a gate, not a paragraph.
+- **Docs renamed off the calendar: Deadlines, not days.** `10_DAY_PLAN.md`
+  → `EXECUTION_PLAN.md`, `DAILY_LOG.md` → `WORK_LOG.md` (both `git mv`),
+  and every "Day N" milestone is now "Deadline N" across all five docs.
+  This log's entries became **Sessions**, each naming the Deadline it
+  advanced. Reasoning in `DECISIONS.md`; the short version is that
+  sessions and deadlines shared one numbering scheme, so three log
+  entries read as three deadlines met when only Deadline 1 was in play.
 
 **Verification run**
 
@@ -256,7 +305,7 @@ alembic current             -> 1ca8b85b7626 (head)
 alembic check               -> No new upgrade operations detected.
 
 state at base               -> only alembic_version remains
-                            -> zero leftover enum types (the Day 2 bug
+                            -> zero leftover enum types (the session-2 bug
                                that broke the chain stays fixed)
                             -> btree_gist still installed; downgrade does
                                not drop it, and CREATE EXTENSION IF NOT
@@ -267,16 +316,23 @@ pip show cryptography       -> not found (jose was the only thing pulling it)
 python -c "import jose"     -> ModuleNotFoundError
 pip show PyJWT              -> 2.10.1
 
-HS256 round-trip, real settings, in the container:
+scripts/check_jwt.py        -> 9 checks, all pass, exit 0
   encode                    -> str
   decode                    -> {'sub': '1', 'role': 'ADMIN', 'exp', 'iat'}
   wrong secret              -> InvalidSignatureError
   expired token             -> ExpiredSignatureError
-  {'sub': 1} (int)          -> InvalidSubjectError: Subject must be a string
+  {'sub': 1} at encode      -> accepted silently  <- the trap
+  {'sub': 1} at decode      -> InvalidSubjectError: Subject must be a string
 
 /health, /health/db         -> 200, both ok after rebuild
 alembic current             -> 1ca8b85b7626 (head)
 ```
+
+Writing the check as a script rather than pasting into a shell paid for
+itself immediately: the first version asserted that an int `sub` fails at
+*encode*, and it does not — it fails at decode, which is a much worse
+failure mode (login succeeds, every later request 401s). A one-off paste
+would have confirmed the wrong belief and moved on.
 
 **Cost incurred**
 
@@ -285,24 +341,34 @@ alembic current             -> 1ca8b85b7626 (head)
   PowerShell. Environment quirk, not a project problem — noted so it is
   not re-debugged.
 
+**Deadline 1 status: MET.** Every checkpoint now verified on both
+machines: `docker compose up` works, `/docs` loads, and the migration
+applies cleanly from empty for both people. Four sessions, one deadline.
+
 **Open / carried forward**
 
-1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Day 7.
+1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Deadline 7.
 2. `Resource.polymorphic_identity = ResourceType.COURSE` on the base
    class — needs both people, since `models/` is frozen.
 3. `tests/` still absent, `pytest-asyncio` still not in
-   `requirements.txt`. Day 5 has nothing to build on.
-4. A's auth column (`core/security.py` → `auth/schemas.py` →
-   `auth/service.py` → `auth/router.py`) is now unblocked and not started.
+   `requirements.txt`. Deadline 5 has nothing to build on.
+4. **Deadline 2 has not been started by either person.** A's auth column
+   (`core/security.py` → `auth/schemas.py` → `auth/service.py` →
+   `auth/router.py`) is unblocked. B's seed script and read endpoints are
+   untouched. This is the whole of Deadline 2 and it is all still ahead.
 
 ---
 
 ## Template
 
 ```markdown
-## Day N — YYYY-MM-DD — A / B / JOINT
+## Session N — YYYY-MM-DD — A / B / JOINT
 
-**Plan:** what the 10-day plan says today is.
+**Advances:** Deadline M (name)   <- which milestone this served; say
+                                     "not Deadline M+1" if the plan said
+                                     otherwise and reality differed
+
+**Plan:** what this session set out to do.
 
 **Shipped**
 - ...
@@ -313,11 +379,14 @@ alembic current             -> 1ca8b85b7626 (head)
 **Cost incurred**          <- time lost and to what; omit if none
 - ...
 
+**Deadline M status:** MET / still open, and what is missing if open.
+                       A session ending is not a deadline being met.
+
 **Open / carried forward**
 - ...
 ```
 
-Two habits worth keeping, both learned the hard way on Days 1 and 2:
+Two habits worth keeping, both learned the hard way in sessions 1 and 2:
 
 - **Verify by querying, never by assuming a successful command.** A
   migration that reports success may not have run the DDL you wrote.

@@ -39,7 +39,7 @@ cancellation and course registration too. No exceptions, anywhere.
 
 ---
 
-# Day 1
+# Deadline 1
 
 ## Stack
 
@@ -58,7 +58,7 @@ difference between our skeleton and a tutorial's:
 - `autoflush=False` — SQLAlchemy will not silently emit INSERTs at
   surprising points. We are reasoning about statement order; statements
   must not move. `db.flush()` is called explicitly when a write must
-  land early — needed on Day 5 so the idempotency key hits the unique
+  land early — needed on Deadline 5 so the idempotency key hits the unique
   index at a known point.
 - `expire_on_commit=False` — objects stay readable after commit, so
   building a response does not trigger an extra SELECT.
@@ -84,7 +84,7 @@ through A.
 `reservations/` is otherwise B's. It is a locking transaction (user lock,
 then cluster lock, then decrement `allocated`) and must obey the same
 lock order as allocation. Reversing it in this one file would reintroduce
-deadlock across the whole app. Settled Day 1 to avoid a Day 7 merge
+deadlock across the whole app. Settled Deadline 1 to avoid a Deadline 7 merge
 conflict.
 
 ## Schema decisions (ratified before freeze)
@@ -116,7 +116,7 @@ database can express, some it cannot, and quota is one it cannot.
 
 > ~~ACTION: the architecture doc still lists `start_time`/`end_time` on
 > `GPUReservation`. It must be corrected — a stale doc is what makes
-> someone "helpfully" re-add the column on Day 6.~~
+> someone "helpfully" re-add the column on Deadline 6.~~
 > **DONE.** The doc now carries an explicit "do not re-add them" note.
 > Three other lines in the same block had drifted (`Resource.location`,
 > `Room.room_number`, `GPUCluster.gpu_type`, and `resource_id` where
@@ -146,7 +146,7 @@ anyway, so we spent no more time here.
 Consequence, and it is a real trap: a student who dropped still owns a
 row, so **re-registration and waitlist promotion must be UPDATEs, not
 INSERTs.** A promoted student who previously dropped would otherwise hit
-an IntegrityError inside the promotion transaction on Day 7, which would
+an IntegrityError inside the promotion transaction on Deadline 7, which would
 look like a mysterious bug rather than a design consequence.
 
 Partial unique index (`WHERE status='ACTIVE'`) was considered and
@@ -162,7 +162,7 @@ guarantee — if the process crashes mid-transaction, key and booking roll
 back together and the retry books cleanly.
 
 **The JWT carries the role as a claim.** `require_role` can then
-authorise without a DB query per request — which matters on Day 5, when
+authorise without a DB query per request — which matters on Deadline 5, when
 500 concurrent requests must not add user-lookup noise to lock
 measurements. Tradeoff: a role change does not take effect until the
 token expires (60 min). Accepted.
@@ -174,8 +174,8 @@ def get_current_user(...) -> User
 def require_role(*allowed: Role) -> Callable
 ```
 
-Stub shipped Day 1 in `app/core/dependencies.py`, returning a hardcoded
-ADMIN so B is unblocked at 9am. Day 3 replaces the **bodies only** —
+Stub shipped Deadline 1 in `app/core/dependencies.py`, returning a hardcoded
+ADMIN so B is unblocked at 9am. Deadline 3 replaces the **bodies only** —
 same import path, no refactor on B's side.
 
 | Code | Meaning |
@@ -260,7 +260,7 @@ pg_constraint query          → no_overlapping_room_reservations present
 was never committed at all.** Every model imports from `enums` (plural),
 so the package could not import — meaning the models had never been run
 before being pushed. `resource.py` holds `GPUCluster`, the row locked on
-Day 4; without it there is no project.
+Deadline 4; without it there is no project.
 
 Resolved by writing `resource.py` locally and renaming `enum.py` →
 `enums.py`. Note `enum.py` is also actively dangerous as a filename: it
@@ -273,8 +273,8 @@ Cost: roughly one hour.
 >
 >     docker compose exec app python -c "import app.models; from app.database.base import Base; print(len(Base.metadata.tables))"
 
-**The migration chain could not be re-run from empty.** Found on Day 2
-while verifying Day 1's "migration applies cleanly on a clean DB"
+**The migration chain could not be re-run from empty.** Found in session 2
+while verifying Deadline 1's "migration applies cleanly on a clean DB"
 checkpoint — which had only ever been tested *incrementally*, never from
 zero. `alembic downgrade base` then `alembic upgrade head` failed:
 
@@ -298,7 +298,7 @@ upgrade:
    create it again. Removed from the initial migration; `e0fbfe421403`
    owns it, which was the point of giving it its own revision.
 
-The Day 1 note above says the duplicated DDL "silently did not execute."
+The Deadline 1 note above says the duplicated DDL "silently did not execute."
 It executes. What actually happened is that the constraint was created by
 the initial migration, the check for it ran against a database where the
 separate revision had also been applied, and nobody re-ran the chain from
@@ -311,7 +311,7 @@ revision 1 as well. The database was left with zero tables and an empty
 would have left it. Good property to know: a failed chain leaves nothing
 half-built.
 
-> Lesson, sharper than Day 1's version: `alembic upgrade head` on a
+> Lesson, sharper than Deadline 1's version: `alembic upgrade head` on a
 > database you built incrementally proves nothing. The check is
 > **`downgrade base` → `upgrade head`, twice.** Now passing, twice, with
 > `alembic check` clean and all 9 non-FK constraints present after the
@@ -330,10 +330,10 @@ deleting the folder.
 **Column names differ from the original design** and code must match the
 models, not the plan: `users.name` (not `full_name`),
 `users.password_hash` (not `hashed_password`), and
-`gpu_reservations.gpu_cluster_id` (not `cluster_id`). Relevant to Day 2's
+`gpu_reservations.gpu_cluster_id` (not `cluster_id`). Relevant to Deadline 2's
 `auth/service.py`.
 
-## Outstanding — ~~B~~ to fix before Day 3
+## Outstanding — ~~B~~ to fix before Deadline 3
 
 > **Mislabelled.** Items 1–5 are all schema changes, and schema changes
 > require an Alembic revision, which **only A may create** (see Ownership
@@ -366,7 +366,7 @@ models, not the plan: `users.name` (not `full_name`),
    GiST index on `(resource_id, tstzrange(start,end))` partial to
    `status='ACTIVE'` — the availability query's exact shape, so a btree on
    `(resource_id, status)` would duplicate it. Not EXPLAIN-verified,
-   because that query does not exist yet; re-check on Day 3 when it does.
+   because that query does not exist yet; re-check on Deadline 3 when it does.
    Added `ix_reservations_user_id` instead, which nothing covered — "my
    reservations" had no index at all and was not on this list.
 4. ~~**`created_at` resolved to `timestamp without time zone`** on
@@ -386,21 +386,21 @@ models, not the plan: `users.name` (not `full_name`),
    **Still open, and narrower: the enforcement semantics.** Does blocking
    evict existing reservations (proposed: no, matching the
    capacity-reduction rule), and what error code? Proposal written up in
-   `10_DAY_PLAN.md` under Day 4. **Deadline is Day 3, not Day 8** — the
+   `EXECUTION_PLAN.md` under Deadline 4. **Deadline is Deadline 3, not Deadline 8** — the
    gate that reads the flag is one line inside the room and GPU
-   transactions, and those are frozen on Day 8. The PATCH endpoints that
-   write it are now scheduled on Day 6; they had no day at all before.
+   transactions, and those are frozen on Deadline 8. The PATCH endpoints that
+   write it are now scheduled at Deadline 6; they had none at all before.
 7. Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
    entries live in their own table, so a student on the waitlist should
-   have a row there, not an enrollment. Matters for Day 7 promotion.
+   have a row there, not an enrollment. Matters for Deadline 7 promotion.
 
 ---
 
 ## Pre-agreed cut order
 
-Decided now rather than under pressure on Day 8. Day 10 is not a buffer.
+Decided now rather than under pressure on Deadline 8. Deadline 10 is not a buffer.
 
-1. ~~Locust~~ (cut Day 1)
+1. ~~Locust~~ (cut Deadline 1)
 2. Room quota (mechanism identical to GPU; document it)
 3. Course-load quota (same)
 4. Schedule-overlap check (orthogonal to the concurrency story)
@@ -420,13 +420,13 @@ deliberately. B runs Benchmark 2 against it and records the corruption
 (`held = 4`). Then the lock goes in and it is re-run.
 
 Two numbers side by side — broken and fixed — is the single most credible
-artifact in the project. Reconstructing a "broken build" on Day 8 to make
+artifact in the project. Reconstructing a "broken build" on Deadline 8 to make
 a table look good is obvious and worthless. Same applies to Benchmark 1
 against unlocked course registration.
 
 ---
 
-## Day 2 split
+## Deadline 2 split
 
 - **A:** Argon2 hashing, JWT encode/decode with role claim,
   `POST /auth/register`, `POST /auth/login`.
@@ -461,7 +461,7 @@ rewriting the catalogue.
 
 **`enrolled_count` added to `course_offerings`.** This is the counter
 that course registration locks — the direct analogue of
-`GPUCluster.allocated`, so the Day 4 GPU transaction and the Day 6 course
+`GPUCluster.allocated`, so the Deadline 4 GPU transaction and the Deadline 6 course
 transaction now have *the same shape*: `SELECT ... FOR UPDATE` the row
 holding the counter, compare against `capacity`, increment, insert.
 
@@ -475,7 +475,7 @@ Locking the offering row is what makes Benchmark 1 winnable.
 `enrolled_count` is therefore derived state and can disagree with
 `enrollments` if any code path updates one without the other. The rule:
 **every write to `enrollments` happens in the same transaction as the
-matching `enrolled_count` update.** Day 6 should end with a reconciliation
+matching `enrolled_count` update.** Deadline 6 should end with a reconciliation
 query proving the two agree after Benchmark 1:
 
 ```sql
@@ -514,7 +514,7 @@ Downgrade collapses capacity back to `MAX` over a course's offerings —
 lossy by nature, since many offerings map to one course. Noted so nobody
 reads the downgrade as a true inverse.
 
-**Verified** (per the Day 1 rule — query the database, do not trust
+**Verified** (per the Deadline 1 rule — query the database, do not trust
 "upgrade successful"):
 
 ```
@@ -528,7 +528,7 @@ alembic check                                        → no drift
 import app.models                                    → still 12 tables
 ```
 
-Seeds and read endpoints (Day 2, B) must set `capacity` and
+Seeds and read endpoints (Deadline 2, B) must set `capacity` and
 `instructor_id` on the offering, not the course.
 
 ---
@@ -600,7 +600,7 @@ Two consequences, both cheap:
 
 1. **`ORDER BY created_at, id` — always, never `created_at` alone.** The
    index leads with `created_at`, so the tiebreak costs nothing.
-2. Day 2's seed script either commits each waitlist insert separately, or
+2. Deadline 2's seed script either commits each waitlist insert separately, or
    sets `created_at` explicitly per row.
 
 > Note: `created_at` is still `timestamp without time zone` (outstanding
@@ -688,13 +688,13 @@ downgrade base → upgrade head, twice (5 revisions each way), alembic check cle
 ## Documentation reconciled against the schema at head
 
 No code or schema change. The five `.md` files had drifted apart, in the
-specific direction the Day 1 GPU note warned about: *"a stale doc is what
-makes someone 'helpfully' re-add the column on Day 6."*
+specific direction the Deadline 1 GPU note warned about: *"a stale doc is what
+makes someone 'helpfully' re-add the column on Deadline 6."*
 
 **Document precedence, now written down.** The models and migrations are
 the truth. Then this file (why, and what was reversed), then
 `ARCHITECTURE_AND_WORKFLOWS.md` (what the system is now), then
-`DAILY_LOG.md` and `10_DAY_PLAN.md`, then `INIT_PLAN.md`.
+`WORK_LOG.md` and `EXECUTION_PLAN.md`, then `INIT_PLAN.md`.
 
 **`INIT_PLAN.md` was corrected in place rather than deleted.** Its §11
 data model was the pre-amendment design and described four things the
@@ -710,9 +710,9 @@ divergence is now marked inline with `CHANGED:` and a pointer to the
 revision, so the file reads as a record of what was decided differently
 rather than as a competing specification.
 
-**`DECISIONS.md` and `DAILY_LOG.md` were deliberately NOT rewritten.**
+**`DECISIONS.md` and `WORK_LOG.md` were deliberately NOT rewritten.**
 They are append-only records whose value is that they were written as
-things happened. Retrofitting today's schema onto Day 1's entries would
+things happened. Retrofitting today's schema onto Deadline 1's entries would
 destroy the one property that makes them credible. Only resolution
 markers were added, in the style the files already use.
 
@@ -742,7 +742,7 @@ write paths become offering-shaped  POST   /offerings/{id}/register
 ```
 
 Browsing a catalogue is genuinely course-shaped; allocating a seat is
-not. Affects B's Day 4 column.
+not. Affects B's Deadline 4 column.
 
 ### Left open on purpose
 
@@ -751,7 +751,7 @@ neither is a documentation problem:
 
 - what `ResourceStatus` (AVAILABLE / BLOCKED) is actually for;
 - whether `EnrollmentStatus.WAITLISTED` is ever used, given waitlist
-  entries live in their own table. **This blocks Day 7 promotion.**
+  entries live in their own table. **This blocks Deadline 7 promotion.**
 
 Related, and the same confusion: `Resource` sets
 `polymorphic_identity = ResourceType.COURSE` on the base class, so a bare
@@ -773,7 +773,7 @@ and says nothing whatsoever about whether the schema exists. A green
 health check and a green `docker compose ps` were both true and both
 irrelevant.
 
-> Sharpening the Day 1 and Day 2 lessons, which were about not trusting a
+> Sharpening the two lessons above, which were about not trusting a
 > *command's* success: do not trust a **health check** either. `/health/db`
 > answers "can I reach Postgres", not "is this database usable". The check
 > that would have caught this is `alembic current`, and it costs nothing:
@@ -786,10 +786,10 @@ irrelevant.
 
 Fixing it was a single `alembic upgrade head`, and it had a silver
 lining: because the database was at base rather than incrementally built,
-that upgrade **was** the clean-DB test Day 1 asked for. All five
+that upgrade **was** the clean-DB test Deadline 1 asked for. All five
 revisions applied from empty, `alembic check` clean, 9 non-FK constraints
 and 6 hot-path indexes verified by querying `pg_constraint` and
-`pg_indexes` directly. Full output in `DAILY_LOG.md`.
+`pg_indexes` directly. Full output in `WORK_LOG.md`.
 
 ~~Still outstanding: the same run on A's machine. "Verify on a clean DB on
 **both** machines" is not met by verifying one.~~
@@ -797,11 +797,11 @@ and 6 hot-path indexes verified by querying `pg_constraint` and
 > **RESOLVED 2026-08-18.** Run on A's machine: `downgrade base` →
 > `upgrade head`, twice, five revisions each way, `alembic current` =
 > `1ca8b85b7626 (head)`, `alembic check` clean. Full output in
-> `DAILY_LOG.md`, Day 3.
+> `WORK_LOG.md`, Deadline 3.
 >
 > One thing the round-trip confirms that `alembic check` cannot: at
 > `base` the database holds **only `alembic_version`** — no orphan enum
-> types. That is the Day 2 chain-breaking bug, still fixed. `btree_gist`
+> types. That is the Deadline 2 chain-breaking bug, still fixed. `btree_gist`
 > deliberately survives the downgrade (dropping an extension can break
 > objects outside our schema); `CREATE EXTENSION IF NOT EXISTS` is what
 > makes the next upgrade idempotent anyway.
@@ -813,7 +813,7 @@ and 6 hot-path indexes verified by querying `pg_constraint` and
 `python-jose[cryptography]==3.3.0` → `PyJWT==2.10.1`. Taken **before**
 `core/security.py` exists, which is the only reason it was a one-line
 change: nothing imported `jose`, so there were no call sites to migrate.
-The same swap after Day 2's auth column would have touched encode,
+The same swap after Deadline 2's auth column would have touched encode,
 decode, and every exception handler.
 
 python-jose 3.3.0 carries known advisories and the project is not
@@ -826,23 +826,86 @@ if we ever move to RS256, via `PyJWT[crypto]`.
 **Two behavioural differences that matter for `security.py`,** both
 verified in the container rather than read off a changelog:
 
-1. **`sub` must be a string.** PyJWT ≥ 2.10 validates it —
-   `{'sub': user.id}` with an int raises `InvalidSubjectError: Subject
-   must be a string` at **encode** time. So it is `str(user.id)` on the
-   way out and `int(payload["sub"])` on the way back. This would
-   otherwise have been found by a failing login, not by reading.
+1. **`sub` must be a string, and PyJWT ≥ 2.10 enforces it on `decode`,
+   not `encode`.** `{'sub': user.id}` with an int encodes **silently**
+   and raises `InvalidSubjectError: Subject must be a string` only when
+   the token is later read. The failure mode is therefore the nasty
+   shape: registration and login both return 200 with a valid-looking
+   token, and then *every authenticated request* 401s — the broken thing
+   is the token issuer, but the symptom appears in `get_current_user`.
+   So: `str(user.id)` on the way out, `int(payload["sub"])` on the way
+   back.
+
+   > First written up here as raising at encode time. It does not. Caught
+   > by `scripts/check_jwt.py` asserting the wrong half — which is the
+   > argument for the script existing rather than a one-off paste into a
+   > shell, and the Deadline 1 lesson again: verify by running, and make sure
+   > the thing you run asserts what you actually claimed.
+
 2. **Exceptions are PyJWT's, not jose's.** `JWTError` no longer exists.
-   The 401 handler catches `jwt.InvalidTokenError`, which is the base
-   class for `ExpiredSignatureError`, `InvalidSignatureError`, and
+   The 401 handler catches `jwt.InvalidTokenError`, the base class for
+   `ExpiredSignatureError`, `InvalidSignatureError`, and
    `InvalidSubjectError` — one `except` covers expiry, tampering, and a
    malformed subject, all of which are the same 401 to the caller.
+   `InvalidSubjectError` is importable only from `jwt.exceptions`; unlike
+   the others it is not re-exported at `jwt.*`.
 
 `exp` is verified by default, so the 60-minute expiry from
 `ACCESS_TOKEN_EXPIRE_MINUTES` is enforced by the library rather than by
 us — which is what makes the role-in-the-claim tradeoff above ("a role
 change does not take effect until the token expires") actually bounded.
 
-Verified: encode/decode round-trip against the real `get_settings()`;
-wrong secret → `InvalidSignatureError`; expired token →
-`ExpiredSignatureError`; `import jose` → `ModuleNotFoundError`;
-`/health` and `/health/db` still 200 after the rebuild.
+Verified by `scripts/check_jwt.py`, which runs against the real
+`get_settings()` and exits non-zero on the first failure, so it is usable
+as a gate rather than something to read: 9 checks, all passing. `/health`
+and `/health/db` still 200 after the rebuild.
+
+    docker compose exec app python scripts/check_jwt.py
+
+---
+
+## Deadlines, not days — and sessions are neither
+
+The schedule is flexible. Ten numbered **Deadlines** are ordered
+milestones with checkpoints; none of them names a date, and one may take
+four sittings or half of one.
+
+**The rename was not cosmetic.** Two different things were both called
+"Day N", and the collision was actively lying to us:
+
+| Was called | Is really | Now called |
+|---|---|---|
+| `EXECUTION_PLAN.md` "Day 4" | a milestone with a checkpoint | **Deadline 4** |
+| `WORK_LOG.md` "Day 3 — 2026-08-18" | one dated sitting | **Session 4** |
+
+Because both were "Day N", a log with three entries read as three
+deadlines met. In fact sessions 2, 3 and 4 were *all* still finishing
+**Deadline 1** — the carried schema items, the documentation sync, and
+the clean-DB migration run. Deadline 2 has not been started by either
+person.
+
+> Four sessions to meet one of ten deadlines. That ratio is the useful
+> number, and the old scheme made it structurally impossible to see:
+> every session incremented the counter that was supposed to track
+> milestones, so falling behind and making progress looked identical.
+
+Consequences, all cheap and all now in place:
+
+- `10_DAY_PLAN.md` → **`EXECUTION_PLAN.md`**, `DAILY_LOG.md` →
+  **`WORK_LOG.md`**. The filenames asserted a cadence the project does
+  not have. Renamed with `git mv`, so history follows.
+- Every `WORK_LOG.md` entry opens with **`Advances: Deadline N`** and
+  closes with **`Deadline N status: MET / still open`**. Where the plan
+  said one thing and reality did another, the entry says so — sessions 2
+  and 3 are both marked *"not Deadline 2"*.
+- "Daily Ritual" is now the **Session Ritual**, since it runs at the
+  edges of a sitting, not of a calendar day.
+- `INIT_PLAN.md` §19 keeps its "Days 1–2" headings. It is a superseded
+  15-day solo schedule; converting it would imply fifteen live
+  milestones competing with the ten real ones. Flagged inline as the one
+  deliberate exception.
+
+The genuine durations were left alone throughout — "half a day to unpick
+divergent `down_revision` chains", "20 person-days", the `days` schedule
+column ("MWF"). Those are measurements, not milestones. Substitution was
+done on `Day <digit>` only, so they were never candidates.

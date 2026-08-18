@@ -45,7 +45,7 @@ access, and load testing rather than building a large frontend.
 > **Precedence when documents disagree:** the models and migrations are
 > the truth; then `DECISIONS.md` (why, and what was reversed); then
 > `ARCHITECTURE_AND_WORKFLOWS.md` (what the system is now); then
-> `DAILY_LOG.md` and `10_DAY_PLAN.md`; then this file.
+> `WORK_LOG.md` and `EXECUTION_PLAN.md`; then this file.
 
 ------------------------------------------------------------------------
 
@@ -308,7 +308,7 @@ change does not take effect until the token expires (60 minutes).
 
 ## Load Testing
 
--   ~~Locust~~ — **cut on Day 1**; see Section 17. The asyncio + httpx
+-   ~~Locust~~ — **cut on Deadline 1**; see Section 17. The asyncio + httpx
     concurrency harness carries the correctness claim.
 
 ## Development / Deployment
@@ -706,7 +706,7 @@ registration and concurrency logic is stable.
 > row, not INSERT one** — a promoted student who previously dropped still
 > owns a row.
 
-The waitlist is item 5 on the pre-agreed cut order in `10_DAY_PLAN.md`,
+The waitlist is item 5 on the pre-agreed cut order in `EXECUTION_PLAN.md`,
 and is cut whole rather than half if the schedule slips.
 
 ------------------------------------------------------------------------
@@ -1501,7 +1501,7 @@ every invariant must always hold.
 # 17. Load Testing
 
 > **CHANGED — Locust is cut.** It is item 1 on the pre-agreed cut order
-> in `10_DAY_PLAN.md`, dropped on Day 1. The asyncio + httpx harness
+> in `EXECUTION_PLAN.md`, dropped on Deadline 1. The asyncio + httpx harness
 > already proves correctness under concurrency, which is the claim the
 > project makes. Throughput numbers we never optimise against invite the
 > question "so what did you do with that?" with no answer.
@@ -1621,12 +1621,18 @@ Optional features should not delay completion of the core system.
 
 # 19. 15-Day Development Plan
 
-> **SUPERSEDED by `10_DAY_PLAN.md`.** This was written for one person
-> over 15 days. The project is being built by two people over 10, which
-> changes the ordering (rooms and courses run in parallel with the GPU
-> core rather than after it) and adds an ownership split. Retained for
-> the phase breakdown; use `10_DAY_PLAN.md` for what happens on a given
-> day.
+> **SUPERSEDED by `EXECUTION_PLAN.md`.** This was written for one person
+> over 15 days. The project is being built by two people across 10
+> **Deadlines**, which changes the ordering (rooms and courses run in
+> parallel with the GPU core rather than after it) and adds an ownership
+> split. Retained for the phase breakdown; use `EXECUTION_PLAN.md` for
+> what has to be true at each Deadline.
+>
+> **The "Days" below are deliberately still called days.** They belong to
+> this dead 15-day schedule and map onto nothing current — renaming them
+> "Deadlines" would imply fifteen live milestones competing with the ten
+> real ones. Everywhere else in the repo, a numbered stage is a Deadline;
+> here, and only here, it is a leftover.
 
 ### Days 1–2
 

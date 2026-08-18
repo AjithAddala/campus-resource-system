@@ -1,10 +1,24 @@
-# 10-Day Two-Person Execution Plan — Full Scope
+# Two-Person Execution Plan — Full Scope
+
+> **Deadlines, not days.** The ten stages below are ordered milestones,
+> not calendar dates. "Deadline 4" means *the fourth checkpoint*, and it
+> takes as long as it takes — it may span one sitting or four. Nothing in
+> this file assumes a date.
+>
+> This file says **what must be true** to call a deadline met.
+> `WORK_LOG.md` says **when work actually happened**. Keeping those two
+> apart is the point: the log had drifted into implying that three
+> deadlines were met because three dated sessions existed.
+>
+> **Status: Deadline 1 met. Deadline 2 not started.**
 
 ## 0. Scope
 
-Nothing is cut. Capacity check: 2 people x 10 days = **20 person-days**,
-against the original solo 15-day plan's 15, plus roughly 3 person-days
-for the added features. It fits — with no slack.
+Nothing is cut. Effort check: 2 people across 10 deadlines ≈ **20
+person-days** of work, against the original solo plan's 15, plus roughly
+3 person-days for the added features. It fits — with no slack. That is an
+estimate of *effort*, not a schedule; the deadlines flex, the work does
+not.
 
 ``` text
 IN SCOPE
@@ -22,7 +36,7 @@ IN SCOPE
 
 DELIBERATELY EXCLUDED (design decision, not a scope cut)
   Denormalized quota counter
-  Locust load scenarios          <- cut Day 1; item 1 on the cut order
+  Locust load scenarios          <- cut Deadline 1; item 1 on the cut order
   GPU reservation start/end times <- do not re-add; see DECISIONS.md
 ```
 
@@ -37,13 +51,13 @@ now the only instrument that could show it.
 
 ## 0.1 Pre-Agreed Cut Order
 
-Full scope means Day 10 is no longer a buffer. Slippage has nowhere to
-go, so decide the cut order **now**, while calm — not on Day 8 under
+Full scope means Deadline 10 is no longer a buffer. Slippage has nowhere to
+go, so decide the cut order **now**, while calm — not on Deadline 8 under
 pressure. If you are behind at any checkpoint, drop strictly in this
 order:
 
 ``` text
-1. Locust                    CUT ON DAY 1 -- the asyncio harness already
+1. Locust                    CUT ON DEADLINE 1 -- the asyncio harness already
                              proves correctness, which is the claim
 2. Room quota                (mechanism identical to GPU; document it)
 3. Course-load quota         (same)
@@ -83,14 +97,14 @@ admin quota endpoints                all four benchmarks
 ```
 
 Note the deliberate crossovers: A applies the quota helper inside B's
-room and course modules (Day 6), and A owns the waitlist *promotion
+room and course modules (Deadline 6), and A owns the waitlist *promotion
 transaction* while B owns the waitlist *endpoints*. Neither person can
 finish without reading the other's code.
 
 ### Shared-file protocol
 
 ``` text
-models/     -> joint Day 1 session ONLY. After that, changes require both
+models/     -> joint Deadline 1 session ONLY. After that, changes require both
                people present. No solo edits.
 alembic/    -> PERSON A OWNS EXCLUSIVELY. B never runs `alembic revision`.
 ```
@@ -101,7 +115,7 @@ that half-day is fatal. If B needs a schema change, B asks A.
 
 ### Interface-first unblocking
 
-B is blocked on auth from Day 2. On **Day 1** jointly fix the signatures:
+B is blocked on auth from Deadline 2. On **Deadline 1** jointly fix the signatures:
 
 ``` python
 def get_current_user(...) -> User
@@ -109,13 +123,13 @@ def require_role(*allowed: Role) -> Callable
 ```
 
 B codes against a hardcoded stub returning a fake `User`. A implements
-the real one. Swap on Day 3 - same import path, no refactor.
+the real one. Swap on Deadline 3 - same import path, no refactor.
 
 ------------------------------------------------------------------------
 
-## 2. Day-by-Day
+## 2. Deadline-by-Deadline
 
-### Day 1 - Foundation (JOINT, do not parallelize)
+### Deadline 1 - Foundation (JOINT, do not parallelize)  ✅ MET
 
 ``` text
 BOTH   repo, .env, docker-compose (Postgres + app), FastAPI skeleton
@@ -127,13 +141,13 @@ BOTH   agree error codes: 401 / 403 / 409 CAPACITY_EXHAUSTED /
        409 QUOTA_EXCEEDED / 422 IDEMPOTENCY_KEY_REUSED
 ```
 
-Divergence here poisons all nine remaining days. This is the one day
-where pairing is faster than splitting.
+Divergence here poisons all nine remaining deadlines. This is the one
+stage where pairing is faster than splitting.
 
 **Checkpoint:** `docker compose up` works, `/docs` loads, migration
 applies cleanly for both.
 
-### Day 2 - Auth vs. Read Paths
+### Deadline 2 - Auth vs. Read Paths  ← NEXT, not started
 
 ``` text
 A      Argon2 hashing, JWT encode/decode, role as a token claim
@@ -155,14 +169,14 @@ B      seed script: 3 users (one per role), 2 GPU clusters, 2 rooms,
 **Checkpoint:** login returns a token containing a role; B can list
 resources.
 
-### Day 3 - Authorization vs. Rooms
+### Deadline 3 - Authorization vs. Rooms
 
 ``` text
 A      require_role dependency; apply to all admin-only routes
        verify 403 fires BEFORE the handler body executes
        hand the real dependency to B, delete the stub
 B      room reservation POST
-       the EXCLUDE USING gist constraint already exists -- shipped Day 1
+       the EXCLUDE USING gist constraint already exists -- shipped Deadline 1
        in revision e0fbfe421403, along with the btree_gist extension.
        B writes the endpoint against it; no migration needed.
        include the resources.status gate while writing the lock (below)
@@ -175,7 +189,7 @@ B      room reservation POST
 **Checkpoint:** student token on `POST /gpus` returns 403; overlapping
 room booking returns 409.
 
-### Day 4 - Flagship vs. Courses (heaviest day)
+### Deadline 4 - Flagship vs. Courses (the heaviest)
 
 ``` text
 A      quotas/ module: RoleQuota table + seeded defaults
@@ -194,12 +208,12 @@ B      course registration: POST /offerings/{id}/register
        DELETE /reservations/{id} with owner-or-admin check
 ```
 
-Both people write a locking transaction for the first time on the same
-day. If by midday A's GPU path is clearly not landing, **B stops courses
-and pairs on it.** The GPU path is the project; courses are supporting
-evidence.
+Both people write a locking transaction for the first time at the same
+deadline. If A's GPU path is clearly not landing by the halfway mark,
+**B stops courses and pairs on it.** The GPU path is the project; courses
+are supporting evidence.
 
-### The `resources.status` gate — one line, written on Days 3 and 4
+### The `resources.status` gate — one line, written on Deadlines 3 and 4
 
 `Resource.status` (AVAILABLE / BLOCKED) already exists on every resource
 row. Nothing reads it yet. The check belongs **inside the transaction,
@@ -214,7 +228,7 @@ LOCK resource row FOR UPDATE
 ```
 
 Both gates read the same locked row, so this costs nothing extra. Adding
-it after the Day 8 freeze means reopening the flagship transaction, which
+it after the Deadline 8 freeze means reopening the flagship transaction, which
 is what the freeze exists to prevent — hence writing it now.
 
 **Proposed semantics, still needs ratifying (open item 6 in
@@ -229,7 +243,7 @@ the resource's, so the service layer is the whole guarantee here.
 **Checkpoint:** 2 GPUs reserve; a 3rd unit returns `QUOTA_EXCEEDED`.
 Duplicate registration rejected; overlapping courses rejected.
 
-### Day 5 - Idempotency vs. Harness
+### Deadline 5 - Idempotency vs. Harness
 
 ``` text
 A      idempotency/ module: IdempotencyKey, UNIQUE(key, user_id)
@@ -247,7 +261,7 @@ B      tests/concurrency/harness.py - asyncio + httpx, fires N
 
 **Checkpoint:** first broken-vs-fixed table with real numbers.
 
-### Day 6 - Quota Rollout, Benchmarks 2-3, SWAP
+### Deadline 6 - Quota Rollout, Benchmarks 2-3, SWAP
 
 ``` text
 A      apply the quota helper inside B's modules:
@@ -258,8 +272,8 @@ A      apply the quota helper inside B's modules:
          PATCH /rooms/{id}   -- block a room for maintenance
          PATCH /gpus/{id}    -- change capacity / status
          these were in ARCHITECTURE_AND_WORKFLOWS.md Workflow E but had
-         no day assigned. They only WRITE resources.status; the gates on
-         Days 3 and 4 are what READ it.
+         no deadline assigned. They only WRITE resources.status; gates on
+         Deadlines 3 and 4 are what READ it.
        fix whatever B's benchmarks break
 B      BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
          DIFFERENT clusters
@@ -268,7 +282,7 @@ B      BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
        BENCHMARK 3 (exactly-once): identical request twice, same key
          no key -> 2 reservations;  key -> 1 reservation, identical response
 
-BOTH (evening, 1 hour) - SWAP REVIEW
+BOTH (1 hour, before closing the deadline) - SWAP REVIEW
        A walks B line-by-line through the GPU transaction
        B walks A line-by-line through the exclusion constraint + harness
 ```
@@ -277,7 +291,7 @@ Benchmark 2 is your strongest artifact: the fix is not "add a lock" -
 the resource lock was already correct. It was the **wrong lock for that
 invariant**. Both of you must be able to say this unprompted.
 
-### Day 7 - Waitlist (a fourth concurrency problem)
+### Deadline 7 - Waitlist (a fourth concurrency problem)
 
 ``` text
 A      promotion transaction. The race: two students drop the same
@@ -301,7 +315,7 @@ B      waitlist endpoints: join on full course, leave, GET waitlist
 **Checkpoint:** promotion follows FIFO, respects quota, and never
 double-promotes under concurrent drops.
 
-### Day 8 - FEATURE FREEZE
+### Deadline 8 - FEATURE FREEZE
 
 ``` text
 BOTH   no new features from here. None.
@@ -317,7 +331,7 @@ B      enrolled_count reconciliation query after Benchmark 1 -- prove the
 If you are behind here, apply the Section 0.1 cut order. Do not extend
 the freeze.
 
-### Day 9 - Docs & Clean-Room Test
+### Deadline 9 - Docs & Clean-Room Test
 
 ``` text
 A      README: architecture, three serialization points, lock ordering,
@@ -332,7 +346,7 @@ BOTH   CLEAN-ROOM TEST: fresh clone, fresh volumes, docker compose up,
 **Checkpoint:** a stranger could clone the repo and reproduce your
 numbers from the README alone.
 
-### Day 10 - Cross-Presentation & Demo
+### Deadline 10 - Cross-Presentation & Demo
 
 ``` text
 BOTH   A presents B's modules (rooms, courses, waitlist, harness) as if
@@ -352,15 +366,22 @@ BOTH   A presents B's modules (rooms, courses, waitlist, harness) as if
 
 ------------------------------------------------------------------------
 
-## 3. Daily Ritual (15 minutes, non-negotiable)
+## 3. Session Ritual (15 minutes, non-negotiable)
+
+Per working session, not per calendar day — a deadline may take several
+sessions, and this runs at the edges of each one.
 
 ``` text
-MORNING (5 min)   What am I touching today? Any shared file?
-                  Any schema change? (-> A generates the migration)
+SESSION START (5 min)   What am I touching? Any shared file?
+                        Any schema change? (-> A generates the migration)
+                        Which Deadline does this session advance?
 
-EVENING (10 min)  Both push. Both pull. Both run the other's tests.
-                  Log to DECISIONS.md: decisions, failures + fixes,
-                  benchmark numbers.
+SESSION END (10 min)    Both push. Both pull. Both run the other's tests.
+                        Log to DECISIONS.md: decisions, failures + fixes,
+                        benchmark numbers.
+                        Log to WORK_LOG.md, and say plainly whether the
+                        Deadline is now MET or still open. A session is
+                        not a deadline.
 ```
 
 `DECISIONS.md` is your interview cheat-sheet. "We tried X, measured Y,
@@ -374,18 +395,18 @@ and it is impossible to reconstruct two months later.
 ``` text
 Risk                              Mitigation
 --------------------------------------------------------------------------
-No buffer day                     Pre-agreed cut order (Section 0.1),
-                                  applied at the Day 8 checkpoint
+No buffer deadline                Pre-agreed cut order (Section 0.1),
+                                  applied at the Deadline 8 checkpoint
 Alembic revision conflict         A owns migrations exclusively
-Models diverge                    Written jointly Day 1, frozen after
-B blocked on auth                 Stub dependency, signature agreed Day 1
-Day 4 spills (most likely)        B abandons courses and pairs on GPU
-Day 7 waitlist spills             Cut waitlist whole; it is item 5 on the
+Models diverge                    Written jointly Deadline 1, frozen after
+B blocked on auth                 Stub dependency, signature agreed Deadline 1
+Deadline 4 spills (most likely)        B abandons courses and pairs on GPU
+Deadline 7 waitlist spills             Cut waitlist whole; it is item 5 on the
                                   cut list and the largest single item
-Neither can explain the other's   Day 6 swap review + Day 10 cross-present
+Neither can explain the other's   Deadline 6 swap review + Deadline 10 cross-present
   code
 Async/SQLAlchemy learning curve   Use SYNC SQLAlchemy + psycopg
-Scope creep after Day 8           Freeze is absolute
+Scope creep after Deadline 8           Freeze is absolute
 ```
 
 **On sync vs. async:** pick sync. `SELECT ... FOR UPDATE` semantics are
