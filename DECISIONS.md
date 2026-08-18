@@ -791,5 +791,58 @@ revisions applied from empty, `alembic check` clean, 9 non-FK constraints
 and 6 hot-path indexes verified by querying `pg_constraint` and
 `pg_indexes` directly. Full output in `DAILY_LOG.md`.
 
-Still outstanding: the same run on A's machine. "Verify on a clean DB on
-**both** machines" is not met by verifying one.
+~~Still outstanding: the same run on A's machine. "Verify on a clean DB on
+**both** machines" is not met by verifying one.~~
+
+> **RESOLVED 2026-08-18.** Run on A's machine: `downgrade base` →
+> `upgrade head`, twice, five revisions each way, `alembic current` =
+> `1ca8b85b7626 (head)`, `alembic check` clean. Full output in
+> `DAILY_LOG.md`, Day 3.
+>
+> One thing the round-trip confirms that `alembic check` cannot: at
+> `base` the database holds **only `alembic_version`** — no orphan enum
+> types. That is the Day 2 chain-breaking bug, still fixed. `btree_gist`
+> deliberately survives the downgrade (dropping an extension can break
+> objects outside our schema); `CREATE EXTENSION IF NOT EXISTS` is what
+> makes the next upgrade idempotent anyway.
+
+---
+
+## JWT library — PyJWT, not python-jose
+
+`python-jose[cryptography]==3.3.0` → `PyJWT==2.10.1`. Taken **before**
+`core/security.py` exists, which is the only reason it was a one-line
+change: nothing imported `jose`, so there were no call sites to migrate.
+The same swap after Day 2's auth column would have touched encode,
+decode, and every exception handler.
+
+python-jose 3.3.0 carries known advisories and the project is not
+actively maintained. PyJWT is the maintained option, is what FastAPI's
+own security docs use, and needs no `[cryptography]` extra for HS256 —
+HMAC is in the core package. `cryptography` left the dependency tree
+entirely with it (jose was the only thing pulling it); it comes back only
+if we ever move to RS256, via `PyJWT[crypto]`.
+
+**Two behavioural differences that matter for `security.py`,** both
+verified in the container rather than read off a changelog:
+
+1. **`sub` must be a string.** PyJWT ≥ 2.10 validates it —
+   `{'sub': user.id}` with an int raises `InvalidSubjectError: Subject
+   must be a string` at **encode** time. So it is `str(user.id)` on the
+   way out and `int(payload["sub"])` on the way back. This would
+   otherwise have been found by a failing login, not by reading.
+2. **Exceptions are PyJWT's, not jose's.** `JWTError` no longer exists.
+   The 401 handler catches `jwt.InvalidTokenError`, which is the base
+   class for `ExpiredSignatureError`, `InvalidSignatureError`, and
+   `InvalidSubjectError` — one `except` covers expiry, tampering, and a
+   malformed subject, all of which are the same 401 to the caller.
+
+`exp` is verified by default, so the 60-minute expiry from
+`ACCESS_TOKEN_EXPIRE_MINUTES` is enforced by the library rather than by
+us — which is what makes the role-in-the-claim tradeoff above ("a role
+change does not take effect until the token expires") actually bounded.
+
+Verified: encode/decode round-trip against the real `get_settings()`;
+wrong secret → `InvalidSignatureError`; expired token →
+`ExpiredSignatureError`; `import jose` → `ModuleNotFoundError`;
+`/health` and `/health/db` still 200 after the rebuild.

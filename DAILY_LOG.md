@@ -230,6 +230,73 @@ the Day 2 seed script expects.
 
 ---
 
+## Day 3 — 2026-08-18 — A (solo)
+
+**Plan:** clear the two items blocking `core/security.py` — the clean-DB
+checkpoint on A's machine (carried item 0) and the `python-jose` swap
+(carried item 4) — before any auth code exists to be written against them.
+
+**Shipped**
+
+- Clean-DB checkpoint met on A's machine. `downgrade base` →
+  `upgrade head`, **twice**, then `alembic current` and `alembic check`.
+  Carried item 0 closed; "verify on a clean DB on BOTH machines" is now
+  actually true rather than asserted.
+- `python-jose[cryptography]==3.3.0` → `PyJWT==2.10.1` in
+  `requirements.txt`, image rebuilt. Carried item 4 closed. Nothing
+  imported `jose`, so this was a one-line change with no call sites to
+  migrate — which was the entire point of doing it before `security.py`.
+
+**Verification run**
+
+```
+alembic downgrade base      -> 5 revisions down, both rounds
+alembic upgrade head        -> 5 revisions up, both rounds
+alembic current             -> 1ca8b85b7626 (head)
+alembic check               -> No new upgrade operations detected.
+
+state at base               -> only alembic_version remains
+                            -> zero leftover enum types (the Day 2 bug
+                               that broke the chain stays fixed)
+                            -> btree_gist still installed; downgrade does
+                               not drop it, and CREATE EXTENSION IF NOT
+                               EXISTS makes the re-upgrade idempotent
+
+pip show python-jose        -> not found
+pip show cryptography       -> not found (jose was the only thing pulling it)
+python -c "import jose"     -> ModuleNotFoundError
+pip show PyJWT              -> 2.10.1
+
+HS256 round-trip, real settings, in the container:
+  encode                    -> str
+  decode                    -> {'sub': '1', 'role': 'ADMIN', 'exp', 'iat'}
+  wrong secret              -> InvalidSignatureError
+  expired token             -> ExpiredSignatureError
+  {'sub': 1} (int)          -> InvalidSubjectError: Subject must be a string
+
+/health, /health/db         -> 200, both ok after rebuild
+alembic current             -> 1ca8b85b7626 (head)
+```
+
+**Cost incurred**
+
+- None material. `docker compose build` fails from Git Bash with
+  `docker-credential-desktop: executable file not found`; runs fine from
+  PowerShell. Environment quirk, not a project problem — noted so it is
+  not re-debugged.
+
+**Open / carried forward**
+
+1. Items 6 and 7 unchanged and still joint calls; item 7 blocks Day 7.
+2. `Resource.polymorphic_identity = ResourceType.COURSE` on the base
+   class — needs both people, since `models/` is frozen.
+3. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Day 5 has nothing to build on.
+4. A's auth column (`core/security.py` → `auth/schemas.py` →
+   `auth/service.py` → `auth/router.py`) is now unblocked and not started.
+
+---
+
 ## Template
 
 ```markdown
