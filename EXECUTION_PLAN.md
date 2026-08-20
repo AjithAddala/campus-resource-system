@@ -145,7 +145,19 @@ Divergence here poisons all nine remaining deadlines. This is the one
 stage where pairing is faster than splitting.
 
 **Checkpoint:** `docker compose up` works, `/docs` loads, migration
-applies cleanly for both.
+applies cleanly for both. — **All three verified (session 4).**
+
+> Met by the checkpoint, with two threads still hanging off it. Neither
+> is a checkpoint item, so neither reopens the deadline, but both
+> originate here and both need B:
+>
+> - *"Write ALL models together"* held for the first sitting only.
+>   `models/` was then changed **solo** across three revisions, which the
+>   shared-file protocol forbids after this deadline. B has not reviewed
+>   them.
+> - Outstanding items 6 and 7 in `DECISIONS.md` are model-semantics
+>   questions the joint session was meant to settle. Item 7 blocks
+>   Deadline 7.
 
 ### Deadline 2 - Auth vs. Read Paths  ← NEXT, not started
 

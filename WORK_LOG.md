@@ -269,8 +269,14 @@ the Deadline 2 seed script expects.
 
 ## Session 4 — 2026-08-18 — A (solo)
 
-**Advances:** Deadline 1 — and **closes it**. First session where the
-work done matches the deadline claimed.
+**Advances:** Deadline 1 — and **closes it**. Also *unblocks* Deadline 2
+(the `python-jose` → PyJWT swap and `scripts/check_jwt.py`), but ships
+none of it: Deadline 2 is register/login, and the API still has exactly
+two routes, `/health` and `/health/db`.
+
+A session touching two deadlines is the case the numbering split exists
+to record — the first draft of this entry claimed Deadline 1 only, which
+would have buried the swap under the wrong milestone.
 
 **Plan:** clear the two items blocking `core/security.py` — the clean-DB
 checkpoint on A's machine (carried item 0) and the `python-jose` swap
