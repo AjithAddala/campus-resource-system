@@ -278,6 +278,26 @@ Capacity and quota rejection are both `409` but carry distinct
 machine-readable codes, because the caller's remedy differs: wait / try
 another cluster, vs. release something you already hold.
 
+### The envelope carrying those codes
+
+Settled at Deadline 2, when duplicate registration became the first
+endpoint to return a coded error. Every coded failure is built by
+`app/core/errors.py::coded_error()` and arrives as:
+
+``` json
+{"detail": {"code": "QUOTA_EXCEEDED", "message": "human-readable prose"}}
+```
+
+`code` is the contract a client may branch on; `message` may be reworded
+at any time. Uncoded errors — a plain 404, the 401 from a bad token —
+keep FastAPI's default string `detail`, because there is nothing for a
+caller to distinguish. Registration adds one code to the Deadline 1
+table:
+
+``` text
+409  EMAIL_ALREADY_REGISTERED    that email already has an account
+```
+
 ------------------------------------------------------------------------
 
 # Part II — User Workflows
@@ -314,16 +334,31 @@ COURSE        6          —     unlimited
 ## 9. Workflow A — Onboarding (all roles)
 
 ``` text
-POST /api/v1/auth/register     name, email, password, role
-                               password → Argon2 hash
+POST /api/v1/auth/register     JSON: name, email, password, role
+                               password → Argon2id hash
                                role stored as ENUM
+                               duplicate email → 409, from the UNIQUE
+                                 constraint, not a pre-flight check
         │
         ▼
-POST /api/v1/auth/login        → JWT { sub: user_id, role: STUDENT, exp }
+POST /api/v1/auth/login        FORM-ENCODED, not JSON: username, password
+                               → JWT { sub: "user_id", role: STUDENT, iat, exp }
         │
         ▼
 All subsequent calls:          Authorization: Bearer <JWT>
 ```
+
+Two interface facts that are easy to get wrong and expensive to discover
+late:
+
+- **Login takes a form body, and the email travels in a field named
+  `username`.** It is the OAuth2 password flow, which is what gives
+  `/docs` a working *Authorize* button. Registration is JSON; only this
+  one route is form-encoded. See `DECISIONS.md`.
+- **`sub` is a string**, `"1"` and not `1`. PyJWT ≥ 2.10 enforces that on
+  *decode*, so an int subject issues a valid-looking token and then 401s
+  every later request — a bug in the issuer that only ever shows up in
+  the consumer.
 
 The role travels in the token, so authorization needs no database
 round-trip. The database remains the source of truth for *state*; the

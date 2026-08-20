@@ -10,7 +10,7 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadline 1 met. Deadline 2 not started.**
+> **Status: Deadlines 1 and 2 met (sessions 4 and 7). Deadline 3 next.**
 
 ## 0. Scope
 
@@ -159,7 +159,7 @@ applies cleanly for both. — **All three verified (session 4).**
 >   questions the joint session was meant to settle. Item 7 blocks
 >   Deadline 7.
 
-### Deadline 2 - Auth vs. Read Paths  ← NEXT, not started
+### Deadline 2 - Auth vs. Read Paths  ✅ MET
 
 ``` text
 A      Argon2 hashing, JWT encode/decode, role as a token claim
@@ -179,7 +179,21 @@ B      seed script: 3 users (one per role), 2 GPU clusters, 2 rooms,
 ```
 
 **Checkpoint:** login returns a token containing a role; B can list
-resources.
+resources. — **Both verified (sessions 6 and 7).**
+
+> Met, with one thing the checkpoint does not actually test. `GET /gpus`
+> returns 200 with a bearer token — and also with no token at all,
+> because `dependencies.py` is still the Deadline 1 stub. The token is
+> *accepted*, not *verified*. Deadline 3 is what makes it load-bearing,
+> so this is a sequencing fact rather than a gap; recorded so the green
+> result is not read as more than it is.
+>
+> One addition to the plan as written: `core/errors.py`. Deadline 1
+> agreed the error codes but never the JSON envelope carrying them, and
+> duplicate registration was the first endpoint to need one. Deadlines 4
+> and 5 must emit `CAPACITY_EXHAUSTED`, `QUOTA_EXCEEDED` and
+> `IDEMPOTENCY_KEY_REUSED` through `coded_error()` rather than inventing
+> a second shape.
 
 ### Deadline 3 - Authorization vs. Rooms
 

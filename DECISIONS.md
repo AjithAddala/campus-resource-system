@@ -961,3 +961,171 @@ The genuine durations were left alone throughout — "half a day to unpick
 divergent `down_revision` chains", "20 person-days", the `days` schedule
 column ("MWF"). Those are measurements, not milestones. Substitution was
 done on `Day <digit>` only, so they were never candidates.
+
+---
+
+# Deadline 2 — the auth column (A)
+
+Files, in the order the split specified and the order they were written:
+`core/security.py` → `auth/schemas.py` → `auth/service.py` →
+`auth/router.py`. Plus `core/errors.py`, which the split did not
+anticipate; see below. Mounted under `API_PREFIX` from `main.py`, which
+was B's one coordination request from session 6.
+
+## The error envelope — settled here because this is the first 409
+
+Deadline 1 agreed the error *codes*. It never agreed the **JSON they
+arrive in**, and nobody noticed because no endpoint returned one yet.
+Duplicate registration is the first, so the shape is fixed now rather
+than improvised three more times at Deadlines 4 and 5:
+
+```json
+{"detail": {"code": "EMAIL_ALREADY_REGISTERED", "message": "..."}}
+```
+
+`code` is the contract and `message` is prose that may be reworded. Every
+coded failure goes through `core/errors.py::coded_error()`; nothing
+hand-rolls a `detail` dict. The reason is the same one that made the two
+409s distinguishable in the first place: `CAPACITY_EXHAUSTED` and
+`QUOTA_EXCEEDED` differ only in the caller's remedy, and B's benchmarks
+have to assert on that difference without parsing English.
+
+Cheap now, and the alternative is discovering at Deadline 8's integration
+pass that three modules each invented their own envelope.
+
+## Login is form-encoded, not JSON
+
+`POST /auth/login` takes `OAuth2PasswordRequestForm`, so the body is
+`username=...&password=...`, while `/auth/register` takes JSON. The
+asymmetry is deliberate and was the one genuinely arguable call in this
+column.
+
+For it: `INIT_PLAN.md` §4 names the **OAuth2 password flow**, and
+`python-multipart` has sat in `requirements.txt` since Deadline 1 doing
+nothing else — session 4 even verified it imports. Following the flow
+means `/docs` gets a working **Authorize** button the moment Deadline 3
+registers the bearer scheme, which is the difference between demoing RBAC
+by clicking and demoing it by pasting headers into every request. That is
+worth real money at Deadline 10.
+
+Against it: the email arrives in a field the spec insists on calling
+`username`, and B's harness has to send `data=` rather than `json=` for
+this one route.
+
+Chosen with the note that **the mapping happens once, in the handler**.
+The rest of the system says `email` everywhere.
+
+## Registration does not check whether the email exists
+
+There is no `SELECT ... WHERE email = ?` before the INSERT, and its
+absence is the point. Two simultaneous registrations of one address can
+both run that check, both see nothing, and both proceed — so it would
+pass exactly when it matters least, while making the code *look* like the
+race was handled. `UNIQUE(users.email)` is what makes the second insert
+impossible, so the INSERT is the check and catching `IntegrityError` is
+how its result is read.
+
+One detail that is easy to get wrong: `db.rollback()` must come before
+anything else in the `except`. After an `IntegrityError` the session is
+in a failed state and any further statement raises
+`PendingRollbackError` — which would surface as a 500 and bury the 409 it
+was supposed to produce.
+
+## `InvalidHashError` is a `ValueError`, not an `Argon2Error`
+
+Verified in the container rather than assumed, and it changes the code:
+
+```
+VerifyMismatchError -> VerificationError -> Argon2Error -> Exception
+InvalidHashError    -> ValueError        -> Exception
+```
+
+The intuitive single clause, `except Argon2Error`, therefore catches a
+wrong password but **not a malformed or empty `password_hash`**, which
+would escape the login handler as a 500. `verify_password` catches
+`(VerificationError, InvalidHashError)` and returns False for both,
+because "this stored hash is garbage" and "this password is wrong" are
+the same answer to a caller: these credentials do not authenticate
+anyone.
+
+Same shape as the PyJWT `sub` lesson — the exception hierarchy you assume
+is not the one the library has, and the only way to know is to run it.
+
+## Both 401s are identical, including their timing
+
+"No such email" and "wrong password" return the same body. That much is
+obvious. Less obvious: without help they return it at very different
+*speeds* — an unknown address skips argon2 entirely and answers in
+microseconds, while a real one pays ~50 ms for a full verify. An
+identical body with a distinguishable response time is still a
+disclosure of which addresses are registered.
+
+`security.py` exports `DUMMY_PASSWORD_HASH` and `authenticate()` verifies
+against it on the miss path, so both cost the same.
+
+## Accepted holes, recorded rather than shipped quietly
+
+- **A caller may register themselves as ADMIN.** `role` comes from the
+  request body, which is what Workflow A specifies. The alternative is
+  bootstrapping the first admin out of band, which adds a seeding
+  concern to every clean-room run — for a project whose claim is about
+  concurrency, not identity management. `scripts/seed.py` already
+  supplies the three demo accounts. Left as-is, deliberately, and stated
+  in the README's limitations rather than discovered by a reader.
+- **`email` is a constrained `str`, not Pydantic's `EmailStr`.** That
+  needs `email-validator`, which the image does not have, and adding a
+  dependency forces a rebuild on both machines — B rebuilt at session 5 —
+  for a format check that guarantees nothing the system relies on. What
+  it relies on is `UNIQUE(email)`, which is in the database.
+
+## Verification
+
+`scripts/check_auth.py`, 25 assertions, exits non-zero on failure. Same
+argument as `check_jwt.py`: that script caught a stale image on its first
+run on a second machine, and it could only do so because it was a gate
+rather than a paste into a shell. This one covers what `check_jwt.py`
+structurally cannot — everything that needs a database and a router.
+
+It registers under a random email and deletes that user at the end, so a
+passing run leaves the database at its post-seed counts and the next
+person to count rows is not misled by it.
+
+Two assertions in it are worth naming, because they are the ones that
+would catch a real regression rather than a typo:
+
+- **`sub` is a string.** The PyJWT ≥ 2.10 trap. If it ever becomes an
+  int, login still returns 200 and every authenticated request 401s at
+  Deadline 3 — the bug is in the issuer, the symptom is in the consumer.
+- **The seeded accounts log in.** B hashed those three users with a bare
+  `PasswordHasher()` in session 5, *before* `core/security.py` existed,
+  on the argument that argon2 encodes its parameters into the hash string
+  so `verify()` would accept them whatever A chose later. That was a
+  claim about a file that did not exist. It is now tested, and it holds.
+
+## A test that the broken version also passes is not a test
+
+The first version of the duplicate-email check registered one address
+**twice in a row** and asserted 409. It passed. It was close to
+worthless, and spotting that is the most useful thing the Deadline 2
+audit did.
+
+The plan does not ask for a 409. It asks for *"409, not 500: catch the
+IntegrityError, **because** two simultaneous registrations can both pass
+a 'does this email exist?' check."* A sequential retry is exactly the
+case a naive pre-flight `SELECT` handles correctly — so the test agreed
+with the implementation we deliberately rejected, and would have gone on
+agreeing with it forever.
+
+Replaced with 8 registrations of one address released together on a
+barrier: `1 x 201, 7 x 409`, zero 500s, and — the assertion that actually
+matters — **one row**, counted in the database rather than inferred from
+status codes. Status codes are what the server claimed; the row count is
+what happened.
+
+This is `DECISIONS.md`'s "build the broken version first" arriving from
+the other direction, and it generalises to every benchmark still ahead.
+Before writing an assertion, ask **which implementation would fail it**.
+If the answer is "none of the ones we were choosing between", it is
+measuring something else. Deadlines 4, 5 and 7 are all of this shape:
+Benchmark 2 in particular is only meaningful because the *correct*
+resource-lock implementation fails it.

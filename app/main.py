@@ -2,6 +2,7 @@ from fastapi import Depends, FastAPI
 from sqlalchemy import text
 from sqlalchemy.orm import Session
 
+from app.auth.router import router as auth_router
 from app.courses.router import offerings_router
 from app.courses.router import router as courses_router
 from app.database.session import get_db
@@ -34,6 +35,12 @@ def health_db(db: Session = Depends(get_db)) -> dict:
     value = db.execute(text("SELECT 1")).scalar_one()
     return {"database": "ok", "result": value}
 
+
+# Auth, Deadline 2. Mounted under the SAME constant as everything else --
+# the coordination point B flagged when they settled the prefix. These
+# two routes are public by design and stay public after Deadline 3: they
+# are how a caller gets the token the other routes will demand.
+app.include_router(auth_router, prefix=API_PREFIX)
 
 # Read paths, Deadline 2. Every one of these is currently authenticated
 # by the STUB in core/dependencies.py, which returns a hardcoded ADMIN --

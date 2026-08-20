@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker compose *)",
+      "PowerShell(docker compose exec app python scripts/seed.py)",
+      "PowerShell(docker compose exec app python scripts/check_auth.py)",
+      "PowerShell(docker compose exec db psql -U campus -d campus -c \"SELECT id, email, role, left\\(password_hash, 32\\) AS hash_prefix, length\\(password_hash\\) AS len, pg_typeof\\(created_at\\) AS ts_type, created_at FROM users ORDER BY id;\")",
+      "PowerShell(docker compose exec app python scripts/check_jwt.py)",
+      "Bash(python -c ' *)"
+    ]
+  }
+}

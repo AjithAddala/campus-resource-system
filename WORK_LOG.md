@@ -625,6 +625,191 @@ is half-met.
 
 ---
 
+## Session 7 — 2026-08-20 — A
+
+**Advances:** Deadline 2 — and **closes it.** A's auth column was the
+only thing left in it after session 6.
+
+**Plan:** `core/security.py` → `auth/schemas.py` → `auth/service.py` →
+`auth/router.py`, in that order, mounted under B's `API_PREFIX`. All of
+it shipped, plus one file the split did not anticipate.
+
+**Shipped — `core/security.py`**
+
+- Argon2 hashing and HS256 encode/decode. Imports only `config` — no
+  models, no session, no FastAPI — which is why it was written first and
+  why nothing in it can grow a hidden dependency on a request.
+- Raises no HTTP errors. `decode_access_token` lets
+  `jwt.InvalidTokenError` propagate; turning that into a 401 is Deadline
+  3's job in `dependencies.py`.
+- `str(user_id)` on the way out, per the PyJWT ≥ 2.10 finding from
+  session 4.
+
+**Shipped — `auth/`, mounted at `/api/v1/auth`**
+
+- `POST /register` → 201, `POST /login` → token carrying `role`.
+- 12 routes under `/api/v1` now (B's 10 + these 2), 2 at root.
+- **`A must mount auth/ under API_PREFIX`, session 6's one carried
+  coordination item, is closed.**
+
+**Shipped — `core/errors.py`, which was not in the plan**
+
+Deadline 1 agreed the error *codes* and never the JSON they arrive in.
+Nobody noticed because no endpoint had returned one. Duplicate
+registration is the first, so the envelope
+(`{"detail": {"code", "message"}}`) is settled now rather than improvised
+separately at Deadlines 4 and 5. Reasoning in `DECISIONS.md`.
+
+**Found by running, not by reading — `InvalidHashError` is a `ValueError`**
+
+`VerifyMismatchError` → `VerificationError` → `Argon2Error`, but
+`InvalidHashError` → `ValueError`, and is **not** an `Argon2Error`. So
+`except Argon2Error` — the clause anyone would write first — catches a
+wrong password and lets a malformed `password_hash` escape the login
+handler as a 500. Checked the MRO in the container before writing the
+`except`, which is the only reason it says
+`(VerificationError, InvalidHashError)`.
+
+Third instance of the same lesson, after the enum-drop bug and the PyJWT
+`sub` trap: **the hierarchy you assume is not the one the library has.**
+
+**Verification run**
+
+```
+alembic current              -> 1ca8b85b7626 (head)   [run first, per DECISIONS.md]
+seed.py                      -> this machine's DB was at head and EMPTY
+                                (B seeded theirs in session 5; seeding is
+                                 per-volume, and nothing had said so)
+
+scripts/check_auth.py        -> 25/25 PASS, exit 0
+  register                   -> 201, role echoed, password_hash absent
+  duplicate email            -> 409 {"code": "EMAIL_ALREADY_REGISTERED"}
+  8 SIMULTANEOUS duplicates  -> 1 x 201, 7 x 409, zero 500s
+                                one row in the database   <- see audit below
+  password < 8 / bad role    -> 422
+  login                      -> 200, token_type bearer
+  token claims               -> {'sub': '1', 'role': 'STUDENT', 'iat', 'exp'}
+  sub is a str               -> '4'         <- the PyJWT 2.10 trap
+  wrong password             -> 401
+  unknown email              -> 401, byte-identical body
+  JSON body to /login        -> 422         <- documents the form contract
+  seeded student / faculty   -> log in, correct role in claim
+
+scripts/check_jwt.py         -> 9/9 PASS, exit 0 (regression, still clean)
+
+psql, not the script's own output:
+  password_hash    -> $argon2id$v=19$m=65536,t=3,p=4$..., 97 chars
+  created_at       -> timestamp with time zone
+  users            -> back to 3 after cleanup
+
+security.py directly, no HTTP:
+  round-trip       -> {'sub': '42', 'role': 'FACULTY', 'iat', 'exp'}
+  tampered token   -> InvalidSignatureError
+  verify_password vs garbage hash -> False, no 500  <- the ValueError above
+  verify_password vs empty hash   -> False
+
+openapi.json     -> 14 paths: 12 under /api/v1, 2 at root
+/docs            -> 200
+app log          -> no tracebacks, only reload notices
+```
+
+**Observed, and it confirms a documented trap:** the three seeded users
+share `created_at` to the microsecond while a registered user gets its
+own — `func.now()` is transaction-start time, exactly as session 5
+predicted. Visible in real data now rather than in a test fixture.
+
+**Cost incurred**
+
+- None material. The empty database on this machine cost one `seed.py`
+  run, and only because seed state is per-volume and no document had
+  said so. Now it does.
+
+**Deadline 2 status: MET.** The checkpoint is *"login returns a token
+containing a role; B can list resources"* and both halves are verified:
+the claim above, and `GET /api/v1/gpus` returning both clusters with that
+token in the header.
+
+One honest qualification on that second half: the token is *accepted*,
+not yet *verified* — `dependencies.py` is still the Deadline 1 stub and
+ignores the header entirely. Making it load-bearing is Deadline 3, which
+is precisely what Deadline 3 is for. Recorded so nobody reads the green
+result as more than it is; a route that returns 200 with a good token and
+also with no token at all has proved only one of those.
+
+Two deadlines met, seven sessions.
+
+**Audit, same session — Deadline 2 re-checked against the plan line by
+line, on this machine**
+
+Prompted by "check all the files whether Deadline 2 is met", i.e. not
+taking the entry above at its word. Every line of the Deadline 2 block in
+`EXECUTION_PLAN.md` was walked against the built system, and B's ten read
+routes were re-run **here** rather than trusted from session 6's run on
+B's machine — the Deadline 1 lesson about "verified on one machine" is
+not specific to migrations.
+
+```
+all 14 routes on THIS machine  -> 12 under /api/v1 + 2 at root, all as expected
+cross-type 404s                -> /gpus/3 (a room) 404, /rooms/1 (a GPU) 404
+availability start >= end      -> 422 ; missing params -> 422
+alembic check                  -> No new upgrade operations detected
+role_quotas vs the plan's list -> exact match, 8 rows, (FACULTY,COURSE) absent
+courses.capacity column        -> 0 rows in information_schema  (it is on the
+                                  offering, where the plan says it goes)
+offering                       -> instructor_id 2 = the FACULTY user,
+                                  capacity 50, "09:00"/"10:30" zero-padded
+```
+
+**One requirement was only half-tested, and the audit is what caught
+it.** The plan does not merely say duplicate registration returns 409; it
+says *"409, not 500: catch the IntegrityError, **because** two
+simultaneous registrations can both pass a 'does this email exist?'
+check."* The original check registered the same email **twice in a row** —
+which passes just as happily against the naive pre-flight check the plan
+is warning about. It tested the return code and not the reason for it.
+
+Fired 8 registrations of one address, released together on a barrier:
+`1 x 201, 7 x 409, zero 500s`, and **one row** in the database — asserted
+by counting rows, not by reading status codes, since those are only what
+the server said. Now part of `check_auth.py` rather than a one-off, so it
+stays true.
+
+Worth naming as a category, because it will recur at Deadlines 4, 5 and
+7: **a test that passes against the broken implementation is not a test
+of that requirement.** It is the same argument as `DECISIONS.md`'s "build
+the broken version first", arriving from the other direction.
+
+**Open / carried forward**
+
+0. **`JWT_SECRET` in `.env` is still `change-me-in-production`**, the
+   literal `.env.example` default. Harmless today — `.env` is gitignored
+   and every environment is thrown away — but the README will claim
+   JWT-based auth, and a demo signed with a published secret is a
+   question nobody wants at Deadline 10. Deadline 9's clean-room test is
+   the natural place to fix it, since that run needs a fresh `.env`
+   anyway. Also: `.claude/` is untracked and not in `.gitignore`.
+1. **Deadline 3 is next**, and A's half is the swap: real
+   `get_current_user` (decode → 401 on `InvalidTokenError` → load the
+   user) and real `require_role` (→ 403), then delete the stub. The
+   import path and call shape B coded against do not change.
+   `GET /me` also belongs to A there.
+2. `core/errors.py` exists but only one code flows through it so far.
+   Deadlines 4 and 5 must use `coded_error()` for `CAPACITY_EXHAUSTED`,
+   `QUOTA_EXCEEDED` and `IDEMPOTENCY_KEY_REUSED` rather than
+   hand-rolling a second envelope.
+3. Items 6–10 in `DECISIONS.md` are joint calls, still open. 8 blocks
+   Deadline 4; 7, 9 and 10 block Deadline 7. **Item 9 is the one to
+   settle first** — the global lock order and the waitlist promotion
+   design contradict each other, and it is A's transaction.
+4. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Deadline 5 has nothing to build on. Note the two
+   `scripts/check_*.py` gates are **not** a substitute: they are
+   sequential smoke tests, and Deadline 5 needs concurrency.
+5. The connection pool still defaults to 15 against a 500-request
+   harness — session 5, item 5. `session.py` needs both people.
+
+---
+
 ## Template
 
 ```markdown
