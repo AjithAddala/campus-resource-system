@@ -502,6 +502,129 @@ resources* — is met by neither half.
 
 ---
 
+## Session 6 — 2026-08-20 — B
+
+**Advances:** Deadline 2. **Completes B's half of it**; the deadline
+itself stays open, because the checkpoint is *"login returns a token
+containing a role; B can list resources"* and A's `auth/` column has not
+started.
+
+**Plan:** the second half of B's Deadline 2 column — the four read
+endpoints.
+
+**Shipped — `gpus/`, `rooms/`, `courses/`, mounted in `main.py`**
+
+- Each module split router / service / schemas, per `INIT_PLAN.md` §15:
+  routers know HTTP, services know the domain.
+- Ten routes, all reads, all authenticated by the Deadline 1 stub — so
+  the Deadline 3 swap now has real call sites and needs no change at
+  those sites.
+
+**Fixed — the modules existed but nothing mounted them**
+
+`include_router` appeared nowhere in `app/`, so `main.py` still served
+only `/health` and `/health/db` and not one of the routes was reachable.
+Written code that is not wired in looks identical to finished work from
+the outside; this is the same shape as a file that is written but never
+committed, and it is the third variant of that failure this project has
+hit.
+
+**Decided — the API prefix is `/api/v1`, defined once in `main.py`**
+
+`INIT_PLAN.md` §12 and `ARCHITECTURE_AND_WORKFLOWS.md` write every route
+under `/api/v1`; `EXECUTION_PLAN.md` writes them bare. Two documents beat
+one, and retrofitting a prefix once `auth/` and the benchmarks exist
+would touch every route and every harness URL. **A must mount `auth/`
+under the same constant.**
+
+Health checks deliberately stay at the **root**, outside the prefix: they
+are infrastructure, not API, and `docker-compose` should not have to
+track an API version.
+
+**Design notes worth keeping**
+
+- Both availability schemas carry docstrings stating they are *boundary
+  reads, stale on arrival*. `free` and `seats_available` must never gate
+  an allocation — the capacity guarantee lives in the transaction, under
+  `SELECT ... FOR UPDATE`. Writing that next to the field is cheaper than
+  discovering it at Deadline 4.
+- Cross-type 404s come free from the polymorphic discriminator: querying
+  the `GPUCluster` subclass adds `resource_type = 'GPU'` to the WHERE
+  clause, so `/gpus/3` where 3 is a room 404s without a hand-written
+  check. The *write* paths get no such help — Deadline 3 still has to
+  check `resource_type` in the service layer.
+- `rooms/service.py` answers availability with the same `&&` on
+  `tstzrange(..., '[)')` filtered to ACTIVE that the exclusion constraint
+  uses, so the read is served by the GiST index the constraint already
+  created. This closes the re-check that outstanding item 3 deferred:
+  *"not EXPLAIN-verified, because that query does not exist yet; re-check
+  on Deadline 3 when it does."* It exists now.
+- `courses/router.py` carries two routers — `/courses` for catalogue
+  reads, `/offerings` for offering-shaped ones — so Deadline 4's
+  `POST /offerings/{id}/register` attaches to a router that already
+  exists.
+
+**Verification run**
+
+```
+openapi.json          -> 10 routes under /api/v1, 2 at root
+GET /gpus             -> 2 clusters, 8 and 4 units
+GET /gpus/1/availability -> total 8, allocated 0, free 8
+GET /rooms            -> 2 rooms
+GET /courses          -> CS641
+GET /courses/1/offerings -> capacity 50, seats_available 50
+GET /offerings/1      -> instructor_id 2 (the FACULTY user)
+/gpus/3  (3 is a ROOM)        -> 404
+/rooms/1 (1 is a GPU cluster) -> 404
+start >= end                  -> 422
+missing course                -> 404
+/docs                         -> 200
+app log                       -> no errors, only reload notices
+
+Room availability cross-checked against the exclusion constraint itself,
+because agreeing with it is the endpoint's entire job:
+
+  window [11,13) vs booked [10,12)   endpoint available=false
+                                     constraint REJECTS the insert
+  window [12,14) adjacent            endpoint available=true
+                                     constraint ACCEPTS the insert
+  after cancelling the [10,12) hold  endpoint available=true
+                                     (constraint is partial on ACTIVE)
+
+test rows deleted; 8 seeded tables back to post-seed counts
+```
+
+A note on that cleanup: `pg_stat_user_tables` reported 2 reservations
+after the DELETE while `count(*)` reported 0. `n_live_tup` is an estimate
+maintained by the stats collector, not a count. Use `count(*)` when the
+number matters.
+
+**Cost incurred**
+
+- Docker Desktop was not running at the start of the session; the daemon
+  had to be started before anything could be verified.
+
+**Deadline 2 status: still open.** B's column is complete — seed script
+and read endpoints, both committed and both verified against a live
+database. A's column (`core/security.py` → `auth/schemas.py` →
+`auth/service.py` → `auth/router.py`) has not started, so the checkpoint
+is half-met.
+
+**Open / carried forward**
+
+1. **A's Deadline 2 auth column, not started.** It is now the only thing
+   between the project and Deadline 2.
+2. **A must mount `auth/` under `API_PREFIX`** from `main.py`. This is
+   new since the last entry and is the one coordination point B created.
+3. Items 6–10 in `DECISIONS.md` are joint calls. 8 blocks Deadline 4;
+   7, 9 and 10 block Deadline 7.
+4. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Deadline 5 has nothing to build on.
+5. The connection pool still defaults to 15 against a 500-request
+   harness — see session 5, item 5. `session.py` needs A.
+
+---
+
 ## Template
 
 ```markdown
