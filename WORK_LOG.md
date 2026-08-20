@@ -365,6 +365,143 @@ applies cleanly from empty for both people. Four sessions, one deadline.
 
 ---
 
+## Session 5 — 2026-08-20 — B
+
+**Advances:** Deadline 2 — the **first** work either person has done on
+it. Does **not** close it: Deadline 2 is auth *and* read paths, and the
+API still has only `/health` and `/health/db`.
+
+**Plan:** B's Deadline 2 column — seed script and read endpoints. Got the
+seed script; read endpoints not started.
+
+**Shipped — `scripts/seed.py`**
+
+- 3 users (one per role), 2 GPU clusters, 2 rooms, 1 course + offering,
+  8 `RoleQuota` rows. `--reset` truncates first; a bare re-run against a
+  non-empty database refuses with exit 1 rather than half-inserting and
+  dying on a UNIQUE violation.
+- Numbers are chosen by the benchmarks, not arbitrary: offering capacity
+  **50** because Benchmark 1 fires 500 concurrent registrations at it;
+  **two** clusters with free units because Benchmark 2 needs one student
+  issuing concurrent 2-GPU requests at *different* clusters;
+  `(STUDENT, GPU) = 2` so the third unit is the quota rejection.
+- Passwords hashed with `argon2.PasswordHasher()` directly rather than
+  waiting on A's `core/security.py`. argon2 encodes its parameters into
+  the hash string, so `verify()` accepts these whatever settings A picks
+  — the seed was never actually blocked on A's column.
+- `--reset` truncates off `Base.metadata.sorted_tables`, not a hardcoded
+  list, so a table added later cannot be silently missed.
+  `alembic_version` is not in the metadata, so this resets data and never
+  schema. `RESTART IDENTITY` keeps ids reproducible run to run, which the
+  benchmarks need because they assert on *which* rows were affected.
+- **`(FACULTY, COURSE)` is absent, not NULL.** Course registration is
+  STUDENT-only, so the pair is unreachable behind the 403. That makes
+  "no row" and "row with `max_units = NULL`" two different things, and
+  A's quota helper must not conflate them.
+
+**Fixed — the app image on B's machine predated the PyJWT swap**
+
+`scripts/check_jwt.py` failed on `ModuleNotFoundError: No module named
+'jwt'`. The container had been up two days, built before `ec7b074`, and
+still had `python-jose 3.3.0` and `cryptography 50.0.0` installed while
+`requirements.txt` said `PyJWT==2.10.1`. Rebuilt; the gate now passes 9/9.
+
+A's decision to write that check as a **script rather than a shell paste**
+is what caught it, on its first run on a second machine. Worth recording
+as a third instance of the same lesson: `docker compose ps` was green and
+`/health/db` was returning 200 throughout.
+
+**Shipped — documentation corrections**
+
+- `app/core/dependencies.py`: five "Day N" references → Deadlines; last
+  Day-N text anywhere in the code. Also corrected the frozen-interface
+  claim — the real `get_current_user` **will** take parameters the stub
+  does not (a bearer token and a `Session`). What is frozen is the import
+  path, the call shape, and the return type; "bodies only" was a promise
+  A could not keep.
+- `DECISIONS.md`: two deadline numbers in the capacity-move section were
+  wrong (course registration is Deadline 4, not 6; the reconciliation
+  query is Deadline 8, not 6). Both read "Day 6" before the rename, so
+  the substitution carried them faithfully. Also `response_status` →
+  `status_code`, which is the real column name.
+- **Outstanding items 8, 9 and 10 added** — see `DECISIONS.md`. All three
+  surfaced from reading `INIT_PLAN.md` against the built system.
+- `EXECUTION_PLAN.md`: `GET /me` scheduled at Deadline 3, `GET /me/quota`
+  at Deadline 6. Both were in two documents with **no deadline assigned**
+  — the same gap the PATCH endpoints had. Workflow B opens with
+  `/me/quota`, so the flagship demo has been starting on an endpoint
+  nobody owned.
+
+**Verification run**
+
+```
+docker compose build app     -> PyJWT-2.10.1 installed, jose absent
+scripts/check_jwt.py         -> 9/9 PASS, exit 0
+alembic current              -> 1ca8b85b7626 (head)
+pg_stat_user_tables          -> 12 tables, 0 rows (pre-seed)
+
+seed.py (bare, empty DB)     -> exit 0
+seed.py (bare, seeded DB)    -> exit 1, refuses  <- guard works
+seed.py --reset              -> exit 0, ids restart at 1
+
+psql verification, not the script's own output:
+  resources        -> 1,2 GPU / 3,4 ROOM, all status AVAILABLE
+                      (joined-table inheritance wrote both halves and
+                       set the discriminator from polymorphic_identity)
+  rooms            -> ids 3,4 with building + capacity
+  gpu_clusters     -> ids 1,2 -> 8 and 4 units, 0 allocated
+  course_offerings -> instructor_id = 2 (the FACULTY user), capacity 50,
+                      start/end "09:00"/"10:30" zero-padded
+  users.created_at -> tz-aware
+  password_hash    -> $argon2id$v=19$m=65536,t=3,p=4$...
+  PasswordHasher().verify(hash, 'campus123') -> True
+  role_quotas      -> 8 rows, (FACULTY, COURSE) absent as intended
+```
+
+**Observed, and it confirms a documented trap:** all three seeded users
+share `created_at` to the microsecond, because `func.now()` is
+transaction-start time. Harmless for users, since nothing orders them —
+and it is exactly why waitlist seeding at Deadline 7 needs separate
+commits or explicit timestamps, and why the promotion query carries the
+`id` tiebreak.
+
+**Cost incurred**
+
+- The stale image. Not large in wall-clock, but it would have been:
+  the seed script would have run fine against it, and the failure would
+  have surfaced later as an import error in A's `security.py`, looking
+  like A's bug.
+
+**Deadline 2 status: still open.** B's seed script is done; B's four read
+endpoints are not started, and A's `auth/` column has not begun. The
+checkpoint — *login returns a token containing a role; B can list
+resources* — is met by neither half.
+
+**Open / carried forward**
+
+1. **B's read endpoints not started**: `GET /gpus`, `/rooms`, `/courses`,
+   `/{id}/availability`. A's auth column not started either.
+2. **The API prefix is undecided and B hits it first.** `INIT_PLAN.md`
+   §12 and `ARCHITECTURE_AND_WORKFLOWS.md` write every route as
+   `/api/v1/...`; `EXECUTION_PLAN.md` writes them bare. `main.py` mounts
+   no routers yet, so there is no precedent in code. Pick `/api/v1` and
+   tell A before they write `auth/router.py` — retrofitting it later
+   touches every route and every benchmark URL.
+3. Items 6–10 in `DECISIONS.md` are joint calls. 8 blocks Deadline 4;
+   7, 9 and 10 block Deadline 7.
+4. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Deadline 5 has nothing to build on.
+5. **The connection pool will distort Benchmark 1.** `create_engine` in
+   `app/database/session.py` takes no pool arguments, so it is on
+   SQLAlchemy defaults — `pool_size=5, max_overflow=10`, i.e. **15
+   connections**. The harness fires 500. Requests past the 15th block on
+   the pool and raise `TimeoutError`, which looks exactly like a
+   concurrency bug in the thing being measured, while Postgres sits at
+   `max_connections=100` with headroom. `session.py` was written jointly,
+   so this needs A rather than a solo edit.
+
+---
+
 ## Template
 
 ```markdown
