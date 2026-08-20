@@ -153,7 +153,7 @@ Partial unique index (`WHERE status='ACTIVE'`) was considered and
 rejected: it allows clean inserts but lets duplicate DROPPED rows
 accumulate, and loses the hard guarantee.
 
-**`idempotency_keys.response_body` / `response_status` stay nullable.**
+**`idempotency_keys.response_body` / `status_code` stay nullable.**
 Load-bearing. The sequence is: INSERT key (response NULL) → do the
 booking → UPDATE key with the response → COMMIT. The claim happens first
 so the slot is taken before any work; the response is filled in once we
@@ -340,6 +340,11 @@ models, not the plan: `users.name` (not `full_name`),
 > above). B could not have done any of them. Items 6 and 7 are decisions,
 > not code. Corrected: 1–5 were A's, all now done in `c86676652ca2` and
 > `1ca8b85b7626`; 6 and 7 remain open and are joint calls.
+>
+> **The heading's "before Deadline 3" no longer holds either.** It was
+> written when the list was all schema. Items 6–10 are design questions
+> with different due dates, so each now names its own; item 7 was already
+> the counter-example, since it blocks Deadline 7.
 
 1. ~~**`WaitlistEntry` has no constraints at all.** Needs
    `UNIQUE(student_id, course_offering_id)` and
@@ -393,6 +398,42 @@ models, not the plan: `users.name` (not `full_name`),
 7. Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
    entries live in their own table, so a student on the waitlist should
    have a row there, not an enrollment. Matters for Deadline 7 promotion.
+8. **`DELETE /reservations/{id}` names a row in two different tables.**
+   Room holds live in `reservations`, GPU holds in `gpu_reservations`,
+   each with its own id sequence — so `/reservations/5` matches a row in
+   both and the path does not say which. This is the same shape as the
+   `/courses/{id}/register` problem: a route keyed on something that does
+   not identify one row. It survived the documentation sync because it
+   does not break a *lock*, only the routing, so nothing failed loudly.
+   In `INIT_PLAN.md` §12 under both Rooms and GPUs, in
+   `ARCHITECTURE_AND_WORKFLOWS.md` Workflow C, and in `EXECUTION_PLAN.md`
+   at Deadline 4 — it is a real open question, not doc staleness.
+   **Needs deciding before Deadline 4** (B's endpoint, A's `cancel()`).
+9. **The global lock order and the waitlist promotion contradict each
+   other.** `INIT_PLAN.md` §14 says every path takes key → user row →
+   resource row, naming *"allocation, cancellation, course registration,
+   and waitlist promotion alike."* Deadline 7 in `EXECUTION_PLAN.md` has
+   promotion lock the **offering first** and then check the promoted
+   student's course-load quota with no user lock at all. Two consequences:
+   the quota check is unprotected — the exact failure Benchmark 2 exists
+   to demonstrate — and taking the user lock to fix it yields
+   offering → user while registration holds user → offering, which is a
+   cycle on the one path these documents promise cannot deadlock.
+   Note "The claim this project makes" above is careful here: it lists
+   cancellation and course registration and does *not* claim promotion.
+   §14 over-claims relative to it. **Needs deciding before Deadline 7**;
+   it is A's transaction.
+10. **Is joining a waitlist automatic or explicit?**
+    `ARCHITECTURE_AND_WORKFLOWS.md` Workflow D falls through to the
+    waitlist when an offering is full (`else → waitlist`);
+    `INIT_PLAN.md` §12 has the student call
+    `POST /offerings/{id}/waitlist` themselves. Both cannot be the
+    default. This is **item 7 in another form**: auto-waitlisting on a
+    full register naturally writes an enrollment row with
+    `status = WAITLISTED`, putting the student in two tables at once;
+    explicit joining leaves `WAITLISTED` dead and it should come out of
+    the enum. Answer one and the other follows.
+    **Needs deciding before Deadline 7**, with item 7.
 
 ---
 
@@ -461,9 +502,10 @@ rewriting the catalogue.
 
 **`enrolled_count` added to `course_offerings`.** This is the counter
 that course registration locks — the direct analogue of
-`GPUCluster.allocated`, so the Deadline 4 GPU transaction and the Deadline 6 course
-transaction now have *the same shape*: `SELECT ... FOR UPDATE` the row
-holding the counter, compare against `capacity`, increment, insert.
+`GPUCluster.allocated`, so the GPU transaction and the course transaction
+— both Deadline 4, one per person — now have *the same shape*:
+`SELECT ... FOR UPDATE` the row holding the counter, compare against
+`capacity`, increment, insert.
 
 Without it, the capacity gate would have to be
 `SELECT COUNT(*) FROM enrollments WHERE course_offering_id = ? AND status
@@ -475,7 +517,7 @@ Locking the offering row is what makes Benchmark 1 winnable.
 `enrolled_count` is therefore derived state and can disagree with
 `enrollments` if any code path updates one without the other. The rule:
 **every write to `enrollments` happens in the same transaction as the
-matching `enrolled_count` update.** Deadline 6 should end with a reconciliation
+matching `enrolled_count` update.** Deadline 8 should end with a reconciliation
 query proving the two agree after Benchmark 1:
 
 ```sql
@@ -483,6 +525,16 @@ SELECT o.id, o.enrolled_count, COUNT(e.id) FILTER (WHERE e.status = 'ACTIVE')
 FROM course_offerings o LEFT JOIN enrollments e ON e.course_offering_id = o.id
 GROUP BY o.id HAVING o.enrolled_count <> COUNT(e.id) FILTER (WHERE e.status = 'ACTIVE');
 ```
+
+> **Two deadline numbers in this section were wrong and are now fixed.**
+> Course registration is **Deadline 4**, the same stage as the GPU
+> transaction — which is the point the paragraph above is making, and it
+> read "Deadline 6". The reconciliation query is scheduled at **Deadline
+> 8** in `EXECUTION_PLAN.md`, in B's column, and it read "Deadline 6" too.
+> Both said "Day 6" when written, so the Deadlines-not-days substitution
+> carried them through faithfully. Corrected rather than struck through:
+> these were miscounts on the day, not decisions that later changed, and
+> nothing about the amendment itself moved.
 
 Two CHECKs guard it, same reasoning as `gpu_capacity_sane` — the lock is
 the mechanism, the constraint makes a locking bug fail loudly instead of

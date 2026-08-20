@@ -187,6 +187,11 @@ resources.
 A      require_role dependency; apply to all admin-only routes
        verify 403 fires BEFORE the handler body executes
        hand the real dependency to B, delete the stub
+       GET /me  -- was in ARCHITECTURE_AND_WORKFLOWS.md and INIT_PLAN.md
+       §12 with no deadline assigned, same gap the PATCH endpoints had.
+       It belongs here and nowhere else: it is the end-to-end proof that
+       a real token decodes to a real user carrying a role, which is the
+       claim this deadline makes. Assigned to A, who owns the decode.
 B      room reservation POST
        the EXCLUDE USING gist constraint already exists -- shipped Deadline 1
        in revision e0fbfe421403, along with the btree_gist extension.
@@ -286,6 +291,14 @@ A      apply the quota helper inside B's modules:
          these were in ARCHITECTURE_AND_WORKFLOWS.md Workflow E but had
          no deadline assigned. They only WRITE resources.status; gates on
          Deadlines 3 and 4 are what READ it.
+       GET /me/quota -- limits + current usage. Same missing-deadline gap.
+         Here rather than Deadline 4, because it reads the quota policy
+         AND the held-units SUM, so it is the quotas/ helper with an
+         HTTP wrapper -- and Workflow B opens with this call, so the
+         flagship demo has been starting on an endpoint nobody owned.
+         Read-only: it must NOT take the user lock. A stale number shown
+         to a caller is fine; the allocation transaction is what has to
+         be right.
        fix whatever B's benchmarks break
 B      BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
          DIFFERENT clusters
