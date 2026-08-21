@@ -300,6 +300,17 @@ round-trip per request — which matters when 500 concurrent requests must
 not add user-lookup noise to lock measurements. Accepted tradeoff: a role
 change does not take effect until the token expires (60 minutes).
 
+> **CHANGED at Deadline 3 — `require_role` reads the role from the
+> database row, not from the claim.** The round-trip these paragraphs
+> avoid was already being made: `get_current_user() -> User`, frozen at
+> Deadline 1, loads the user on every authenticated request, so by the
+> time `require_role` runs the row is in hand and there is no lookup left
+> to save. With both copies available the fresher one wins, and the
+> stale-role window is zero rather than the token's 60 minutes. The token
+> is still the source of identity; it is just not what entitlement is
+> read from. See `DECISIONS.md`, "The role is read from the database, not
+> the claim".
+
 ## Testing
 
 -   Pytest
@@ -1031,6 +1042,17 @@ ADMIN
 The role is written into the JWT at login, so authorization checks do
 not require a database round-trip on every request (the token is the
 source of identity; the database remains the source of truth for state).
+
+> **CHANGED at Deadline 3 — `require_role` reads the role from the
+> database row, not from the claim.** The round-trip these paragraphs
+> avoid was already being made: `get_current_user() -> User`, frozen at
+> Deadline 1, loads the user on every authenticated request, so by the
+> time `require_role` runs the row is in hand and there is no lookup left
+> to save. With both copies available the fresher one wins, and the
+> stale-role window is zero rather than the token's 60 minutes. The token
+> is still the source of identity; it is just not what entitlement is
+> read from. See `DECISIONS.md`, "The role is read from the database, not
+> the claim".
 
 ## Enforcement via dependencies
 

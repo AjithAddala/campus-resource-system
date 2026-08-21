@@ -32,7 +32,7 @@ So every entry names the Deadline it advanced, and says whether that
 Deadline is now met. A deadline may take several sessions; a session may
 touch more than one deadline; neither implies the other.
 
-**As of session 4 (2026-08-18): Deadline 1 MET. Deadline 2 not started.**
+**As of session 9 (2026-08-21): Deadlines 1, 2 and 3 MET. Deadline 4 next.**
 
 It took four sessions to meet the first of ten deadlines. That is the
 number worth looking at, and it was invisible while sessions and
@@ -807,6 +807,315 @@ the broken version first", arriving from the other direction.
    sequential smoke tests, and Deadline 5 needs concurrency.
 5. The connection pool still defaults to 15 against a 500-request
    harness — session 5, item 5. `session.py` needs both people.
+
+## Session 8 — 2026-08-21 — A
+
+**Advances:** Deadline 3 — **A's column, complete.** Does not close the
+deadline: the checkpoint is two claims, *"student token on `POST /gpus`
+returns 403"* **and** *"overlapping room booking returns 409"*, and the
+second is B's room-reservation endpoint, not started.
+
+**Plan:** replace the Deadline 1 stub in `core/dependencies.py` with real
+JWT decoding and role enforcement, ship `GET /me`, and prove the swap by
+running it rather than by reading it.
+
+**Shipped — `core/dependencies.py`, the stub deleted**
+
+- Real `get_current_user`: decode → 401 on `jwt.InvalidTokenError` →
+  `int(sub)` → load the user → 401 if that row is gone. Real
+  `require_role`: 403 on a role mismatch, as a dependency so it resolves
+  before the handler body.
+- **Zero edits at B's ten call sites.** The import path, call shape and
+  return type were frozen at Deadline 1 for this moment, and the freeze
+  held exactly as designed.
+- `OAuth2PasswordBearer` registers the bearer scheme, so `/docs` now has
+  a working **Authorize** button — the payoff for login being
+  form-encoded, argued at Deadline 2 and only now cashable.
+
+**Shipped — `app/users/`, `GET /me`**
+
+Assigned to Deadline 3 in session 5 after being found in two documents
+with no deadline at all. It is the end-to-end proof that a real token
+decodes to a real user carrying a real role. Reuses
+`auth.schemas.UserRead`; no `users/service.py`, because the domain half
+is empty until `GET /me/quota` arrives at Deadline 6.
+
+**Shipped — `POST /gpus` and `POST /rooms`, both ADMIN**
+
+Not in the Deadline 3 column as written, and unavoidable: the checkpoint
+names `POST /gpus`, **which did not exist**, and no other admin-only
+route did either — so `require_role` had nothing to guard and the
+checkpoint could not have been run. Third instance of the
+specified-but-unassigned endpoint gap, after `GET /me` and the admin
+PATCH endpoints. Reasoning in `DECISIONS.md`.
+
+**Shipped — `API_PREFIX` moved to `core/config.py`**
+
+`dependencies.py` needs it for `tokenUrl`, and importing `main.py` from a
+dependency is a cycle. Value and reasoning unchanged from session 6; one
+place to change it, as before.
+
+**Verification run**
+
+```
+alembic current              -> 1ca8b85b7626 (head)   [run first, per DECISIONS.md]
+alembic check                -> No new upgrade operations detected
+routes                       -> 21 total: 15 under /api/v1, 2 at root, 4 from FastAPI
+
+scripts/check_rbac.py        -> 34/34 PASS, exit 0
+  no token / garbage / wrong signature / expired
+    / int sub / signed token for a nonexistent user
+                             -> 401 x 6   <- ALL SIX returned 200 yesterday
+  401 carries WWW-Authenticate: Bearer
+  student token              -> 200, both seeded clusters
+  GET /me                    -> the seeded student, role STUDENT,
+                                no password_hash field
+  GET /me, no token          -> 401
+  POST /gpus, no token       -> 401, NOT 403
+  POST /gpus, student        -> 403   <- THE CHECKPOINT
+  POST /gpus, faculty        -> 403
+  POST /rooms, student       -> 403
+  cluster/room counts across the 403s -> 2 -> 2, 2 -> 2
+                                <- the 403 fired BEFORE the handler body;
+                                   status codes cannot show this
+  ADMIN-claim token on the STUDENT row -> 403, nothing created
+                                <- the role is read from the DB, not the claim
+  POST /gpus, admin          -> 201, allocated = 0, readable at GET /gpus/{id}
+  gpu_count = 0, admin       -> 422
+  gpu_count = 0, student     -> 403, not 422  <- authn -> authz -> validation
+  openapi securitySchemes    -> OAuth2PasswordBearer,
+                                tokenUrl api/v1/auth/login,
+                                declared on protected routes
+
+scripts/check_auth.py        -> 25/25 PASS, exit 0 (regression, still clean)
+scripts/check_jwt.py         ->  9/9  PASS, exit 0 (regression, still clean)
+
+psql, not the scripts' own output:
+  resources 4, gpu_clusters 2, rooms 2, users 3, role_quotas 8
+                                <- post-seed counts exactly; deleting the
+                                   created cluster through the subclass took
+                                   its `resources` row with it, leaving no
+                                   orphan typed row behind
+app log                      -> no tracebacks, only request lines
+```
+
+**Observed, and it is the point of the whole deadline:** the six 401
+assertions above are the ones that describe what changed. Every one of
+them was a **200** against the build that passed Deadline 2's checkpoint.
+The token was accepted, not verified; it is verified now.
+
+**Cost incurred**
+
+- Docker Desktop was not running at session start (second time — session
+  6 lost time the same way). It is not installed under
+  `C:\Program Files\Docker`; the executable is at
+  `%LOCALAPPDATA%\Programs\DockerDesktop\Docker Desktop.exe`. Noted so
+  it is not re-searched.
+- One self-inflicted near-miss: a file written through Python's
+  `write_text` on Windows picked up **cp1252**, putting a raw `0xA7`
+  byte where a `§` was meant. Python source is read as UTF-8, so that
+  file would have failed to import — a syntax error with nothing
+  syntactically wrong in it. Caught by running `iconv -f UTF-8` over
+  every touched file before starting the stack, not by reading them.
+  Write with an explicit encoding, or stay in ASCII.
+
+**Deadline 3 status: still open.** A's column is complete and verified;
+B's column — `POST /rooms/{id}/reservations`, the `resource_type` check
+in the service layer, the `resources.status` gate, and the adjacent-
+interval test — is not started. Half the checkpoint is met.
+
+**Open / carried forward**
+
+1. **B's Deadline 3 column is the only thing between the project and
+   Deadline 3.** Note the `resources.status` gate in it depends on
+   outstanding item 6, which is still unratified — the proposal is
+   written up in `EXECUTION_PLAN.md` at Deadline 4 (blocking stops new
+   allocations, does not evict, distinct code `RESOURCE_BLOCKED`) and
+   needs a yes before the endpoint is written, because adding it after
+   the Deadline 8 freeze means reopening a frozen transaction.
+2. `GET /me/quota` (Deadline 6) and the admin `PATCH` endpoints
+   (Deadline 6) are the remaining half of the endpoint set that had no
+   deadline. `POST /courses` and `POST /offerings` — `[ADMIN | FACULTY]`
+   in `INIT_PLAN.md` §12 — are **a fourth instance of the same gap** and
+   still belong to no deadline. Worth assigning before a checkpoint trips
+   over them the way this one did.
+3. Items 6–10 in `DECISIONS.md` are joint calls. 6 blocks B's half of
+   Deadline 3; 8 blocks Deadline 4; 7, 9 and 10 block Deadline 7. **Item
+   9 remains the one to settle first** — the global lock order and the
+   waitlist promotion design contradict each other, and it is A's
+   transaction.
+4. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Deadline 5 has nothing to build on. The three
+   `scripts/check_*.py` gates are not a substitute: `check_auth.py` fires
+   8 simultaneous registrations with threads, which is real concurrency,
+   but they are smoke tests against a running server and Deadline 5 needs
+   a harness that reports collected status codes.
+5. The connection pool still defaults to 15 against a 500-request
+   harness — session 5, item 5. `session.py` needs both people.
+6. `JWT_SECRET` in `.env` is still `change-me-in-production` — session 7,
+   item 0. Now slightly more load-bearing than it was: tokens are
+   actually verified against it, so a published secret is a forgeable
+   admin token rather than a theoretical one. Still fine for a
+   throwaway environment; still due at Deadline 9's clean-room run.
+
+## Session 9 — 2026-08-21 — B
+
+**Advances:** Deadline 3 — and **closes it.** B's room reservation
+endpoint was the only thing left after session 8.
+
+Ran straight on from session 8 in the same sitting, logged separately
+because the columns are separate and the two halves fail differently: A's
+half is a boundary that must reject, B's half is a transaction that must
+not double-book.
+
+**Ratified first — outstanding item 6, open since Deadline 1**
+
+`resources.status = BLOCKED` stops **new** allocations, does **not**
+evict existing ones (same rule as the capacity reduction in
+`ARCHITECTURE_AND_WORKFLOWS.md` §13), and carries its own code
+`409 RESOURCE_BLOCKED` because the remedy differs from both existing
+409s. Checked inside the transaction against the row just locked, never
+at the boundary — `status` is mutable, so an admin can flip it between a
+boundary read and the write. As proposed in `EXECUTION_PLAN.md`; the
+proposal had been sitting unratified for five sessions and this endpoint
+is the first code that reads the flag.
+
+**Shipped — `POST /rooms/{id}/reservations`**
+
+- Any authenticated role, per the role matrix — `get_current_user`, not
+  `require_role`. How many a caller may hold is a *quota*, a different
+  question answered at Deadline 6 under the user lock.
+- The `resource_type` check in the service layer. `reservations.
+  resource_id` is an FK to `resources`, and a GPU cluster **is** a
+  resource, so nothing in the database stops a "room booking" naming a
+  cluster. Read paths get this free from the polymorphic discriminator;
+  write paths do not.
+- The BLOCKED gate, per the ratification above.
+- No pre-flight "is this slot free?" SELECT. The exclusion constraint is
+  what makes the second INSERT impossible, so the INSERT is the check —
+  the same shape as duplicate registration at Deadline 2.
+- `_is_overlap_violation()` reads the **constraint name** from psycopg's
+  diagnostics and re-raises anything else, so an unrelated FK bug is not
+  reported to the caller as a booking conflict.
+- `INTERVAL_CONFLICT` added to the coded errors. Two 409s now share this
+  endpoint with different remedies (pick another slot / pick another
+  room), which is exactly what the envelope was created for.
+
+**Changed while writing it — `FOR SHARE`, not `FOR UPDATE`**
+
+The status gate was first written with `FOR UPDATE`, following the sketch
+in `EXECUTION_PLAN.md`. That sketch is correct **for the GPU
+transaction**, which writes the row it locks. The room transaction never
+writes it — rooms have no counter — so an exclusive lock buys nothing the
+gate needs and quietly serializes every booking of one room behind every
+other, making the application lock rather than the constraint the thing
+that decides a concurrent slot race.
+
+Caught by writing the router docstring, which claimed no application lock
+was involved in the overlap invariant, and noticing that by then one was.
+The fix was to make the lock match the claim rather than soften the
+claim. Reasoning in `DECISIONS.md`.
+
+**Verification run**
+
+```
+routes                       -> 22 total: 16 under /api/v1, 2 at root
+
+scripts/check_rooms.py       -> 34/34 PASS, exit 0
+  no token                   -> 401  (the Deadline 3 boundary, on a write route)
+  student books [10,12)      -> 201, status ACTIVE, user_id = the caller
+  overlapping [11,13)        -> 409 INTERVAL_CONFLICT   <- THE CHECKPOINT
+  inner / enclosing / identical windows -> 409 x 3
+                                <- a hand-written overlap test with one
+                                   comparison inverted passes the simple
+                                   case and fails these
+  adjacent [12,14) and [8,10) -> 201 x 2   <- the whole reason for '[)'
+  same slot, different room  -> 201
+  8 SIMULTANEOUS identical bookings -> 1 x 201, 7 x 409, zero 500s
+                                and ONE row, counted in the database
+                                <- every other assertion here passes
+                                   against check-then-insert; only this
+                                   one does not
+  slot of a CANCELLED hold   -> bookable again (constraint is partial)
+  booking a GPU cluster via /rooms -> 404, and zero reservation rows
+                                      against that cluster
+  booking room 999999        -> 404
+  BLOCKED room               -> 409 RESOURCE_BLOCKED
+  existing hold on it        -> survives   <- blocking does not evict
+  ADMIN on a BLOCKED room    -> 409 too    <- BLOCKED is a fact about the
+                                              resource, not a permission
+  start == end / inverted / missing body -> 422 x 3
+  naive datetime             -> 201, and the tz-aware repeat 409s
+                                <- proves it was stored as UTC, not
+                                   resolved against the session TimeZone
+  availability vs reality    -> booked slot false, free slot true
+
+  the lock mechanism itself, two sessions and a 750ms lock_timeout:
+    SHARE lock blocks an admin write to the row -> LockNotAvailable
+    SHARE lock does NOT block another booker    -> acquired
+                                <- both halves matter: FOR UPDATE would
+                                   satisfy the first and break the second
+
+scripts/check_rbac.py        -> 34/34 PASS, exit 0 (regression, still clean)
+scripts/check_auth.py        -> 25/25 PASS, exit 0 (regression)
+scripts/check_jwt.py         ->  9/9  PASS, exit 0 (regression)
+
+psql:  reservations 0, rooms 2, gpu_clusters 2, resources 4
+       no room left BLOCKED
+alembic current / check      -> 1ca8b85b7626 (head), no drift
+```
+
+**Cost incurred**
+
+- None material. No schema change, so no migration: the exclusion
+  constraint and `btree_gist` have been in place since revision
+  `e0fbfe421403` at Deadline 1, and this endpoint is the first code to
+  use either.
+
+**Deadline 3 status: MET.** Both halves of the checkpoint verified on
+this machine: *student token on `POST /gpus` returns 403* (session 8,
+with the row counts showing it fired before the handler) and *overlapping
+room booking returns 409* (above, with eight concurrent bookings landing
+exactly one row).
+
+Three deadlines met, nine sessions.
+
+**Open / carried forward**
+
+1. **Deadline 4 is next, and it is the heaviest** — A's GPU transaction
+   and B's course registration, both people writing a locking
+   transaction for the first time at the same deadline. The plan's
+   fallback stands: if A's GPU path is not landing by the halfway mark,
+   B stops courses and pairs on it.
+2. **Outstanding item 8 blocks B's Deadline 4 column** and is unchanged:
+   `DELETE /reservations/{id}` names a row in two tables with separate id
+   sequences. Now slightly more concrete than it was — `reservations`
+   holds real room rows as of this session, and `gpu_reservations` gets
+   its first rows at Deadline 4, which is when the ambiguity becomes
+   reachable rather than theoretical.
+3. Items 7, 9 and 10 in `DECISIONS.md` remain joint calls and all block
+   Deadline 7. **Item 9 is still the one to settle first** — the global
+   lock order and the waitlist promotion design contradict each other,
+   and it is A's transaction. Note this session added a *third* lock mode
+   to the picture (`FOR SHARE` on a row that is only read), which is
+   worth having in mind when that order is finally written down: the rule
+   is about the order locks are taken in, not about their strength.
+4. `POST /courses` and `POST /offerings` — `[ADMIN | FACULTY]` in
+   `INIT_PLAN.md` §12 — still belong to no deadline. Fourth instance of
+   the specified-but-unassigned gap. B's Deadline 4 column needs an
+   offering to register against, and the seed provides exactly one, so
+   this is reachable at Deadline 4.
+5. `tests/` still absent, `pytest-asyncio` still not in
+   `requirements.txt`. Deadline 5 has nothing to build on. Note the four
+   `scripts/check_*.py` gates now include two barrier-released
+   concurrency cases (8 duplicate registrations, 8 duplicate bookings),
+   which is real contention but still threads-in-a-script; Deadline 5
+   wants asyncio + httpx firing 500.
+6. The connection pool still defaults to 15 against a 500-request
+   harness — session 5, item 5. `session.py` needs both people. This is
+   now the oldest untouched item on the list.
+7. `JWT_SECRET` in `.env` is still `change-me-in-production` — session 7,
+   item 0. Due at Deadline 9's clean-room run.
 
 ---
 

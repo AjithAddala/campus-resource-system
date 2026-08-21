@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.models.enums import ResourceStatus
 
@@ -30,3 +30,17 @@ class GPUAvailability(BaseModel):
     total: int
     allocated: int
     free: int
+
+
+class GPUClusterCreate(BaseModel):
+    """Admin-only cluster creation.
+
+    `allocated` is deliberately NOT a field. It is derived state owned by
+    the allocation transaction, and letting a caller set it would mean a
+    cluster could be born already over-allocated -- the exact invariant
+    `gpu_capacity_sane` exists to protect. New clusters start at zero,
+    always.
+    """
+
+    name: str = Field(min_length=1, max_length=255)
+    gpu_count: int = Field(ge=1)

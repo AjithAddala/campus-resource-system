@@ -72,7 +72,7 @@ app/
 │   ├── dependencies.py   get_current_user, require_role
 │   └── config.py
 ├── auth/                 register, login
-├── users/                profile, GET /me/quota
+├── users/                GET /me  (Deadline 3); GET /me/quota at Deadline 6
 ├── quotas/               RoleQuota policy + enforcement helper
 ├── idempotency/          key storage + replay helper
 ├── rooms/                interval reservations
@@ -267,7 +267,8 @@ testing proves the user-row lock is a bottleneck.
 404  resource does not exist
 409  CAPACITY_EXHAUSTED     capacity exhausted
 409  QUOTA_EXCEEDED         role quota exceeded
-409  room interval conflict
+409  INTERVAL_CONFLICT      room slot overlaps an active reservation
+409  RESOURCE_BLOCKED       admin has blocked this resource
 409  duplicate enrollment
 422  malformed request body
 422  IDEMPOTENCY_KEY_REUSED same key, different body
@@ -289,14 +290,44 @@ endpoint to return a coded error. Every coded failure is built by
 ```
 
 `code` is the contract a client may branch on; `message` may be reworded
-at any time. Uncoded errors — a plain 404, the 401 from a bad token —
-keep FastAPI's default string `detail`, because there is nothing for a
-caller to distinguish. Registration adds one code to the Deadline 1
+at any time. Uncoded errors — a plain 404, the 401 from a bad token, the
+403 from `require_role` — keep FastAPI's default string `detail`, because
+there is nothing for a caller to distinguish: there is one remedy for a
+401 (get a token) and one for a 403 (stop).
+
+Two details of the 401, settled at Deadline 3: every 401 is
+**byte-identical** whatever went wrong — expired, tampered, malformed
+subject, or a signed token naming a deleted user — because which one it
+was is not the caller's business and distinguishing them hands an
+attacker a probe. And it carries `WWW-Authenticate: Bearer`, which is
+what makes it a spec-conforming 401 rather than a 401-shaped 403. Registration adds one code to the Deadline 1
 table:
 
 ``` text
 409  EMAIL_ALREADY_REGISTERED    that email already has an account
 ```
+
+Deadline 3 adds two more, both on `POST /rooms/{id}/reservations` — which
+is precisely why they are coded. Two 409s on one endpoint, distinguishable
+only by the remedy:
+
+``` text
+409  INTERVAL_CONFLICT    that slot is taken       -> pick another slot
+409  RESOURCE_BLOCKED     the room is blocked      -> pick another room
+```
+
+`RESOURCE_BLOCKED` is outstanding item 6, ratified at Deadline 3:
+blocking stops **new** allocations and does **not** evict existing ones,
+matching the capacity-reduction rule in §13. The gate is checked inside
+the transaction against the row it just locked, never at the boundary,
+because `status` is mutable — an admin can flip it between a boundary read
+and the write. The database enforces none of this: the GiST constraint is
+partial on the *reservation's* status, not the *resource's*, so the
+service layer is the whole guarantee.
+
+401 and 403 stay **uncoded**, with FastAPI's plain string `detail`: there
+is one remedy for a 401 (get a token) and one for a 403 (stop), so a code
+would carry nothing the status line does not.
 
 ------------------------------------------------------------------------
 
@@ -360,9 +391,18 @@ late:
   every later request — a bug in the issuer that only ever shows up in
   the consumer.
 
-The role travels in the token, so authorization needs no database
-round-trip. The database remains the source of truth for *state*; the
-token is the source of *identity*.
+The role travels in the token — but **authorization reads it from the
+database row, not from the claim** (changed at Deadline 3; see
+`DECISIONS.md`). The lookup the claim was meant to save had already been
+spent: `get_current_user` returns a `User`, so the row is loaded on every
+authenticated request regardless, and by the time `require_role` runs
+there is nothing left to avoid. Given both copies, the fresher one wins,
+so a role change takes effect on the caller's next request rather than at
+token expiry.
+
+The database is therefore the source of truth for *state* **and** for
+entitlement; the token is the source of *identity*, and its role claim is
+the demonstrable half of the auth story rather than the enforced one.
 
 ## 10. Workflow B — Student reserves a GPU (flagship path)
 
@@ -512,7 +552,10 @@ Cluster full                      409 CAPACITY_EXHAUSTED
 Student already holds 2 GPUs      409 QUOTA_EXCEEDED
 Retried request (same key)        200/201 replay, no new booking
 Same key, different body          422 IDEMPOTENCY_KEY_REUSED
-Overlapping room booking          409 (exclusion constraint)
+Overlapping room booking          409 INTERVAL_CONFLICT (exclusion constraint)
+Booking a BLOCKED room            409 RESOURCE_BLOCKED, existing holds kept
+Booking a GPU cluster via /rooms  404 (service-layer resource_type check;
+                                       the FK alone would accept it)
 Duplicate course registration     409 (unique constraint)
 Two concurrent identical retries  one commits, one blocks then replays
 ```

@@ -10,7 +10,8 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1 and 2 met (sessions 4 and 7). Deadline 3 next.**
+> **Status: Deadlines 1, 2 and 3 met (sessions 4, 7 and 9).
+> Deadline 4 — the heaviest — is next.**
 
 ## 0. Scope
 
@@ -195,30 +196,65 @@ resources. — **Both verified (sessions 6 and 7).**
 > `IDEMPOTENCY_KEY_REUSED` through `coded_error()` rather than inventing
 > a second shape.
 
-### Deadline 3 - Authorization vs. Rooms
+### Deadline 3 - Authorization vs. Rooms  ✅ MET (sessions 8 and 9)
 
 ``` text
-A      require_role dependency; apply to all admin-only routes
-       verify 403 fires BEFORE the handler body executes
-       hand the real dependency to B, delete the stub
-       GET /me  -- was in ARCHITECTURE_AND_WORKFLOWS.md and INIT_PLAN.md
+A ✅   require_role dependency; apply to all admin-only routes
+A ✅   verify 403 fires BEFORE the handler body executes
+A ✅   hand the real dependency to B, delete the stub
+A ✅   GET /me  -- was in ARCHITECTURE_AND_WORKFLOWS.md and INIT_PLAN.md
        §12 with no deadline assigned, same gap the PATCH endpoints had.
        It belongs here and nowhere else: it is the end-to-end proof that
        a real token decodes to a real user carrying a role, which is the
        claim this deadline makes. Assigned to A, who owns the decode.
-B      room reservation POST
+A ✅   POST /gpus and POST /rooms [ADMIN] -- NOT in this column as written,
+       and the checkpoint below could not run without them: it names
+       POST /gpus, which did not exist, and no other admin-only route did
+       either, so require_role had nothing to guard. Creating a resource
+       is [ADMIN] in both role matrices and in INIT_PLAN.md §12, with no
+       deadline assigned -- the third instance of that gap after GET /me
+       and the PATCH endpoints. Assigned here by the checkpoint.
+B ✅   room reservation POST
        the EXCLUDE USING gist constraint already exists -- shipped Deadline 1
        in revision e0fbfe421403, along with the btree_gist extension.
        B writes the endpoint against it; no migration needed.
-       include the resources.status gate while writing the lock (below)
-       adjacent-interval test: [10,12) and [12,14) both succeed
-       reservations.resource_id points at `resources`, so nothing at the
+B ✅   include the resources.status gate while writing the lock (below)
+       -- item 6 RATIFIED as proposed; 409 RESOURCE_BLOCKED, no eviction
+B ✅   adjacent-interval test: [10,12) and [12,14) both succeed
+B ✅   reservations.resource_id points at `resources`, so nothing at the
        DB level stops a "room" booking naming a GPU cluster -- check the
        resource_type in the service layer
+
+       One deviation from the sketch below, deliberate: the room gate
+       takes the resource row FOR SHARE, not FOR UPDATE. The sketch is
+       written for the GPU transaction, which WRITES the row it locks.
+       The room path never does -- rooms have no counter -- so an
+       exclusive lock would serialize every booking of one room behind
+       every other and make the application lock, rather than the
+       exclusion constraint, the thing deciding a concurrent slot race.
+       FOR UPDATE stays correct and stays the rule at Deadline 4.
 ```
 
 **Checkpoint:** student token on `POST /gpus` returns 403; overlapping
-room booking returns 409.
+room booking returns 409. — **BOTH HALVES VERIFIED (sessions 8 and 9).**
+
+**First half (session 8):
+`scripts/check_rbac.py`, 34/34, including the row counts on both sides of
+the 403 that show it fired before the handler body.
+**Second half (session 9):** `scripts/check_rooms.py`, 34/34, including
+eight barrier-released identical bookings landing exactly one row.
+
+> One decision reversed while meeting the first half, recorded in
+> `DECISIONS.md`: `require_role` reads the role from the **database row**,
+> not the token claim. Deadline 1 accepted a 60-minute stale-role window
+> to save a lookup per request — but freezing `get_current_user() -> User`
+> in the same session already spent that lookup, so the window was being
+> paid for nothing. It is now zero.
+>
+> **Outstanding item 6 is now ratified** (session 9), as proposed:
+> BLOCKED stops new allocations, does not evict existing ones, and
+> carries `409 RESOURCE_BLOCKED`. The GPU half of that gate lands with
+> the transaction at Deadline 4.
 
 ### Deadline 4 - Flagship vs. Courses (the heaviest)
 

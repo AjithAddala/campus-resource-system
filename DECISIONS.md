@@ -167,6 +167,16 @@ authorise without a DB query per request — which matters on Deadline 5, when
 measurements. Tradeoff: a role change does not take effect until the
 token expires (60 min). Accepted.
 
+> **REVERSED at Deadline 3 — the saving was already spent.** The frozen
+> signature returns a `User`, so `get_current_user` loads that row on
+> every request regardless; by the time `require_role` runs there is no
+> lookup left to avoid. `require_role` therefore reads `user.role` from
+> the database row, and the stale-role window is zero rather than 60
+> minutes. Left in place unstruck because the reasoning was sound given
+> what was known at Deadline 1 — what changed is that the return type
+> was frozen in the same session. See "The role is read from the
+> database, not the claim" below.
+
 ## Frozen interfaces
 
 ```python
@@ -388,13 +398,27 @@ models, not the plan: `users.name` (not `full_name`),
    (`PATCH /rooms/{id} -- modify availability/status`), and §13, which
    titles it *"Requested feature: admin-only resource modification."* It
    is admin-blocks-a-room-for-maintenance, and it was asked for.
-   **Still open, and narrower: the enforcement semantics.** Does blocking
+   ~~**Still open, and narrower: the enforcement semantics.** Does blocking
    evict existing reservations (proposed: no, matching the
-   capacity-reduction rule), and what error code? Proposal written up in
-   `EXECUTION_PLAN.md` under Deadline 4. **Deadline is Deadline 3, not Deadline 8** — the
-   gate that reads the flag is one line inside the room and GPU
-   transactions, and those are frozen on Deadline 8. The PATCH endpoints that
-   write it are now scheduled at Deadline 6; they had none at all before.
+   capacity-reduction rule), and what error code?~~
+   **RATIFIED at Deadline 3, as proposed, and now enforced in
+   `rooms/service.py::reserve_room`:**
+   - blocking stops **new** allocations and does **not** evict existing
+     ones — the same rule as the capacity reduction in
+     `ARCHITECTURE_AND_WORKFLOWS.md` §13;
+   - distinct code **`409 RESOURCE_BLOCKED`**, because the remedy differs
+     from both existing 409s: try a different resource, do not wait for
+     capacity, do not release anything you hold;
+   - checked **inside the transaction, against the row just locked**,
+     never at the boundary — `status` is mutable, so an admin can flip it
+     between a boundary read and the write.
+
+   Asserted in `scripts/check_rooms.py`, including the non-eviction half
+   (an active hold survives its room being blocked) and the fact that an
+   ADMIN is refused too — BLOCKED is a fact about the resource, not a
+   permission. The GPU half of the gate lands with that transaction at
+   Deadline 4; the PATCH endpoints that *write* the flag are at Deadline
+   6, and they had no deadline at all before session 5.
 7. Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
    entries live in their own table, so a student on the waitlist should
    have a row there, not an enrollment. Matters for Deadline 7 promotion.
@@ -1129,3 +1153,348 @@ If the answer is "none of the ones we were choosing between", it is
 measuring something else. Deadlines 4, 5 and 7 are all of this shape:
 Benchmark 2 in particular is only meaningful because the *correct*
 resource-lock implementation fails it.
+
+---
+
+# Deadline 3 — the authorization boundary (A)
+
+The stub is gone. `core/dependencies.py` decodes a real token, loads a
+real user, and rejects with 401 or 403 before any handler body runs.
+Nothing changed at B's ten call sites: the import path, the call shape
+and the return type were frozen at Deadline 1 for exactly this moment,
+and the swap cost zero edits outside `core/`.
+
+## What Deadline 2's green checkpoint was actually worth
+
+`GET /gpus` returned 200 with a bearer token — and also with no token at
+all, because the stub took no parameters and read no header. Session 7's
+entry recorded that honestly at the time. It is worth restating as a
+general rule rather than a one-off caveat:
+
+> A route that answers the same way with and without a credential has
+> tested the happy path of *routing*, not of *authentication*.
+
+`scripts/check_rbac.py` opens with the negative case for that reason —
+six ways of arriving without a valid identity (absent, malformed, wrongly
+signed, expired, int `sub`, and a signed token naming a user who does not
+exist), each asserted to be 401. Every one of them returned **200**
+against yesterday's build.
+
+## The role is read from the database, not the claim
+
+Deadline 1 decided the opposite, and the reversal is worth stating
+plainly because the original reasoning was not wrong — it was overtaken
+by another decision made in the same session.
+
+The claim was: put `role` in the token so `require_role` authorises with
+no DB round-trip, accepting that a role change lags until the token
+expires. The problem is that the *other* Deadline 1 decision — freezing
+`get_current_user() -> User` — means the user row is loaded on every
+authenticated request anyway. `require_role` depends on
+`get_current_user`, so by the time it runs, the row is in hand and the
+lookup it was meant to avoid has already happened. The saving was spent
+before the function that was supposed to collect it was reached.
+
+With both copies available, the fresher one wins:
+
+``` text
+token claim   signed, tamper-proof, up to 60 minutes stale
+database row  already loaded, never stale
+```
+
+So a demoted admin loses admin on their next request rather than at
+expiry, and the "accepted tradeoff" in the Deadline 1 block above is
+simply void — there is no cost being paid for it any more.
+
+The claim still earns its place, in two ways that are not authorization:
+it is the **demonstrable** half of the auth story (Deadline 2's
+checkpoint is literally "login returns a token containing a role", and
+`/docs` shows it decoding), and it is what a future stateless service
+would read if one ever needed to authorise without touching this
+database. It is simply not what *this* system authorises on.
+
+**The assertion that proves it, and which implementation fails it:** mint
+a token signed with the real secret, `sub` = the seeded STUDENT's id,
+`role` claim = `ADMIN`, and POST it at `/gpus`. A build that trusts the
+claim returns 201 and creates a cluster. Ours returns 403. No forgery is
+involved — only this system could have signed that token — which is what
+makes it a test of *which copy is consulted* rather than of the
+signature.
+
+## The 403 must fire before the handler body, and a status code cannot show that
+
+`require_role` is a dependency, not an `if` at the top of a handler.
+FastAPI resolves the dependency chain before calling the function, so a
+rejected caller cannot leave partial state behind.
+
+An `if user.role != ADMIN: raise` written as the **first** line of the
+handler behaves identically from outside — same 403, same body — and the
+two only diverge when the check drifts one line below the INSERT, which
+is exactly the kind of edit nobody notices in review. So the assertion is
+not the status code; it is the **row count on both sides of the 403**,
+read from the database. Same argument as Deadline 2's duplicate-email
+audit: status codes are what the server said, row counts are what
+happened.
+
+The dependency chain also has an order worth asserting, because it is
+observable: authentication (401) → authorization (403) → validation
+(422). A student sending a body that is *also* invalid gets 403, not 422.
+A 422 there would mean the request body was parsed and validated for a
+caller with no business reaching the endpoint.
+
+## `POST /gpus` and `POST /rooms` — the checkpoint had nothing to fire at
+
+Deadline 3's checkpoint is *"student token on `POST /gpus` returns 403"*.
+That route did not exist. Neither did any other admin-only route, so
+`require_role` was about to ship with nothing guarding anything, and the
+checkpoint could not have been run at all.
+
+Creating a resource is `[ADMIN]` in the role matrix of both
+`INIT_PLAN.md` §13 and `ARCHITECTURE_AND_WORKFLOWS.md` §8, and appears in
+the API list of `INIT_PLAN.md` §12 — with **no deadline assigned**. This
+is the third instance of that exact gap, after `GET /me` and the admin
+PATCH endpoints (both found in session 5). The pattern is now clear
+enough to name: *an endpoint that appears in a specification but in no
+deadline's column belongs to nobody, and is discovered by whichever
+checkpoint trips over it.* Both are assigned here.
+
+`GPUClusterCreate` deliberately has **no `allocated` field**. It is
+derived state owned by the allocation transaction, and letting a caller
+set it would allow a cluster to be born already over-allocated — the
+precise invariant `gpu_capacity_sane` exists to protect. New clusters
+start at zero, always.
+
+`RoomCreate` carries `capacity`, and it is a different kind of number:
+seats in a room, a physical fact. Rooms are allocated by **interval**,
+not by unit — the invariant is "no two active reservations overlap",
+enforced by the GiST constraint — so there is no counter and nothing to
+guard on write. Worth stating because the two resources sharing one base
+table invites the assumption that they share an allocation model, and
+they deliberately do not.
+
+## `GET /me` is here because this is the deadline it proves
+
+Same missing-deadline gap, assigned in session 5 to Deadline 3 and
+implemented here. It is the end-to-end demonstration that a real token
+decodes to a real user carrying a real role — which is the entire claim
+of this deadline, and it cannot be made by a 403 alone (a route that
+rejects *everyone* also produces 403s).
+
+It reuses `auth.schemas.UserRead` rather than declaring a second model of
+the same row. The property that matters most about that model is a
+negative one — it has no `password_hash` field, so no handler can leak
+the hash by returning an ORM object — and a guarantee like that is worth
+having in exactly one place.
+
+There is no `users/service.py`. `INIT_PLAN.md` §15 splits routers from
+services because the domain half is the part worth testing without a
+client; here the domain half is empty, since the dependency has already
+produced the row. A file that only forwards is a file to keep in sync for
+nothing. `GET /me/quota` lands in the same module at Deadline 6 and
+*will* bring a service, because reading the quota policy and SUMming held
+units is real domain logic.
+
+## 401 and 403 stay uncoded
+
+`core/errors.py::coded_error()` exists for failures a client must branch
+on — `CAPACITY_EXHAUSTED` and `QUOTA_EXCEEDED` are both 409 and demand
+opposite remedies. There is exactly one remedy for a 401 (get a token)
+and one for a 403 (stop). So both keep FastAPI's plain string `detail`,
+per `ARCHITECTURE_AND_WORKFLOWS.md` §7, and the envelope stays reserved
+for cases where the code carries information the status line does not.
+
+Two smaller calls in the same spirit:
+
+- **Every 401 is byte-identical**, whatever went wrong — expired,
+  tampered, malformed subject, user deleted. Which one it was is not the
+  caller's business, and distinguishing them hands an attacker a probe.
+  The 401 carries `WWW-Authenticate: Bearer`, which is what makes it a
+  spec-conforming 401 rather than a 401-shaped 403.
+- **The 403 does not name the required role.** That is policy
+  information, and a caller cannot act on it.
+
+## `API_PREFIX` moved to `core/config.py`
+
+`OAuth2PasswordBearer(tokenUrl=...)` needs the prefix, and importing
+`main.py` from `core/dependencies.py` is a cycle — `main.py` imports the
+routers, which import the dependency. The value and its reasoning are
+unchanged from session 6; only its address moved, so there is still
+exactly one place to change it.
+
+`tokenUrl` has **no leading slash**, so Swagger resolves it relative to
+the docs page and the Authorize button survives the app ever being
+mounted under a sub-path. That button is the payoff for login being
+form-encoded, argued in the Deadline 2 block above, and it is now real:
+`check_rbac.py` asserts the security scheme is in `openapi.json` and that
+protected routes declare it, because a demo that goes back to pasting
+headers has lost the thing that decision bought.
+
+## Verification
+
+`scripts/check_rbac.py`, 34 assertions, exits non-zero on failure. Third
+gate in the project written as a script rather than a shell paste, a
+habit that has now caught a stale image (`check_jwt.py`, session 5) and a
+requirement tested against the wrong implementation (`check_auth.py`,
+session 7) on their first runs.
+
+It leaves the database at its post-seed counts: the cluster and room it
+creates as ADMIN are deleted at the end, and the counts are re-asserted
+afterwards rather than assumed. Deleting through the subclass removes the
+`resources` row too — checked directly in `psql`, not inferred, because
+an orphaned `resources` row would be invisible to `GET /gpus` and would
+surface much later as a resource of no type.
+
+---
+
+# Deadline 3 — the room path (B)
+
+`POST /rooms/{id}/reservations`. The second half of the checkpoint, and
+the one resource in the system whose central invariant is enforced by
+Postgres rather than by us.
+
+## Three invariants, three different mechanisms, one endpoint
+
+This endpoint is worth reading closely because the three things it
+guarantees are guaranteed in three completely different ways, and only
+one of them is application code:
+
+``` text
+Invariant                    Enforced by                    If our code is wrong
+---------------------------------------------------------------------------------
+no overlapping holds         EXCLUDE USING gist             nothing happens.
+                             (the database)                 The INSERT is rejected.
+this id is really a room     the service layer              a "room booking" lands
+                             (nothing else)                 on a GPU cluster
+the room is not BLOCKED      the service layer              a booking lands on a
+                             (nothing else)                 blocked room
+```
+
+The FK on `reservations.resource_id` points at `resources`, and a GPU
+cluster **is** a resource — so the database accepts that row happily. The
+GiST constraint is partial on the *reservation's* status, not the
+*resource's*, so it is entirely indifferent to BLOCKED. Rows two and
+three are the only places application code can be wrong here, which is
+why `scripts/check_rooms.py` tests them hardest and asserts the absence
+of the bad row (`no reservation row against the GPU cluster`) rather than
+just the status code.
+
+## No "is this slot free?" SELECT
+
+Same argument as registration at Deadline 2, and it is the project's
+recurring pattern: **our code handles the normal case, the database makes
+the race impossible.** A pre-flight availability check passes exactly when
+it does not matter — two concurrent bookings both run it, both see free,
+both proceed — while making the code *look* like the race was handled.
+The INSERT is the check, and catching the `IntegrityError` is how its
+result is read.
+
+`_is_overlap_violation()` reads the **constraint name** out of psycopg's
+diagnostics rather than matching on the message text, and re-raises
+anything else. Mapping every `IntegrityError` to "slot taken" would report
+an unrelated foreign-key bug to the caller as a booking conflict, which is
+a lie that would survive a long time. The message text is localised and
+reworded across server versions; the constraint name is not.
+
+And, as at Deadline 2: `db.rollback()` is the first statement in the
+`except`. After an `IntegrityError` the session is in a failed state and
+any further statement raises `PendingRollbackError` — a 500 burying the
+409 it was supposed to produce.
+
+## `FOR SHARE`, not `FOR UPDATE` — the gate needs the row not to *change*
+
+The ratified item-6 semantics say the status gate reads the row it just
+locked. The obvious way to write that is `SELECT ... FOR UPDATE`, and it
+is what `EXECUTION_PLAN.md` sketches — correctly, because that sketch is
+in the **GPU** transaction, which goes on to *write* the row it locked
+(`allocated = allocated + n`).
+
+The room transaction never writes the resource row. Rooms have no counter;
+that is the whole difference between the two resources. So an exclusive
+lock buys nothing the gate needs and costs something the design claims:
+
+``` text
+FOR UPDATE   admin PATCH waits   ✓        other bookers wait too    ✗
+FOR SHARE    admin PATCH waits   ✓        other bookers proceed     ✓
+```
+
+With `FOR UPDATE`, every booking of one room queues behind every other,
+and the *application lock* — not the exclusion constraint — becomes the
+thing deciding who wins a concurrent slot race. The invariant still holds.
+The claim that "Postgres enforces this one, unaided" quietly stops being
+true, which matters at Deadline 10 when that contrast with the GPU path
+is the thing being explained.
+
+This was caught by writing the comment before re-reading the code: the
+router docstring claimed no application lock was involved, and by then one
+was. The fix was to make the lock mode match the claim rather than soften
+the claim.
+
+**Both halves are asserted, because "it should block" and "it does block"
+are different statements.** One session holds `FOR SHARE` on the resource
+row; a second session with `lock_timeout = 750ms` then tries the admin's
+`UPDATE` and must fail with `LockNotAvailable`, and tries a second
+`FOR SHARE` and must succeed:
+
+```
+SHARE lock blocks an admin write to the row   -> LockNotAvailable
+SHARE lock does NOT block another booker      -> acquired
+```
+
+Note this is an argument about which mechanism is load-bearing, **not** a
+measured throughput claim. Nothing here has been benchmarked; Deadline 5's
+harness is the instrument that could, if it ever matters.
+
+## Where the user lock goes, and why it is not there yet
+
+The global order is user row → resource row, no exceptions. This
+transaction takes only the second lock. That is consistent rather than an
+exception: room quota is Deadline 6, when A adds the user-row lock and the
+held-reservations count. The comment block in `reserve_room` marks the
+exact position — immediately above the resource lock, with deliberately
+nothing between them — so Deadline 6 is an **insertion**, not a reordering.
+Taking the user lock today would be a lock protecting no invariant, and
+the project's standard is that complexity is earned.
+
+## `INTERVAL_CONFLICT` is a coded error
+
+`ARCHITECTURE_AND_WORKFLOWS.md` §7 listed "409 room interval conflict"
+with no code, from before `core/errors.py` existed. It gets one, through
+`coded_error()` like every other coded failure, because B's harness must
+distinguish it from `RESOURCE_BLOCKED` — two 409s on the same endpoint,
+with different remedies (pick another slot / pick another room), which is
+the exact situation the envelope was created for at Deadline 2.
+
+## A naive datetime is interpreted as UTC, explicitly
+
+Postgres would otherwise resolve a naive timestamp against the session's
+`TimeZone`, making the stored instant depend on who ran the request and
+with what settings. That is the same trap revision `1ca8b85b7626` hit
+converting `timestamp` to `timestamptz`, where the fix was an explicit
+`USING ... AT TIME ZONE 'UTC'`.
+
+Rejecting naive input with a 422 was the alternative. Interpreting it,
+explicitly and in one validator, blocks nobody and leaves no ambiguity —
+and it is asserted rather than asserted-about: a booking sent naive, then
+repeated with an explicit `+00:00`, must return 409. That only happens if
+the first one was stored as UTC.
+
+## Verification
+
+`scripts/check_rooms.py`, 34 assertions, exits non-zero on failure.
+Fourth gate in the project.
+
+Three worth naming, on the "which implementation would fail this"
+standard:
+
+- **Containment in both directions, and an identical window.** A
+  hand-written overlap test with one comparison inverted passes the
+  simple `[11,13)` case and fails these. The constraint gets them all
+  right for free, which is the argument for using it.
+- **Eight simultaneous identical bookings**, released on a barrier:
+  exactly one 201, seven 409s, zero 500s — and **one row**, counted in
+  the database. Every other assertion in the file passes against a
+  check-then-insert implementation. Only this one does not.
+- **A cancelled hold does not block its old slot.** The constraint is
+  partial on `status = 'ACTIVE'`. If that `WHERE` clause were ever
+  dropped, releasing a room would make the slot permanently unbookable,
+  and nothing else in the file would notice.
