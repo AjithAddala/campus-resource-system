@@ -1,4 +1,8 @@
+from datetime import datetime
+
 from pydantic import BaseModel, ConfigDict, computed_field
+
+from app.models.enums import EnrollmentStatus
 
 
 class CourseRead(BaseModel):
@@ -38,3 +42,20 @@ class CourseOfferingRead(BaseModel):
         under `SELECT ... FOR UPDATE` on the offering row.
         """
         return self.capacity - self.enrolled_count
+
+
+class EnrollmentRead(BaseModel):
+    """A seat, held or released.
+
+    Carries `status` rather than only existing/not existing, because
+    `enrollment_unique` is unconditional: a dropped student still owns a
+    row, so "has a row" and "is enrolled" are different questions.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    student_id: int
+    course_offering_id: int
+    status: EnrollmentStatus
+    created_at: datetime

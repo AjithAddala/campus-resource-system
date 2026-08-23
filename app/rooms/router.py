@@ -145,3 +145,33 @@ def reserve_room(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Room not found")
 
     return reservation
+
+
+@router.delete(
+    "/{room_id}/reservations/{reservation_id}", response_model=ReservationRead
+)
+def cancel_room_reservation(
+    room_id: int,
+    reservation_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> ReservationRead:
+    """Release a room hold. Owner or ADMIN.
+
+    Mirrors the POST path, which is outstanding item 8 ratified at
+    Deadline 4: `DELETE /reservations/{id}` was ambiguous because room
+    holds live in `reservations` and GPU holds in `gpu_reservations`,
+    each with its own id sequence, so one id named a row in both.
+
+    Ownership is checked in the service rather than by `require_role`,
+    which cannot express "owner OR admin" from a token alone.
+    """
+    try:
+        reservation = service.cancel_reservation(db, room_id, reservation_id, user)
+    except service.NotOwner:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
+
+    if reservation is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Reservation not found")
+
+    return reservation

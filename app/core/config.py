@@ -24,6 +24,24 @@ class Settings(BaseSettings):
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60
 
+    # Drops the user-row lock out of the GPU transaction. DEFAULT FALSE,
+    # and the only thing that ever sets it true is Benchmark 2.
+    #
+    # It exists because DECISIONS.md says the broken version is built and
+    # measured FIRST -- "reconstructing a broken build at Deadline 8 to
+    # make a table look good is obvious and worthless" -- and because
+    # Deadline 9 asks that a stranger reproduce our numbers from a fresh
+    # clone. They cannot reproduce the BROKEN half of a broken-vs-fixed
+    # table unless the broken build is still reachable. One documented
+    # switch is the honest way to keep both columns reproducible; the
+    # alternative is a table with one number nobody can re-derive.
+    #
+    # It removes a lock. It does not change any other logic, so the quota
+    # arithmetic under it is the same arithmetic -- which is the point:
+    # the bug Benchmark 2 shows is not bad arithmetic, it is correct
+    # arithmetic on a value nothing was holding still.
+    BENCHMARK_UNSAFE_NO_USER_LOCK: bool = False
+
     @property
     def database_url(self) -> str:
         return (

@@ -432,7 +432,14 @@ models, not the plan: `users.name` (not `full_name`),
    In `INIT_PLAN.md` §12 under both Rooms and GPUs, in
    `ARCHITECTURE_AND_WORKFLOWS.md` Workflow C, and in `EXECUTION_PLAN.md`
    at Deadline 4 — it is a real open question, not doc staleness.
-   **Needs deciding before Deadline 4** (B's endpoint, A's `cancel()`).
+   ~~**Needs deciding before Deadline 4** (B's endpoint, A's `cancel()`).~~
+   **RATIFIED at Deadline 4: the cancel route mirrors the POST route.**
+   `DELETE /rooms/{room_id}/reservations/{id}` and
+   `DELETE /gpus/{gpu_id}/reservations/{id}`. No new naming convention,
+   and the ambiguity disappears structurally rather than by
+   documentation. Both services verify the reservation really belongs to
+   the resource named in the path, so the id there is load-bearing, and
+   both checks are asserted. See the Deadline 4 section below.
 9. **The global lock order and the waitlist promotion contradict each
    other.** `INIT_PLAN.md` §14 says every path takes key → user row →
    resource row, naming *"allocation, cancellation, course registration,
@@ -458,6 +465,20 @@ models, not the plan: `users.name` (not `full_name`),
     explicit joining leaves `WAITLISTED` dead and it should come out of
     the enum. Answer one and the other follows.
     **Needs deciding before Deadline 7**, with item 7.
+11. **Why does the GPU path not reproduce the stale locked read?** A
+    two-session probe shows `SELECT ... FOR UPDATE` returning a stale
+    `GPUCluster.allocated` exactly as it did for `CourseOffering.
+    enrolled_count` — lock held, value from before the lock. But with
+    `populate_existing()` removed, the 12-racer capacity race produced a
+    correct 8/8 on four consecutive runs, `allocated` matching
+    `SUM(active)` every time. The course path failed catastrophically in
+    the same situation (20 of 5 seats sold, counter reading 3).
+    The statement sequences differ slightly and no explanation was
+    established. `populate_existing()` stays on every locked read
+    regardless, because the staleness is demonstrable and the cost is one
+    keyword — but until this is understood, it is a precaution rather
+    than a diagnosed fix. **Matters before Deadline 7**, which introduces
+    the next locked read (the promotion transaction), and it is A's.
 
 ---
 
@@ -1498,3 +1519,266 @@ standard:
   partial on `status = 'ACTIVE'`. If that `WHERE` clause were ever
   dropped, releasing a room would make the slot permanently unbookable,
   and nothing else in the file would notice.
+
+---
+
+# Deadline 4 — the flagship and the courses
+
+Both locking transactions, written at the same deadline as the plan
+intends. Two things learned here matter more than either feature, and
+both are the same lesson from opposite ends: **a lock can be present,
+correct, and useless.**
+
+## The finding: `SELECT ... FOR UPDATE` returned a stale value
+
+Course registration was written, and 20 concurrent registrations for a
+5-seat offering produced this:
+
+``` text
+20 concurrent registrations, 5 seats: {201: 20}
+enrolled_count = 3        active enrollment rows = 20
+```
+
+Every request succeeded. The counter said 3. Not an off-by-one — lost
+updates, twenty transactions all incrementing the same number.
+
+The lock was there. The SQL was right. `SELECT ... FOR UPDATE` was
+emitted and acquired. **The value it returned was from before the lock.**
+
+The cause is SQLAlchemy's identity map. The transaction reads the
+offering once for the 404 check, which puts the row in the Session. When
+the locked read then returns that same primary key, SQLAlchemy hands back
+the **existing Python object without refreshing its attributes** — so the
+capacity gate compared, and the increment incremented, a value read
+before anyone was holding anything.
+
+Proven directly rather than reasoned about, in two sessions:
+
+``` text
+A reads enrolled_count            = 0
+B commits enrolled_count          = 41
+A: SELECT ... FOR UPDATE          = 0     <-- the lock is held; the value is stale
+A: same statement + populate_existing = 41
+raw column value                  = 41
+```
+
+The fix is `populate_existing()` (or `.execution_options(populate_existing
+=True)`) on every locked read. One keyword. Its absence is invisible in
+review, invisible in the SQL log — the `FOR UPDATE` really is in the
+statement — and invisible to every sequential test.
+
+> **The general form, worth carrying to Deadline 7:** in an ORM, taking
+> the lock and reading the locked value are two different things. Ask of
+> every `FOR UPDATE`: *is the value I am about to compare the one this
+> statement just fetched, or one I already had?*
+
+### The honest part: the GPU path does not reproduce it
+
+The same probe shows the same staleness on `GPUCluster` — A reads
+`allocated = 0`, B commits 7, A's `FOR UPDATE` still reports 0. So the
+flagship transaction has the same latent read.
+
+But removing `populate_existing()` from the GPU path and running the
+12-racer capacity race **four times** gave a correct `8/8` every time,
+with `allocated` matching `SUM(active)` exactly. The statement sequence
+differs slightly between the two paths, and no explanation was
+established for why one races and the other does not.
+
+`populate_existing()` stays in both. The staleness is demonstrable, the
+cost is one keyword, and *"we could not make it fail today"* is not a
+reason to depend on a read a probe says is wrong. Recorded as an
+unresolved question rather than written up as a fix for a bug we proved
+was biting — the difference matters, and Deadline 7's promotion
+transaction is the next place it could.
+
+## The second finding: Benchmark 2, as specified, can pass against the broken build
+
+`DECISIONS.md` already required building `reserve_gpu()` without the user
+lock first and measuring the corruption. Doing that produced a result
+nobody expected:
+
+``` text
+first run, unlocked build, 2 concurrent cross-cluster requests:
+    held = 2      <-- PASSED. Against the build it exists to indict.
+```
+
+The window between `SUM held units` and `COMMIT` is well under a
+millisecond, and two HTTP requests released on a barrier do not reliably
+land inside it. A single trial is a coin flip, so the benchmark as
+written in the plan proves nothing on either side.
+
+Rerun as a **measurement** — the same race, 25 trials, counting how often
+the invariant broke:
+
+| build | over-quota trials | held units observed |
+|---|---|---|
+| resource lock only | **24 / 25** | `{2: 1, 4: 24}` |
+| + user-row lock | **0 / 25** | `{2: 25}` |
+
+That is the real Benchmark 2 table, both halves measured at build time
+rather than reconstructed later.
+
+And the contrast that makes the point: **the capacity race passed on the
+same broken build** — 12 concurrent requests, 8 units, exactly 8
+succeeded, `allocated = 8`. The cluster lock was already perfect. The
+quota rule broke anyway, because it is a fact about the *user* and
+nothing was holding the user still.
+
+> The lesson generalises past benchmarks: a concurrency test that
+> asserts once is a test of scheduling luck. Assert over trials and
+> report the count.
+
+### `BENCHMARK_UNSAFE_NO_USER_LOCK`
+
+A setting, default false, that drops the user lock out of the GPU
+transaction. Nothing but Benchmark 2 ever sets it.
+
+It exists because Deadline 9 asks that a stranger reproduce our numbers
+from a fresh clone, and nobody can reproduce the *broken* half of a
+broken-vs-fixed table unless the broken build is still reachable. The
+alternative is a table with one number that cannot be re-derived, which
+is exactly the "reconstructing a broken build to make a table look good"
+this file already rejects. It removes a lock and changes no other logic —
+the quota arithmetic under it is the same arithmetic, which is the whole
+point: the bug is correct arithmetic on a value nothing was holding.
+
+## Outstanding item 8, ratified: cancel mirrors the POST path
+
+``` text
+POST   /rooms/{room_id}/reservations          DELETE /rooms/{room_id}/reservations/{id}
+POST   /gpus/{gpu_id}/reservations            DELETE /gpus/{gpu_id}/reservations/{id}
+```
+
+`DELETE /reservations/{id}` named a row in two tables — room holds in
+`reservations`, GPU holds in `gpu_reservations`, each with its own id
+sequence — so `/reservations/5` matched a row in both. Scoping the cancel
+under its resource removes the ambiguity **structurally** rather than by
+documentation, and introduces no new naming convention, because the POST
+routes were already shaped that way.
+
+The resource id in the path is load-bearing, not decorative: both cancel
+paths verify the reservation actually belongs to the resource named, and
+both gates are asserted (`/gpus/2/reservations/{id}` where the hold is on
+cluster 1 must 404).
+
+## The quota helper never opens a transaction and never takes a lock
+
+`quotas/service.py` takes a `Session` it did not create, emits no COMMIT,
+and knows nothing about HTTP. That is what makes the guarantee atomic:
+the quota gate and the write it guards commit or roll back together.
+
+It also deliberately does **not** take the user lock. A helper that
+locked on its own behalf would bury the single most important line of the
+project inside a utility function, where nobody reading the transaction
+would see it. The caller takes the lock; the helper documents that it
+must already be held.
+
+**`limit_for` reads the policy row without a lock**, and that is
+deliberate too. `role_quotas` is admin-editable policy, not per-user
+state. The invariant is `held <= limit` at commit time, and the caller is
+holding the user row, so `held` cannot move underneath it. Locking policy
+rows would serialize every allocation in the system on a handful of rows
+to protect nothing.
+
+### Absent and NULL are different, and the code fails closed
+
+`scripts/seed.py` omits `(FACULTY, COURSE)` because course registration
+is STUDENT-only, so the pair is unreachable behind the 403. Meanwhile
+`(ADMIN, *)` rows exist with `max_units = NULL`, meaning unlimited.
+
+So NULL is a policy that says yes; a missing row is *no policy at all*.
+`QuotaNotConfigured` fails closed and surfaces as
+`409 QUOTA_NOT_CONFIGURED`, naming the pair. Treating a missing row as
+unlimited would be the dangerous default — one un-seeded row would
+silently switch off the invariant this project exists to enforce, and
+every existing test would still pass.
+
+`None` is also checked *before* the comparison rather than defaulted to a
+large number: a sentinel like 999999 makes "unlimited" a quantity that
+can be exceeded.
+
+## Course registration takes the user lock at Deadline 4, not Deadline 6
+
+The plan sketches this transaction as offering-lock-only, with the
+course-load quota arriving at Deadline 6. That is correct for capacity
+alone — but the **schedule-overlap check reads the student's other
+enrollments**, and two concurrent registrations for two clashing
+offerings touch no common offering row. Nothing would serialize them and
+both would pass.
+
+That is the cross-cluster GPU quota race exactly, on a different
+invariant: *a schedule clash is a fact about the student.* So the lock is
+earned here rather than taken early for tidiness, and Deadline 6 adds the
+quota SUM inside a lock already held — an addition, not a reordering.
+
+Measured, as trials rather than once: **0/15 students double-booked**
+across 15 concurrent clashing-registration trials.
+
+## Smaller decisions, each with a reason
+
+**The 404 check runs before both gates, and reads only immutable state.**
+Without it, a caller already at quota gets `409 QUOTA_EXCEEDED` for
+naming a room or a cluster that does not exist — the quota gate fires and
+nobody ever checks the target. The distinction that makes a boundary read
+safe here is that **existence and `resource_type` never change**, while
+`status` is admin-mutable and therefore must be read under the lock. Found
+by running the broken build: the assertion said 404 and the server said
+`QUOTA_EXCEEDED`.
+
+**Cancellation locks the reservation's OWNER, not the caller.** An ADMIN
+cancelling someone else's hold must serialize against *that user's*
+allocations. Locking the admin's own row would protect nothing.
+
+**Cancellation and drop are naturally idempotent.** The counter moves only
+on the `ACTIVE -> CANCELLED` (or `-> DROPPED`) transition, so a repeat is
+a no-op. This is a direct benefit of recomputing held units by `SUM`
+rather than keeping a denormalized counter: with a counter, a repeated
+cancel would double-decrement, and the damage would surface much later as
+a perfectly valid allocation being wrongly refused somewhere else.
+
+**Room cancellation takes no locks at all**, unlike GPU cancellation.
+A room hold owns no counter — the only state changing is that
+reservation's own `status`, and the exclusion constraint reads status at
+INSERT time, so releasing a slot simply makes the constraint stop
+objecting. Room quota at Deadline 6 changes this: once "how many active
+holds" is a gate, a release changes a quantity the quota reads, and the
+user lock arrives — first, per the global order.
+
+**Day codes are single characters (`MTWRFSU`, R = Thursday).** Overlap is
+a set intersection of characters, and `set("Tu") & set("Th") == {"T"}` —
+so multi-character tokens would report a Tuesday class as clashing with a
+Thursday one. One character per day makes the intersection exact.
+
+**Schedule times compare lexicographically, which is correct only because
+they are zero-padded.** `"9:00"` sorts after `"10:30"` and silently
+inverts every comparison. Half-open (`<`, not `<=`), for the same reason
+the room constraint uses `'[)'`: a class ending at 10:30 does not clash
+with one starting at 10:30. Asserted both ways.
+
+**`DELETE /offerings/{id}/drop` is assigned here**, the fifth endpoint
+found specified but owned by no deadline. It is not optional at Deadline
+4: the column requires that re-registration be an UPDATE rather than an
+INSERT, and that is untestable without a DROPPED row to re-register over.
+
+**Registering for a full offering returns `409 CAPACITY_EXHAUSTED`**,
+rather than falling through to a waitlist. Whether a full registration
+auto-waitlists is outstanding item 10, due at Deadline 7; this is a
+policy question about the API, not about the lock, and Deadline 7 can
+change the branch without touching the transaction.
+
+## Two test bugs, both worth recording
+
+**A capacity race in which every racer shares one account is not a
+capacity test.** The GPU capacity race was first written with 12 requests
+from a single ADMIN. The user-row lock serialized all of them, so the
+cluster gate was never contended — it would have passed against a
+capacity gate that did not work. Capacity is keyed on the *resource*, so
+the racers must differ in everything except the resource. It now creates
+12 distinct students.
+
+**A test that has to be talked out of a true failure deserves more
+attention than one that passes.** `after dropping the clashing one,
+registration succeeds` failed, and the code was right: the student still
+held a *second* offering (MWF 10:30–12:00) that also overlaps the
+10:00–11:00 one being registered. The assertion was wrong, not the
+service. Recorded rather than quietly corrected.

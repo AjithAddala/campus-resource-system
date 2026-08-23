@@ -10,8 +10,8 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1, 2 and 3 met (sessions 4, 7 and 9).
-> Deadline 4 — the heaviest — is next.**
+> **Status: Deadlines 1-4 met (sessions 4, 7, 9 and 10).
+> Deadline 5 — idempotency and the concurrency harness — is next.**
 
 ## 0. Scope
 
@@ -256,7 +256,7 @@ eight barrier-released identical bookings landing exactly one row.
 > carries `409 RESOURCE_BLOCKED`. The GPU half of that gate lands with
 > the transaction at Deadline 4.
 
-### Deadline 4 - Flagship vs. Courses (the heaviest)
+### Deadline 4 - Flagship vs. Courses (the heaviest)  ✅ MET (session 10)
 
 ``` text
 A      quotas/ module: RoleQuota table + seeded defaults
@@ -308,7 +308,27 @@ this; the GiST constraint is partial on the *reservation's* status, not
 the resource's, so the service layer is the whole guarantee here.
 
 **Checkpoint:** 2 GPUs reserve; a 3rd unit returns `QUOTA_EXCEEDED`.
-Duplicate registration rejected; overlapping courses rejected.
+Duplicate registration rejected; overlapping courses rejected. — **All
+four verified (session 10):** `scripts/check_gpus.py` 44/44 and
+`scripts/check_courses.py` 38/38.
+
+> **Two findings from this deadline change how later ones are written.**
+>
+> 1. **Benchmark 2 as specified here can pass against the broken build.**
+>    Its first run on the deliberately unlocked build reported `held = 2`
+>    — a pass. The corruption window is sub-millisecond. Re-run as 25
+>    trials it separates cleanly: **24/25 over-quota unlocked, 0/25
+>    locked.** Every concurrency assertion from Deadline 5 on must be a
+>    count over trials, not a single result.
+> 2. **`SELECT ... FOR UPDATE` can return a stale value** through an ORM
+>    identity map — lock held, SQL correct, value from before the lock.
+>    It cost 20-of-5 seats sold with the counter reading 3. Every locked
+>    read now carries `populate_existing()`. Deadline 7's promotion
+>    transaction is the next place this can bite.
+
+> **Outstanding item 8 ratified** (session 10): the cancel route mirrors
+> the POST route — `DELETE /{resource}/{id}/reservations/{id}` — so one
+> id can no longer name rows in two tables.
 
 ### Deadline 5 - Idempotency vs. Harness
 

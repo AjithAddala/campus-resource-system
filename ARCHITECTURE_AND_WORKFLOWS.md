@@ -269,7 +269,10 @@ testing proves the user-row lock is a bottleneck.
 409  QUOTA_EXCEEDED         role quota exceeded
 409  INTERVAL_CONFLICT      room slot overlaps an active reservation
 409  RESOURCE_BLOCKED       admin has blocked this resource
-409  duplicate enrollment
+409  ALREADY_ENROLLED       you already hold this seat
+409  SCHEDULE_CONFLICT      clashes with an enrollment you hold
+409  NOT_ENROLLED           drop called with no enrollment
+409  QUOTA_NOT_CONFIGURED   no policy row for (role, resource) -- fails closed
 422  malformed request body
 422  IDEMPOTENCY_KEY_REUSED same key, different body
 200  idempotent replay      (original response, original status)
@@ -306,6 +309,14 @@ table:
 ``` text
 409  EMAIL_ALREADY_REGISTERED    that email already has an account
 ```
+
+Deadline 4 adds four more. Three are the course path's refusals
+(`ALREADY_ENROLLED`, `SCHEDULE_CONFLICT`, `NOT_ENROLLED`), and the fourth
+is `QUOTA_NOT_CONFIGURED`, which **fails closed**: a missing `RoleQuota`
+row is not the same thing as `max_units = NULL`. NULL is a policy that
+says unlimited; no row is no policy at all, and treating it as unlimited
+would let one un-seeded row silently disable the quota system while every
+test still passed.
 
 Deadline 3 adds two more, both on `POST /rooms/{id}/reservations` — which
 is precisely why they are coded. Two 409s on one endpoint, distinguishable
@@ -479,6 +490,13 @@ DELETE /api/v1/reservations/{id}
    → held recomputed as 0; student may allocate again
 ```
 
+The path is `DELETE /gpus/{gpu_id}/reservations/{id}` — it mirrors the
+POST, because `DELETE /reservations/{id}` named a row in two tables with
+separate id sequences (outstanding item 8, ratified at Deadline 4). Note
+the user lock is taken on the reservation's **owner**, not the caller: an
+ADMIN cancelling someone else's hold must serialize against that user's
+allocations.
+
 Cancellation is **naturally idempotent**: it flips a status flag, and
 flipping an already-`CANCELLED` row is a no-op. This is a direct benefit
 of aggregation over a denormalized counter — with a counter, a repeated
@@ -513,7 +531,19 @@ course-shaped (`GET /courses`, `GET /courses/{id}/offerings`); write paths
 are offering-shaped.
 
 Under 500 concurrent registrations for 50 seats: exactly 50 succeed, 450
-receive `409`, over-allocation is zero.
+receive `409`, over-allocation is zero. Measured at Deadline 4 in
+miniature — 20 concurrent registrations for 5 seats gave exactly 5, with
+`enrolled_count` and the active-row count agreeing; Deadline 5's harness
+scales it.
+
+**The route also locks the student's user row, before the offering row.**
+The plan had this transaction offering-lock-only, with the course-load
+quota arriving at Deadline 6. But the schedule-overlap check reads the
+student's *other* enrollments, and two concurrent registrations for two
+clashing offerings share no offering row — so nothing would serialize
+them and both would pass. A schedule clash is a fact about the **student**,
+exactly like a quota, so it is guarded by the user lock. Measured: 0 of 15
+concurrent clashing-registration trials produced a double-booking.
 
 Course registration gets **deduplication for free** from the unique
 constraint, but not full idempotency — a retry returns a duplicate error

@@ -32,7 +32,7 @@ So every entry names the Deadline it advanced, and says whether that
 Deadline is now met. A deadline may take several sessions; a session may
 touch more than one deadline; neither implies the other.
 
-**As of session 9 (2026-08-21): Deadlines 1, 2 and 3 MET. Deadline 4 next.**
+**As of session 10 (2026-08-23): Deadlines 1-4 MET. Deadline 5 next.**
 
 It took four sessions to meet the first of ten deadlines. That is the
 number worth looking at, and it was invisible while sessions and
@@ -1116,6 +1116,207 @@ Three deadlines met, nine sessions.
    now the oldest untouched item on the list.
 7. `JWT_SECRET` in `.env` is still `change-me-in-production` — session 7,
    item 0. Due at Deadline 9's clean-room run.
+
+## Session 10 — 2026-08-23 — JOINT (A's and B's columns)
+
+**Advances:** Deadline 4 — and **closes it.** Both columns, logged as one
+entry because the two halves cannot be told apart honestly: the bug that
+dominated this session was found in B's course path and fixed in both,
+and the benchmark finding came out of A's flagship and rewrote how B's
+concurrency assertions are written.
+
+**Plan:** the heaviest deadline. `quotas/` and the GPU transaction (A);
+course registration, drop, and the cancel routes (B). No schema change,
+so no migration.
+
+**Ratified first — outstanding item 8**, open since session 5.
+`DELETE /reservations/{id}` named a row in two tables. The cancel route
+now mirrors the POST route on both resources. Reasoning in `DECISIONS.md`.
+
+**Shipped — A's column**
+
+- `app/quotas/service.py`. Helper called from inside another module's
+  transaction; opens no transaction, takes no lock, knows no HTTP.
+  `limit_for` distinguishes a **missing** policy row from
+  `max_units = NULL` and fails closed on the former
+  (`409 QUOTA_NOT_CONFIGURED`).
+- `POST /gpus/{id}/reservations` — the flagship. User row locked, held
+  units SUMmed, quota compared; then the cluster row locked, status
+  gated, capacity compared; then counter and reservation written and
+  committed together. Lock order in a comment at the top, as the plan
+  requires.
+- `DELETE /gpus/{id}/reservations/{id}` — owner-or-admin, same lock
+  order, locking the **reservation's owner** rather than the caller.
+- `BENCHMARK_UNSAFE_NO_USER_LOCK`, default false. See below.
+
+**Shipped — B's column**
+
+- `POST /offerings/{id}/register` — STUDENT only. User row locked (see
+  below), offering row locked, capacity gated, enrollment upserted and
+  `enrolled_count` bumped in one transaction.
+- `DELETE /offerings/{id}/drop` — the fifth specified-but-unassigned
+  endpoint, and not optional here: "re-registration is an UPDATE, not an
+  INSERT" is untestable without a DROPPED row to re-register over.
+- Schedule-overlap check, single-character day codes, zero-padded
+  half-open time comparison.
+- `DELETE /rooms/{id}/reservations/{id}` — no locks, deliberately, and
+  the docstring says why it differs from the GPU twin.
+
+**Departure from the plan, deliberate: registration takes the user lock
+now.** The plan sketches it offering-lock-only. But schedule overlap reads
+the student's *other* enrollments, and two concurrent registrations for
+two clashing offerings share no offering row — nothing would serialize
+them. Same failure shape as the cross-cluster GPU race, different
+invariant. Deadline 6 now adds the course-load quota inside a lock that is
+already held.
+
+**THE FINDING — `SELECT ... FOR UPDATE` returned a stale value**
+
+``` text
+20 concurrent registrations, 5 seats:  {201: 20}
+enrolled_count = 3        active rows = 20
+```
+
+Every request succeeded; the counter said 3. Lost updates. The lock was
+acquired, the SQL was right, and the value compared was from **before**
+the lock — SQLAlchemy's identity map returns the already-loaded object
+without refreshing its attributes, and the 404 check had loaded that row
+moments earlier.
+
+Proven in two sessions rather than reasoned about:
+
+```
+A reads enrolled_count                 = 0
+B commits enrolled_count               = 41
+A: SELECT ... FOR UPDATE               = 0    <- lock held, value stale
+A: same statement + populate_existing  = 41
+raw column value                       = 41
+```
+
+Fixed with `populate_existing()` on every locked read, in both modules.
+
+**And the part that is not tidy.** The same probe shows the same
+staleness on `GPUCluster` — yet removing `populate_existing()` from the
+GPU path and running the 12-racer capacity race **four times** produced a
+correct 8/8 every time. The latent read is stale; that request flow does
+not hit it; no explanation was established. The keyword stays in both
+paths, and this is written up as an open question rather than as a fix
+for a bug we proved was biting. Carried forward as item 11.
+
+**THE OTHER FINDING — Benchmark 2, as specified, passes against the
+broken build**
+
+Building the unlocked version first, as `DECISIONS.md` requires, produced
+`held = 2` on its first run — a pass, against the build it exists to
+indict. The corruption window is sub-millisecond and two barrier-released
+HTTP requests do not reliably land inside it.
+
+Rerun as a measurement over trials:
+
+| build | over-quota trials | held units |
+|---|---|---|
+| resource lock only | **24 / 25** | `{2: 1, 4: 24}` |
+| + user-row lock | **0 / 25** | `{2: 25}` |
+
+The contrast that makes the point: on that same broken build the
+**capacity race passed** — 12 concurrent requests, 8 units, exactly 8
+succeeded. The cluster lock was already perfect. The quota rule broke
+anyway, because it is a fact about the user and nothing held the user
+still.
+
+**Verification run**
+
+```
+routes                     -> 27 total: 21 under /api/v1, 2 at root
+
+scripts/check_gpus.py      -> 44/44 PASS, exit 0
+  student reserves 2               -> 201, allocated 2
+  3rd unit                         -> 409 QUOTA_EXCEEDED   <- CHECKPOINT
+  2 more on a DIFFERENT cluster    -> 409 QUOTA_EXCEEDED
+  faculty 4 (quota 10) / admin NULL-> 201, 201
+  full cluster                     -> 409 CAPACITY_EXHAUSTED, not QUOTA
+  over-quota caller, full cluster  -> QUOTA first (gate order)
+  room id / missing id via /gpus   -> 404 x 2
+  blocked cluster                  -> 409 RESOURCE_BLOCKED, admin too
+  cancel wrong cluster id          -> 404      <- item 8, path is load-bearing
+  cancel someone else's            -> 403, nothing cancelled
+  cancel twice                     -> 200, counter NOT double-decremented
+  admin cancels another's hold     -> 200
+  BENCHMARK 2, 25 trials           -> 0/25 over quota, held {2: 25}
+  capacity race, 12 DISTINCT users -> {201: 8, 409: 4}, allocated 8/8
+  allocated == SUM(active)         -> after every phase
+
+scripts/check_courses.py   -> 38/38 PASS, exit 0
+  faculty / admin register         -> 403 x 2, nobody enrolled
+  duplicate                        -> 409 ALREADY_ENROLLED
+  drop / drop twice                -> 200, counter not double-decremented
+  re-register after drop           -> 201, SAME enrollment id, one row
+  overlapping schedule             -> 409 SCHEDULE_CONFLICT
+  adjacent times / different days  -> 201 x 2
+  capacity 1, second student       -> 409 CAPACITY_EXHAUSTED
+  drop something never registered  -> 409 NOT_ENROLLED
+  BENCHMARK 1 (mini) 20 on 5 seats -> {201: 5, 409: 15}, count 5, rows 5
+  reconciliation counter == rows   -> 5 == 5   <- Deadline 8 query, early
+  schedule race, 15 trials         -> 0/15 double-booked
+
+scripts/check_rooms.py     -> 34/34 PASS   (regression)
+scripts/check_rbac.py      -> 34/34 PASS   (regression)
+scripts/check_auth.py      -> 25/25 PASS   (regression)
+scripts/check_jwt.py       ->  9/9  PASS   (regression)
+
+alembic current / check    -> 1ca8b85b7626 (head), no drift
+psql                       -> users 3, gpu_reservations 0, enrollments 0,
+                              offerings 1, clusters all allocated = 0
+```
+
+**Cost incurred**
+
+- Docker Desktop not running again at session start (third time).
+- Two of this session's own tests were wrong, and both are recorded in
+  `DECISIONS.md` rather than quietly fixed: a capacity race where all 12
+  racers shared one ADMIN account (the user lock serialized them, so the
+  cluster gate was never contended and the test could not fail), and a
+  schedule assertion that failed for a correct reason the test had not
+  accounted for.
+
+**Deadline 4 status: MET.** Checkpoint verified on this machine: *2 GPUs
+reserve; a 3rd unit returns `QUOTA_EXCEEDED`* and *duplicate registration
+rejected; overlapping courses rejected* — all four, plus the concurrency
+evidence the checkpoint does not ask for and which is the only part that
+proves the locks do anything.
+
+Four deadlines met, ten sessions.
+
+**Open / carried forward**
+
+1. **NEW, item 11 — why does the GPU path not reproduce the stale locked
+   read?** The probe says the read is stale; four runs of the capacity
+   race say the request flow never hits it. Unresolved. It matters
+   because Deadline 7's promotion transaction is the next locked read
+   written, and because the answer determines whether
+   `populate_existing()` is a fix or a talisman.
+2. **Deadline 5 is next**: A wires idempotency in as step (1) of the GPU
+   transaction — the code comment marking its position is already there.
+   B builds `tests/concurrency/harness.py`. `tests/` still does not exist
+   and `pytest-asyncio` is still not in `requirements.txt`; that is now
+   the immediate blocker rather than a standing note.
+3. **Benchmark 1 at Deadline 5 must be written as trials, not a single
+   run** — see the Benchmark 2 finding. The mini version in
+   `check_courses.py` (20 racers, 5 seats) is the shape to scale up, and
+   its reconciliation assertion is Deadline 8's query arriving early.
+4. Items 7, 9 and 10 remain joint calls and all block Deadline 7. **Item
+   9 is now urgent** — the global lock order versus waitlist promotion.
+   Two more paths were written against user-first this session, so the
+   cost of promotion contradicting it has gone up.
+5. `POST /courses` and `POST /offerings` still belong to no deadline —
+   the fourth and fifth instances of that gap were `GET /me/quota` and
+   `drop`. `check_courses.py` creates offerings by direct insert because
+   no endpoint exists.
+6. The connection pool still defaults to 15 against a 500-request
+   harness — session 5, item 5. **This is now due**: Deadline 5's
+   harness is the thing it distorts, and `session.py` needs both people.
+7. `JWT_SECRET` in `.env` is still the published default — due at
+   Deadline 9's clean-room run.
 
 ---
 

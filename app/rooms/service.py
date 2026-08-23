@@ -4,7 +4,7 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.models.enums import ReservationStatus, ResourceStatus, ResourceType
+from app.models.enums import ReservationStatus, ResourceStatus, ResourceType, Role
 from app.models.reservation import Reservation
 from app.models.resource import Resource, Room
 from app.models.user import User
@@ -79,6 +79,10 @@ class RoomIntervalConflict(Exception):
 
 class RoomBlocked(Exception):
     """The room is BLOCKED. Outstanding item 6, ratified at Deadline 3."""
+
+
+class NotOwner(Exception):
+    """Caller is neither the owner of this reservation nor an ADMIN."""
 
 
 def _is_overlap_violation(exc: IntegrityError) -> bool:
@@ -209,5 +213,49 @@ def reserve_room(
             raise RoomIntervalConflict(room_id) from exc
         raise
 
+    db.refresh(reservation)
+    return reservation
+
+
+def cancel_reservation(
+    db: Session, room_id: int, reservation_id: int, user: User
+) -> Reservation | None:
+    """Release a room hold. Owner or ADMIN. Returns None if not found.
+
+    **No locks, and that is not an oversight.** Compare with
+    `gpus.service.cancel_gpu_reservation`, which takes two: that path
+    decrements `GPUCluster.allocated`, a counter shared by every user of
+    the cluster, so it must serialize. A room hold owns no counter. The
+    only state changing here is this reservation's own `status`, and the
+    exclusion constraint reads that status at INSERT time — so releasing
+    a slot simply makes the constraint stop objecting to it.
+
+    What about two concurrent cancels of the same row? The second finds
+    `status = CANCELLED` and returns, exactly as the GPU path does — but
+    here there is nothing to double-decrement, so the check is about
+    answering consistently rather than about protecting a number.
+
+    Room quota at Deadline 6 will change this: once "how many active
+    holds does this user have" is a gate, a release becomes a change to a
+    quantity the quota reads, and this transaction will take the user
+    lock — first, per the global order.
+    """
+    reservation = db.get(Reservation, reservation_id)
+
+    # Item 8, ratified at Deadline 4: the route mirrors the POST, so the
+    # room id in the path must actually name this reservation's room.
+    # Without this check the path segment is decorative and
+    # /rooms/4/reservations/5 would cancel a hold on room 3.
+    if reservation is None or reservation.resource_id != room_id:
+        return None
+
+    if reservation.user_id != user.id and user.role is not Role.ADMIN:
+        raise NotOwner(reservation_id)
+
+    if reservation.status is ReservationStatus.CANCELLED:
+        return reservation
+
+    reservation.status = ReservationStatus.CANCELLED
+    db.commit()
     db.refresh(reservation)
     return reservation
