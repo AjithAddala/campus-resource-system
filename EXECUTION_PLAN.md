@@ -10,9 +10,9 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-4 met (sessions 4, 7, 9 and 10). Deadline 5 is
-> half met — A's idempotency column landed in session 11 and is verified;
-> the deadline closes on B's harness and Benchmark 1.**
+> **Status: Deadlines 1-5 met (sessions 4, 7, 9, 10, 11 and 12).
+> Deadline 6 — quota rollout, Benchmarks 2-3, and the swap review — is
+> next.**
 
 ## 0. Scope
 
@@ -331,7 +331,7 @@ four verified (session 10):** `scripts/check_gpus.py` 44/44 and
 > the POST route — `DELETE /{resource}/{id}/reservations/{id}` — so one
 > id can no longer name rows in two tables.
 
-### Deadline 5 - Idempotency vs. Harness  ◐ A'S COLUMN MET (session 11)
+### Deadline 5 - Idempotency vs. Harness  ✅ MET (sessions 11 and 12)
 
 ``` text
 A ✅   idempotency/ module: IdempotencyKey, UNIQUE(key, user_id)
@@ -349,21 +349,36 @@ A ✅   SAVEPOINT around the claim -- NOT in this column as written, and
 A ✅   `Idempotency-Key` header is OPTIONAL, settled deliberately --
        Benchmark 3 is the contrast between sending it and not, so
        requiring it would delete one column of its own table.
-B      tests/concurrency/harness.py - asyncio + httpx, fires N
-       simultaneous requests, collects status codes
-       BLOCKER: tests/ does not exist and pytest-asyncio is not in
-       requirements.txt. Add it before starting.  <- STILL TRUE at
-       session 11; verified, not assumed.
-       BENCHMARK 1 (capacity): 500 concurrent registrations, capacity 50
-         unlocked build -> record over-allocation
-         locked build   -> exactly 50, zero over-allocation
+B ✅   tests/concurrency/harness.py - asyncio + httpx, barrier-released,
+       reports the concurrency ACHIEVED (pg_stat_activity) next to the
+       one requested. Plus 5 tests OF the harness -- one asserts wall
+       time < half the summed latencies, which is the only assertion
+       that can catch a harness that silently serializes.
+B ✅   BLOCKER cleared: pytest-asyncio added, tests/ created.
+       Carried since session 2.
+B ✅   BENCHMARK 1 (capacity): 500 submitted, 40 in flight, capacity 50
+         unlocked build -> oversold 3/3 trials; two trials seated ALL
+                           500 students, counter reading 24 and 34
+         locked build   -> exactly 50 x3, 450 x 409, counter == rows
+
+       CORRECTION TO THIS LINE: "500 concurrent" is not achievable and
+       never was. A connection is held from dependency resolution to the
+       end of the request, so in-flight requests ARE connections and
+       Postgres allows 100. Firing 500 unbounded gives 440 x 500-error
+       with 50 connections `idle in transaction`. The benchmark submits
+       500 at once with 40 in flight and says so.
 ```
 
 **Checkpoint:** first broken-vs-fixed table with real numbers.
-— **A's half produced one** (`scripts/check_idempotency.py`, 37/37, three
-builds measured; see DECISIONS.md). The checkpoint as written names
-Benchmark 1, which is B's, so **the deadline is not met until B's harness
-lands.**
+— **MET, and there are two of them:** A's three-build idempotency table
+(session 11) and Benchmark 1 (session 12, above).
+
+> **The pool was not a distortion, it was a wall.** Carried since session
+> 5. On the defaults Benchmark 1 does not produce a bad number, it
+> produces none: `201=0 409=0 errors=500/500`, median latency 126 s,
+> `QueuePool limit of size 5 overflow 10 reached`. The pool was set
+> *below the server's own 40-thread ceiling*. Now 40 + 10, timeout 10 s.
+> **`session.py` was changed solo and needs A's review.**
 
 > **The A column here did not depend on B at any point**, which is worth
 > recording because the plan's phrasing implied a shared deliverable.

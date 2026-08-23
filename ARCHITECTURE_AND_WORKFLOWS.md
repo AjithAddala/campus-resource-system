@@ -568,9 +568,31 @@ single row to lock, which is the entire mechanism. Read paths stay
 course-shaped (`GET /courses`, `GET /courses/{id}/offerings`); write paths
 are offering-shaped.
 
-Under 500 concurrent registrations for 50 seats: exactly 50 succeed, 450
-receive `409`, over-allocation is zero. Measured at Deadline 4 in
-miniature — 20 concurrent registrations for 5 seats gave exactly 5, with
+**Measured at Deadline 5** — 500 registrations submitted simultaneously
+at a 50-seat offering, 40 in flight, 3 trials per build:
+
+``` text
+build                      201      409 CAPACITY   enrolled_count   active rows   oversold
+--------------------------------------------------------------------------------------------
+no offering lock       377 - 500     0 - 123          24 - 50        377 - 500      3/3
++ SELECT ... FOR UPDATE       50           450              50             50      0/3
+```
+
+Two trials of the unlocked build seated **all 500 students in a 50-seat
+section**. The locked build sold exactly 50 every time, with the counter
+and the row count agreeing.
+
+**"500 concurrent" is 500 submitted, 40 in flight, and the distinction is
+not pedantry.** A connection is checked out during dependency resolution
+(`get_current_user` reads the user row) and held by the Session until the
+request ends, so in-flight requests *are* connections — and Postgres
+allows 100. Firing 500 unbounded returns 440 of them as `500`, with the
+whole pool sitting `idle in transaction`. Serving 500 truly at once would
+need a Postgres sized for 500 backends. The contention that matters is at
+the seat gate, and 40-way is enough to oversell the unlocked build
+tenfold.
+
+Also measured at Deadline 4 in miniature — 20 concurrent registrations for 5 seats gave exactly 5, with
 `enrolled_count` and the active-row count agreeing; Deadline 5's harness
 scales it.
 

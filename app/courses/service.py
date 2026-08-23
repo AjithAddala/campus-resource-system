@@ -1,6 +1,7 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.core.config import get_settings
 from app.models.course import Course, CourseOffering
 from app.models.enrollment import Enrollment
 from app.models.enums import EnrollmentStatus
@@ -199,12 +200,18 @@ def register(db: Session, offering_id: int, student: User) -> Enrollment | None:
     # seats all returned 201, with enrolled_count landing on 3. Not an
     # off-by-one -- lost updates, because every transaction
     # incremented the same stale number.
-    locked = db.execute(
+    seat_read = (
         select(CourseOffering)
         .where(CourseOffering.id == offering_id)
-        .with_for_update()
         .execution_options(populate_existing=True)
-    ).scalar_one()
+    )
+    # Benchmark 1's broken build removes ONLY the lock. The read stays
+    # fresh (`populate_existing` above), so what the benchmark measures is
+    # not a stale value -- it is a correct value that nothing was holding
+    # still between the check and the increment. Default is locked.
+    if not get_settings().BENCHMARK_UNSAFE_NO_OFFERING_LOCK:
+        seat_read = seat_read.with_for_update()
+    locked = db.execute(seat_read).scalar_one()
 
     if locked.enrolled_count >= locked.capacity:
         # 409 today. Deadline 7 decides whether a full offering instead

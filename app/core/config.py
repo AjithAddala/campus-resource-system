@@ -42,6 +42,15 @@ class Settings(BaseSettings):
     # arithmetic on a value nothing was holding still.
     BENCHMARK_UNSAFE_NO_USER_LOCK: bool = False
 
+    # The same idea for course registration, and the same justification.
+    # Drops `FOR UPDATE` from the offering read while leaving everything
+    # else -- including `populate_existing()` -- exactly as it is, so the
+    # broken build reads a FRESH value and still loses updates. That is
+    # the honest broken build: not a stale read, but a correct read that
+    # nothing was holding still. Benchmark 1 is the only thing that sets
+    # it, and it defaults to false.
+    BENCHMARK_UNSAFE_NO_OFFERING_LOCK: bool = False
+
     @property
     def database_url(self) -> str:
         return (

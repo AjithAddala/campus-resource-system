@@ -32,7 +32,7 @@ So every entry names the Deadline it advanced, and says whether that
 Deadline is now met. A deadline may take several sessions; a session may
 touch more than one deadline; neither implies the other.
 
-**As of session 10 (2026-08-23): Deadlines 1-4 MET. Deadline 5 next.**
+**As of session 12 (2026-08-24): Deadlines 1-5 MET. Deadline 6 next.**
 
 It took four sessions to meet the first of ten deadlines. That is the
 number worth looking at, and it was invisible while sessions and
@@ -1425,6 +1425,158 @@ real numbers; that is not the same as the checkpoint being met.
 7. No expiry or cleanup on `idempotency_keys`. Rows accumulate forever.
    Fine for a demo, and a real answer would be a TTL sweep; worth a
    sentence in "Designed, not implemented."
+
+## Session 12 — 2026-08-24 — B
+
+**Advances:** Deadline 5 — and **closes it.** B's harness and Benchmark 1
+were the only things left after A's column in session 11.
+
+**Plan:** clear the two blockers carried since session 2, build
+`tests/concurrency/harness.py`, and produce Benchmark 1 as a
+broken-vs-fixed table.
+
+**Unblocked first, both carried for ten sessions**
+
+- `pytest-asyncio==0.25.0` added to `requirements.txt`; image rebuilt.
+- `tests/` and `tests/concurrency/` created, with `pytest.ini` setting
+  `asyncio_mode = strict` — **not** `auto`, because under `auto` a test
+  that loses its marker is collected as a coroutine that never runs and
+  reported as a PASS.
+
+**Shipped — `tests/concurrency/harness.py`**
+
+asyncio + httpx, all calls released on an `asyncio.Barrier`, results
+returned in submission order with status, error code and latency. Plus
+`DBConcurrencyObserver`, which samples `pg_stat_activity` during a run so
+every benchmark reports the concurrency it **achieved** next to the one
+it requested.
+
+**Shipped — `tests/concurrency/test_harness.py`, 5 tests**
+
+The instrument gets tested. `test_requests_actually_overlap` asserts wall
+time is under half the summed latencies — a harness that awaited each
+call in turn passes every status-code assertion in this project and fails
+only that one.
+
+**Shipped — `tests/concurrency/benchmark_1_capacity.py`**
+
+``` text
+build                      201      409 CAPACITY   enrolled_count   active rows   oversold
+--------------------------------------------------------------------------------------------
+no offering lock       377 - 500     0 - 123          24 - 50        377 - 500      3/3
++ SELECT ... FOR UPDATE       50           450              50             50      0/3
+```
+
+Two trials of the unlocked build seated **all 500 students in a 50-seat
+section**, counter reading 34 and 24 against 500 ACTIVE rows. The locked
+build sold exactly 50 in all three trials, counter and rows agreeing,
+zero 5xx.
+
+**THE FINDING — "500 concurrent" was never achievable, and not because
+of tuning**
+
+Firing 500 unbounded against a *correctly sized* pool still gave
+`{201: 60, 500: 440}` with 86 s median. Sampled during the run:
+
+```
+state                 wait_event   count
+idle in transaction   Client        50     <- the entire pool
+active                              1
+```
+
+Fifty connections open, in a transaction, doing nothing. The cause is
+structural: a connection is checked out during **dependency resolution**
+(`get_current_user` reads the user row) and held by the Session until
+`get_db` closes it at the end of the request — so it spans event-loop
+hops and the ceiling is **requests in flight**, not the 40 worker
+threads. N in flight needs N connections; Postgres allows 100.
+
+500-way concurrency would need a Postgres sized for 500 backends, ~10 MB
+each. The benchmark now submits 500 at once with **40 in flight**, and
+says so. 40-way contention oversells the unlocked build tenfold — the
+claim never needed 500, it needed to be stated accurately. `ARCHITECTURE
+_AND_WORKFLOWS.md` §12 corrected.
+
+**Fixed — the connection pool, carried since session 5**
+
+Not a distortion. On the defaults Benchmark 1 does not produce a bad
+number, it produces none: `201=0 409=0 errors=500/500`, median 126 s,
+`QueuePool limit of size 5 overflow 10 reached`. The pool was set
+**below the server's own thread ceiling** — 40 threads competing for 15
+connections. Now 40 + 10, `pool_timeout` 30 s → 10 s.
+
+**`session.py` is a shared file and was changed solo.** A must review it;
+the measured failure is the argument.
+
+**Fixed — a benchmark must not import the application's `SessionLocal`**
+
+With the server pool correct, 500 requests *still* gave 387 × `500`. The
+benchmark process was building a second 50-connection engine from the
+same module, against a 100-connection Postgres, and the symptom surfaced
+in the **server's** log as `QueuePool timed out`. Benchmarks now get a
+5-connection engine of their own.
+
+**Fixed — my own benchmark was hiding the answer**
+
+An early run reported `201=0 409=0 err=0` for 500 requests: three buckets
+that summed to nothing, with 500 responses falling outside all of them.
+It now prints the full `Counter` per trial and warns when the buckets do
+not sum to the request count. Two long runs were wasted before the
+numbers were readable.
+
+**Verification run**
+
+```
+pytest tests/ -q                -> 5 passed
+benchmark 1, broken, 3 trials   -> oversold 3/3, max 500 seated in 50 seats
+benchmark 1, fixed,  3 trials   -> exactly 50 x3, 450 x 409, 0 mismatches
+                                   peak_db_conns 37-39 of 40 in flight
+
+regressions, all on THIS machine after touching session.py:
+  check_jwt 9 / check_auth 25 / check_rbac 34 / check_rooms 34
+  check_gpus 44 / check_courses 38 / check_idempotency 40   all exit 0
+psql  -> users 3, enrollments 0, offerings 1, courses 1  (post-seed)
+```
+
+**Cost incurred**
+
+- Four full 500-request runs produced unusable data before the fifth was
+  readable: the default pool, then the duplicated pool, then the missing
+  tally buckets, then unbounded in-flight. Each was a real defect and
+  each is written up, but the sequence is the cost of building a
+  measuring instrument without measuring the instrument first.
+- ~25 ms baseline latency for `/health` on loopback inside the container
+  was investigated and is **not** `--reload` (tested with a second
+  uvicorn without it: 24 ms vs 28 ms). Unexplained, environmental, and
+  it sets a floor on every latency figure above.
+
+**Deadline 5 status: MET.** The checkpoint is *"first broken-vs-fixed
+table with real numbers"* and there are now two of them: A's three-build
+idempotency table (session 11) and Benchmark 1 above.
+
+Five deadlines met, twelve sessions.
+
+**Open / carried forward**
+
+1. **`session.py` needs A's review** — shared file, changed solo, with a
+   measured failure as justification. Top of the next joint session.
+2. **The in-flight ceiling belongs in the README**, not just here. "500
+   concurrent" is the phrase in three documents and it is not what the
+   system does; what it does is serve 40 concurrently and refuse the rest
+   correctly. Deadline 9.
+3. Item 11 (stale locked read on the GPU path) **unchanged and still
+   unresolved** — and Deadline 7's promotion transaction is the next
+   locked read to be written.
+4. Items 7, 9, 10 remain joint calls blocking Deadline 7; item 9 (lock
+   order vs. promotion) is still the urgent one and is now **the** thing
+   between the project and Deadline 6.
+5. Benchmarks 2, 3 and 4 should move onto this harness. Benchmark 2 and 3
+   currently live inside `check_gpus.py` and `check_idempotency.py` as
+   threads, which works and is not wrong — but Deadline 9 asks a stranger
+   to reproduce four tables, and four scripts in two styles is a worse
+   answer than four benchmarks in one.
+6. `POST /courses` / `POST /offerings` still belong to no deadline;
+   Benchmark 1 creates offerings by direct insert for want of an endpoint.
 
 ---
 

@@ -2026,3 +2026,172 @@ saying plainly because the plan's phrasing implied a shared deliverable.
 `check_idempotency.py` uses threads exactly as `check_gpus.py` does, so
 the exactly-once evidence exists today without the asyncio harness
 existing at all.
+
+---
+
+# Deadline 5 — the harness and Benchmark 1 (B)
+
+A's column landed in session 11. This is the other half, and almost all
+of its cost went to a discovery the plan had no line for: **the system
+cannot serve 500 concurrent requests, and no amount of pool tuning
+changes that.**
+
+## BENCHMARK 1 — capacity under concurrency
+
+500 registrations submitted simultaneously at a 50-seat offering, 40 in
+flight, 3 trials each. Both builds run today; the broken one first.
+
+``` text
+build                      201      409 CAPACITY   enrolled_count   active rows   oversold
+--------------------------------------------------------------------------------------------
+no offering lock       377 - 500     0 - 123          24 - 50        377 - 500      3/3
++ SELECT ... FOR UPDATE       50           450              50             50      0/3
+```
+
+Two trials of the unlocked build seated **all 500 students in a 50-seat
+section**, with `enrolled_count` reading 34 and 24 while 500 ACTIVE rows
+existed. The locked build sold exactly 50 in every trial, with the
+counter and the row count agreeing every time, and zero 5xx.
+
+**The broken build reads a FRESH value.** `populate_existing()` stays on
+in both builds; only `FOR UPDATE` is removed. So this table is not about
+a stale read — it is a correct read of a number that another transaction
+changes between the check and the increment. That distinction matters
+because Deadline 4's finding was the *other* failure (lock held, value
+stale), and the two are easy to conflate. One is fixed by
+`populate_existing()`, the other only by the lock. Both are needed, and
+neither implies the other.
+
+## The finding: "500 concurrent" was never achievable
+
+Firing 500 unbounded, against a correctly sized pool, gives:
+
+``` text
+responses: {(201, None): 60, (500, None): 440}
+median latency 86 s
+pg_stat_activity: 50 connections `idle in transaction`, wait_event Client
+```
+
+Fifty connections — the entire pool — open, in a transaction, and doing
+nothing. Sampled from `pg_stat_activity` during the run rather than
+inferred from the error.
+
+The cause is structural, not a setting:
+
+> A connection is checked out during **dependency resolution** —
+> `get_current_user` reads the user row — and the Session holds it, with
+> an open transaction, until `get_db` closes it at the end of the
+> request. The connection is therefore held across event-loop hops, so
+> the ceiling is **requests in flight**, not the server's 40 worker
+> threads. N in-flight requests need N connections.
+
+Postgres allows 100. So 500-way concurrency needs a Postgres sized for
+500 backends, at roughly 10 MB each — 5 GB of server memory to make one
+sentence in a benchmark literally true.
+
+**What we do instead, and say out loud:** 500 requests are submitted
+together and at most 40 are in flight. The first 40 hit the seat gate
+simultaneously, which is the contention the benchmark is actually about
+— and 40-way contention oversells the unlocked build tenfold. The claim
+does not need 500. What it needs is to be stated accurately.
+
+`ARCHITECTURE_AND_WORKFLOWS.md` §12 said "under 500 concurrent
+registrations"; it now says what is measured.
+
+## The connection pool was not a distortion, it was a wall
+
+Carried since session 5 as "the pool will distort Benchmark 1". It does
+not distort it. On the defaults it makes it **impossible**:
+
+``` text
+500 registrations, default pool (5 + 10 = 15):
+  201=0  409=0  errors=500/500  median latency 126_000 ms
+  sqlalchemy.exc.TimeoutError: QueuePool limit of size 5 overflow 10
+  reached, connection timed out, timeout 30.00
+```
+
+Every request failed. Five sessions of "we should look at that" and the
+first run turned it into a wall.
+
+The sizing argument is sharper than "the pool was small". FastAPI runs
+`def` endpoints in anyio's worker pool, default **40** threads, so the
+pool was set **below the number of requests the server would admit** —
+40 threads competing for 15 connections, 25 blocking then raising. Now:
+
+``` text
+Postgres max_connections     100  (3 reserved)
+server thread ceiling         40  (anyio default)
+server pool_size + overflow   50  <- must exceed in-flight requests
+benchmark tool pool            5  (separate engine, see below)
+```
+
+`pool_timeout` 30s → 10s: with 50 > 40 a checkout cannot block, so a
+timeout now means a real misconfiguration and should surface fast rather
+than stall for half a minute looking like a slow query.
+
+**This is a shared file changed solo.** The protocol says both people
+present; it was changed anyway because it is a hard blocker with a
+measured failure attached, and A must review it. The numbers above are
+the argument.
+
+## A benchmark must not import the application's `SessionLocal`
+
+After sizing the server pool correctly, 500 requests *still* returned
+387 × `500`. The benchmark process imports `app.database.session`, which
+builds a **second engine with the same 40 + 10 sizing** — two pools of 50
+against a Postgres that allows 100, and the symptom appears inside the
+*server* as `QueuePool timed out`, which reads exactly like the bug the
+sizing was meant to fix.
+
+`tests/concurrency/harness.py::tool_session_factory()` gives benchmarks
+their own 5-connection engine. Setup, resets and the observer need about
+three between them.
+
+> Generalisation worth keeping: **a test process that imports production
+> connection settings is competing with the thing it measures.**
+
+## The harness reports the concurrency it ACHIEVED
+
+Three throttles sit between `asyncio.gather` and a row lock, and the
+lowest wins silently:
+
+``` text
+httpx max_connections     default 100   <- harness raises it
+server thread pool        default  40
+SQLAlchemy pool           default  15   <- was the binding one
+```
+
+Firing 500 through defaults measures 15-way contention and calls it 500.
+So `DBConcurrencyObserver` samples `pg_stat_activity` during every run
+and each trial prints `peak_db_conns` next to the number requested. If
+those differ by an order of magnitude, the run measured a pool.
+
+Measured on the final runs: **38–39 achieved against 40 in flight.**
+
+## The instrument gets tested too
+
+`tests/concurrency/test_harness.py`, 5 tests, and one of them is the only
+kind that can catch the worst failure: `test_requests_actually_overlap`
+asserts **wall time < half the summed latencies.** A harness that awaited
+each call in turn would pass every status-code assertion in the project
+and fail that one. Every benchmark is built on this function; if it
+serialized, all four tables would be measuring nothing and all four would
+still look plausible.
+
+`asyncio_mode = strict` in `pytest.ini`, deliberately not `auto`: with
+`auto`, a test that loses its marker is silently collected as a coroutine
+that never runs and reported as a **PASS**. Strict mode makes that a
+failure.
+
+## The reporting bug in my own benchmark
+
+An early run reported `201=0  409=0  err=0` for 500 requests. All three
+buckets empty, 500 responses unaccounted for — the tally only counted
+`201`, `409 CAPACITY_EXHAUSTED` and `5xx`, and everything else vanished.
+
+Fixed by printing the **full** `Counter` every trial plus an explicit
+warning when the buckets do not sum to the request count.
+
+> A benchmark that can silently drop 500 responses is not an instrument.
+> It is the same class of error as a test that passes against the broken
+> build, and it cost two long runs before the numbers were even readable.
