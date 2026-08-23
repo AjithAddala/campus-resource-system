@@ -1782,3 +1782,247 @@ registration succeeds` failed, and the code was right: the student still
 held a *second* offering (MWF 10:30–12:00) that also overlaps the
 10:00–11:00 one being registered. The assertion was wrong, not the
 service. Recorded rather than quietly corrected.
+
+---
+
+# Deadline 5 — exactly-once (A)
+
+## The table already existed, so this deadline was pure application code
+
+`alembic check` reports **"No new upgrade operations detected"** at head
+`1ca8b85b7626`. `idempotency_keys`, with its `UNIQUE(key, user_id)`,
+shipped at Deadline 1 in `705b757e5df2`; the `timestamptz` fix in
+`1ca8b85b7626` was the last thing it needed.
+
+Worth recording because A owns Alembic exclusively and every previous A
+deadline opened with a migration. This one did not, and checking rather
+than assuming saved generating a revision against a schema that was
+already correct.
+
+## The serialization point is an index, not a lock
+
+The other two guarantees are row locks: quota locks the user row,
+capacity locks the resource row. Exactly-once cannot work that way, and
+the reason is worth being able to say unprompted:
+
+> **there is nothing to lock until somebody creates the row, and
+> creating the row is exactly the window a retry arrives in.**
+
+`UNIQUE(key, user_id)` serializes on the *index entry*. Two simultaneous
+retries race to INSERT; one proceeds, the other blocks on the entry until
+the first transaction ends, then either sees the violation (it committed,
+so replay its stored response) or succeeds (it rolled back, so do the
+work for real). No application lock can express that, because the thing
+being contended does not exist yet.
+
+This is the third distinct mechanism in the system, and the README should
+say so plainly: **three invariants, three serialization points.**
+
+``` text
+capacity      a fact about the RESOURCE  -> resource row lock
+quota         a fact about the USER      -> user row lock
+exactly-once  a fact about the REQUEST   -> unique index
+```
+
+## The SAVEPOINT, which was not in the plan and without which nothing works
+
+A unique violation **aborts the entire Postgres transaction**. Every
+statement after it fails with `InFailedSqlTransaction` — including the
+SELECT that fetches the stored response, which is the whole point of
+catching the violation in the first place. `db.begin_nested()` wraps the
+INSERT in a SAVEPOINT so the rollback is partial and the surrounding
+transaction survives.
+
+The plan's Deadline 5 column does not mention it. It is not an
+implementation detail: without it the feature does not function at all
+under concurrency, and the measurement below says how badly.
+
+Core `insert()` rather than `db.add()`, deliberately: an ORM add puts a
+pending object in the identity map, and reasoning about what a savepoint
+rollback leaves behind there is a complication with nothing to buy it.
+
+## Measured: three builds, and the claim we were about to overstate
+
+Both broken builds were written and run before the correct one was kept —
+this file's standing rule that the broken version is built and measured
+*first*, so the table is reproducible rather than reconstructed.
+
+`scripts/check_idempotency.py`, 8 simultaneous retries of one key × 15
+trials = 120 requests:
+
+``` text
+build                              201    409    500   rows/trial   seq fails
+----------------------------------------------------------------------------
+correct (savepoint, one commit)    120      0      0        1           0
+check-then-insert, no savepoint     34      0     86        1           1
+key commits separately              22     98      0        1           2
+```
+
+**No build over-allocated. Not one.** `UNIQUE(key, user_id)` held the row
+count to exactly one in all three — the database was never going to allow
+a double-booking, whatever the application did.
+
+That is a correction to what this project was about to claim.
+"Idempotency prevents double-booking" is *false here*, and saying it in
+an interview against our own numbers would be indefensible. What the
+correct implementation buys is that **the retry gets the original
+response**:
+
+- **no savepoint** — the violation aborts the transaction and the replay
+  lookup cannot run: 86 of 120 retries become a `500`;
+- **split commit** — the key commits with a NULL response while the
+  allocation is still in flight, so concurrent retries see a claimed-but-
+  unanswered row: 98 of 120 become a spurious `409`;
+- **correct** — 120 of 120 return `201` with byte-identical bodies.
+
+The split-commit build is also the only one caught by a *sequential*
+assertion: it leaves a key behind after a failed allocation, so the
+caller can never retry a request that never happened. Two of the
+sequential assertions fail against it and none of the concurrency ones
+do — which is the reverse of what was expected, and the reason both
+kinds are in the script.
+
+## Exactly-once is a promise about successes
+
+A direct consequence of committing the key with the allocation: **a
+request refused by the quota gate leaves no key.** The claim rolls back
+with everything else, so a later retry of that same key allocates for
+real rather than replaying a 409.
+
+This is correct and it is the only defensible option. The alternative — a
+key that outlives its own rollback — has to answer "for how long is the
+caller forbidden from retrying a request that never happened?", and there
+is no good answer. Asserted directly: over-quota request with a key gives
+409 and zero key rows; cancel a hold; the same key again gives 201.
+
+## The replay returns 201, not 200 — a contradiction in our own docs
+
+`ARCHITECTURE_AND_WORKFLOWS.md` §7 said `200 idempotent replay`; §14 said
+`200/201 replay`. Both cannot be right and the question had never been
+asked out loud.
+
+**Settled: the replay returns the status that was stored**, which for a
+successful reservation is `201`. A replay is supposed to be
+indistinguishable from the original call. A client that branches on `201`
+would take a different path on the retry — precisely the class of bug
+idempotency exists to remove, reintroduced by the mechanism meant to
+prevent it. Both doc lines now say `201`.
+
+Implementation note: the router returns a `JSONResponse` directly, which
+bypasses `response_model`. Deliberate — the stored body goes back exactly
+as recorded, rather than being re-serialized from a row that may have
+changed since. A reservation cancelled between the original call and the
+retry would otherwise replay as `CANCELLED`, which is not what the caller
+was told the first time.
+
+## The `Idempotency-Key` header is optional
+
+Benchmark 3's entire shape is the contrast between sending it and not —
+*"no key gives 2 reservations; key gives 1 reservation, identical
+response."* Requiring the header would delete one column of the table it
+exists to produce.
+
+It is also the honest default: a caller who has not thought about retries
+gets the old behaviour, and a caller who has gets exactly-once by adding
+a header. The unkeyed double-allocation is asserted as a **passing** test
+for this reason — it is the broken column, and it is supposed to be there.
+
+## The fingerprint covers the cluster id, not just the body
+
+`POST /gpus/1/reservations {"gpu_count": 2}` and
+`POST /gpus/2/reservations {"gpu_count": 2}` have identical bodies and
+are different requests. Hashing the body alone would let a key claimed
+for cluster 1 replay a response naming cluster 1 while the caller asked
+about cluster 2 — a wrong answer that looks like a success. `endpoint` is
+compared as well, so the same key on a different route is caught even if
+the bodies happen to hash alike.
+
+**`hash()` would have been wrong, silently.** Python salts it per
+process, so a digest stored by one uvicorn worker would never match the
+one computed by another for an identical body, and every cross-worker
+replay would 422. Single-process tests would all pass.
+`hashlib.sha256` over `json.dumps(..., sort_keys=True)` instead.
+
+## `IDEMPOTENCY_IN_PROGRESS`, a code for something that should not happen
+
+409, raised when a claim is committed but carries no response. It should
+be unreachable: a concurrent retry either blocks (the first transaction
+is open) or reads a populated row (it committed). It exists so that if a
+future caller ever wires `claim()` in without `record_response()`, the
+symptom is a clear 409 naming the problem rather than a replay of `null`
+surfacing as a 500 three layers away.
+
+The split-commit build made it reachable and returned it 98 times, which
+is how we know the branch works.
+
+## Verification
+
+`scripts/check_idempotency.py` — **37/37 PASS**, the sixth gate.
+
+``` text
+no key, twice                    -> 2 reservations, distinct ids
+same key, twice                  -> 1 reservation, 201, identical body
+third retry, later               -> still replays, still 1 reservation
+stored claim                     -> status_code 201, body == returned body
+same key, different body         -> 422 IDEMPOTENCY_KEY_REUSED
+same key, different cluster      -> 422       <- fingerprint covers gpu_id
+same key STRING, different users -> 2 reservations, 2 key rows
+over quota with a key            -> 409, ZERO key rows left
+same key after cancelling        -> 201, allocates for real
+8 retries x 15 trials            -> {201: 120}, 1 row every trial
+```
+
+Full regression after wiring into the flagship transaction: `check_jwt`,
+`check_auth`, `check_rbac`, `check_rooms`, `check_gpus`, `check_courses`
+— all pass. `alembic check` — no drift.
+
+## Outstanding — B, before Deadline 5 can close
+
+A's column is met. **The deadline is not**, and the gap is entirely B's:
+the checkpoint is *"first broken-vs-fixed table with real numbers"* and
+the table it names is Benchmark 1. A's half produced *a* broken-vs-fixed
+table with real numbers (three builds, above), which is evidence but is
+not the checkpoint as written. Recorded here so the two are not conflated
+later — the same mistake this file corrected once already, when three
+dated sessions were being read as three met deadlines.
+
+Verified at session 11, not assumed:
+
+1. **`tests/` is still empty and `pytest-asyncio` is still absent from
+   `requirements.txt`.** `EXECUTION_PLAN.md` has flagged both as a
+   blocker "before starting" since the plan was written, and neither has
+   moved. `requirements.txt` ends at `pytest==8.3.4` with no async
+   plugin, so `tests/concurrency/harness.py` cannot run on the day it is
+   written.
+
+2. **Benchmark 1 must be written as trials, not a single run.** This is
+   Deadline 4's finding applied forward and it is the one most likely to
+   be skipped, because a single 500-request run *looks* like plenty of
+   evidence. It is not: Benchmark 2's first run passed against the very
+   build it exists to indict, because the corruption window is
+   sub-millisecond. A benchmark that reports one number cannot separate
+   the two builds; one that counts over trials can.
+
+3. **The shape already exists — scale it, do not restart.**
+   `scripts/check_courses.py` contains a working mini version: 20 racers
+   on 5 seats, `{201: 5, 409: 15}`, with the `enrolled_count` vs
+   active-row reconciliation query already written. That query is
+   Deadline 8's arriving early, and it is the assertion that proves the
+   counter and the table agree. 500/50 is that test with two constants
+   changed.
+
+4. **The connection pool is joint, and it is due now.** `session.py`
+   passes no `pool_size`, so SQLAlchemy defaults to 5 + 10 overflow =
+   **15 connections against a 500-request harness**. Carried since
+   session 5 as a standing note; Benchmark 1 is the specific thing it
+   distorts, because a run that queues 485 of its 500 requests behind a
+   pool is measuring the pool and not the lock. `session.py` is a shared
+   file, so the protocol says both people present — this is the item to
+   settle *before* B starts measuring, not after the first strange
+   number.
+
+**Nothing in A's column is blocked on any of these**, which is worth
+saying plainly because the plan's phrasing implied a shared deliverable.
+`check_idempotency.py` uses threads exactly as `check_gpus.py` does, so
+the exactly-once evidence exists today without the asyncio harness
+existing at all.

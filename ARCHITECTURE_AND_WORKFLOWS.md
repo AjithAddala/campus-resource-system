@@ -254,6 +254,29 @@ than fix it — commit the allocation but lose the key and a retry
 double-allocates; store the key but roll back the allocation and a retry
 returns a fake success.
 
+**Measured at Deadline 5, and the numbers correct the claim above.** Both
+broken builds were built and run against `scripts/check_idempotency.py`
+before the correct one was kept:
+
+``` text
+build                          201    409    500   rows/trial  seq. failures
+------------------------------------------------------------------------
+correct (savepoint, one tx)    120      0      0       1            0
+check-then-insert, no savepoint  34      0     86       1            1
+key commits separately           22     98      0       1            2
+                              (120 requests: 8 simultaneous retries x 15 trials)
+```
+
+**No build over-allocated.** `UNIQUE(key, user_id)` holds the row count
+to exactly one in all three — the database was never going to let a
+double-booking through. What the correct implementation buys is not
+uniqueness, it is that the *retry gets the original response*: without
+the SAVEPOINT the unique violation aborts the transaction and 86 of 120
+retries become a `500`; with a split commit the key is visible with a
+NULL response and 98 of 120 become a spurious `409`. Stating the claim as
+"idempotency prevents double-booking" would be overclaiming against our
+own measurements.
+
 **Why aggregation, not a counter:** held units are recomputed by `SUM`
 under the user lock, so they cannot drift out of sync with reality. A
 denormalized counter is a later optimization, introduced only if load
@@ -273,14 +296,29 @@ testing proves the user-row lock is a bottleneck.
 409  SCHEDULE_CONFLICT      clashes with an enrollment you hold
 409  NOT_ENROLLED           drop called with no enrollment
 409  QUOTA_NOT_CONFIGURED   no policy row for (role, resource) -- fails closed
+409  IDEMPOTENCY_IN_PROGRESS  claim committed, response not yet recorded
 422  malformed request body
-422  IDEMPOTENCY_KEY_REUSED same key, different body
-200  idempotent replay      (original response, original status)
+422  IDEMPOTENCY_KEY_REUSED same key, different request
+201  idempotent replay      (the ORIGINAL response, the ORIGINAL status)
 ```
 
 Capacity and quota rejection are both `409` but carry distinct
 machine-readable codes, because the caller's remedy differs: wait / try
 another cluster, vs. release something you already hold.
+
+**The replay line was contradictory until Deadline 5 and is now
+settled.** This table said `200`; §14 said `200/201`. A replay returns
+**the status that was stored**, which for a successful GPU reservation is
+`201` — a replay is supposed to be indistinguishable from the original
+call, and a client that branches on `201` would take a different path on
+the retry, which is the exact bug idempotency exists to remove.
+
+`IDEMPOTENCY_IN_PROGRESS` is new at Deadline 5 and should be unreachable:
+a concurrent retry either blocks on the unique index (the first
+transaction is still open) or reads a fully populated row (it committed).
+It exists so that a future caller who forgets `record_response` gets a
+clear `409` instead of a replay of `null` surfacing as a `500` three
+layers away.
 
 ### The envelope carrying those codes
 
@@ -580,8 +618,11 @@ No token                          401
 Student calls POST /gpus          403, no state change
 Cluster full                      409 CAPACITY_EXHAUSTED
 Student already holds 2 GPUs      409 QUOTA_EXCEEDED
-Retried request (same key)        200/201 replay, no new booking
-Same key, different body          422 IDEMPOTENCY_KEY_REUSED
+Retried request (same key)        201 replay of the STORED response
+Same key, different request       422 IDEMPOTENCY_KEY_REUSED
+Retry of a request that FAILED    allocates for real -- the key rolled
+                                  back with it, so there is nothing to
+                                  replay. Exactly-once covers SUCCESSES.
 Overlapping room booking          409 INTERVAL_CONFLICT (exclusion constraint)
 Booking a BLOCKED room            409 RESOURCE_BLOCKED, existing holds kept
 Booking a GPU cluster via /rooms  404 (service-layer resource_type check;

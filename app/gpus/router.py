@@ -1,10 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
 from app.core.dependencies import get_current_user, require_role
 from app.core.errors import coded_error
 from app.database.session import get_db
 from app.gpus import service
+from app.idempotency import service as idempotency
 from app.gpus.schemas import (
     GPUAvailability,
     GPUClusterCreate,
@@ -101,14 +103,20 @@ def reserve_gpu(
     payload: GPUReservationCreate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(
+        None,
+        alias="Idempotency-Key",
+        description="Optional. Retrying with the same key returns the "
+        "original response instead of allocating again.",
+    ),
 ) -> GPUReservationRead:
     """Hold GPU units on a cluster until released. Any authenticated role.
 
     **The flagship path.** It is the only endpoint where all three of the
-    system's guarantees meet: exactly-once (Deadline 5, via an
-    `Idempotency-Key` header), quota (the user row lock), and capacity
-    (the cluster row lock). `service.reserve_gpu` carries the reasoning
-    for the order they are taken in.
+    system's guarantees meet: exactly-once (the `Idempotency-Key` header),
+    quota (the user row lock), and capacity (the cluster row lock).
+    `service.reserve_gpu` carries the reasoning for the order they are
+    taken in.
 
     Body is `{"gpu_count": N}` and carries **no times** -- holds run until
     cancelled. See DECISIONS.md for why timestamps and a scalar
@@ -121,9 +129,40 @@ def reserve_gpu(
         QUOTA_EXCEEDED      you hold too much     -> release something
         CAPACITY_EXHAUSTED  the cluster is full   -> wait, or try another
         RESOURCE_BLOCKED    admin blocked it      -> try another, do not wait
+
+    **The header is optional**, and Deadline 5 settled that deliberately
+    rather than by omission: Benchmark 3's whole shape is the contrast
+    between sending it and not, so making it mandatory would delete one
+    column of the table it exists to produce.
     """
     try:
-        reservation = service.reserve_gpu(db, gpu_id, user, payload)
+        reservation = service.reserve_gpu(db, gpu_id, user, payload, idempotency_key)
+    except idempotency.KeyReplayed as replay:
+        # **The stored status, not 200.** A replay is supposed to be
+        # indistinguishable from the original call, and a caller that
+        # branches on 201 would take a different path on the retry -- which
+        # is precisely the bug idempotency exists to remove. Returning a
+        # JSONResponse directly also bypasses `response_model`, so the body
+        # goes back exactly as it was stored rather than being
+        # re-serialized from a row that may have changed since.
+        return JSONResponse(status_code=replay.status_code, content=replay.body)
+    except idempotency.KeyReuse:
+        raise coded_error(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "IDEMPOTENCY_KEY_REUSED",
+            "This Idempotency-Key was already used for a different request. "
+            "Use a fresh key for a different request.",
+        )
+    except idempotency.KeyInFlight:
+        # Should be unreachable: a concurrent retry either blocks on the
+        # unique index or sees a fully populated row. Answered as a 409
+        # rather than allowed to become a 500 three layers away.
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "IDEMPOTENCY_IN_PROGRESS",
+            "A request with this Idempotency-Key is still being processed. "
+            "Retry shortly.",
+        )
     except quotas.QuotaExceeded as exc:
         raise coded_error(
             status.HTTP_409_CONFLICT,

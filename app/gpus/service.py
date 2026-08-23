@@ -2,12 +2,20 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.gpus.schemas import GPUClusterCreate, GPUReservationCreate
+from app.gpus.schemas import GPUClusterCreate, GPUReservationCreate, GPUReservationRead
+from app.idempotency import service as idempotency
 from app.models.enums import ReservationStatus, ResourceStatus, Role
 from app.models.reservation import GPUReservation
 from app.models.resource import GPUCluster
 from app.models.user import User
 from app.quotas import service as quotas
+
+# The `endpoint` column on a claim, and half of what distinguishes one
+# request from another. A stable logical name rather than the URL path:
+# the path carries the cluster id, which belongs in the fingerprint (it
+# is part of *which* request this is), while this names the operation.
+# Matches the canonical transaction in ARCHITECTURE_AND_WORKFLOWS.md §6.
+RESERVE_ENDPOINT = "gpu.reserve"
 
 
 def list_clusters(db: Session) -> list[GPUCluster]:
@@ -64,12 +72,25 @@ class NotOwner(Exception):
 
 
 def reserve_gpu(
-    db: Session, gpu_id: int, user: User, payload: GPUReservationCreate
+    db: Session,
+    gpu_id: int,
+    user: User,
+    payload: GPUReservationCreate,
+    idempotency_key: str | None = None,
 ) -> GPUReservation | None:
     """THE transaction. Hold `gpu_count` units on a cluster until released.
 
     Returns the committed row, or None if `gpu_id` is not a GPU cluster.
-    Raises `QuotaExceeded`, `ClusterBlocked` or `CapacityExhausted`.
+    Raises `QuotaExceeded`, `ClusterBlocked` or `CapacityExhausted`, and
+    from Deadline 5 also `KeyReplayed`, `KeyReuse` and `KeyInFlight`.
+
+    `idempotency_key` is **optional, and that is a requirement rather than
+    a convenience.** Benchmark 3 measures the difference between the two
+    modes -- "no key -> 2 reservations; key -> 1 reservation, identical
+    response" -- so the unkeyed path has to stay reachable or the
+    benchmark has only one column. It is also the honest default: a caller
+    who has not thought about retries gets today's behaviour, and a caller
+    who has gets exactly-once by sending a header.
 
     ==================================================================
     LOCK ORDER -- USER ROW FIRST, RESOURCE ROW SECOND. NO EXCEPTIONS.
@@ -84,9 +105,9 @@ def reserve_gpu(
 
     The steps, and what each one protects:
 
-      (1) exactly-once   Deadline 5 inserts the idempotency key HERE,
-                         above both locks, so a replayed request does not
-                         even queue for them.
+      (1) exactly-once   insert the idempotency key HERE, above both
+                         locks, so a replayed request does not even queue
+                         for them.        <- keyed on the REQUEST
       (2) QUOTA GATE     lock the USER row, SUM held units, compare
                          against role policy.        <- keyed on the USER
       (3) CAPACITY GATE  lock the CLUSTER row, check status, compare
@@ -130,6 +151,32 @@ def reserve_gpu(
     # writing against a row that vanished.
     if get_cluster(db, gpu_id) is None:
         return None
+
+    # --- (1) EXACTLY-ONCE -----------------------------------------------
+    # Above BOTH locks, so a retry that is going to be replayed never
+    # queues behind a real allocation. Raises `KeyReplayed` to abandon the
+    # rest of this function -- the caller has already been served once and
+    # nothing below should run a second time.
+    #
+    # Note what is NOT here: no lock. The serialization point is the
+    # `UNIQUE(key, user_id)` index, which works before the row exists.
+    # There is nothing to lock until somebody creates it, and "somebody
+    # creates it" is exactly the window a concurrent retry lands in.
+    #
+    # The fingerprint covers `gpu_id` as well as the body. The same
+    # `{"gpu_count": 2}` posted to two different clusters is two different
+    # requests, and hashing the body alone would let a key claimed for one
+    # cluster replay a response naming the other.
+    if idempotency_key is not None:
+        idempotency.claim(
+            db,
+            idempotency_key,
+            user.id,
+            RESERVE_ENDPOINT,
+            idempotency.request_fingerprint(
+                {"gpu_id": gpu_id, "gpu_count": payload.gpu_count}
+            ),
+        )
 
     # --- (2) QUOTA GATE -------------------------------------------------
     # Taken on the caller's own row and held to COMMIT. It serializes THIS
@@ -215,6 +262,29 @@ def reserve_gpu(
         status=ReservationStatus.ACTIVE,
     )
     db.add(reservation)
+
+    # Record the response INTO THE SAME TRANSACTION, before the commit
+    # below. This is the load-bearing line of the whole exactly-once
+    # story, and the failure modes of splitting it are asymmetric but both
+    # fatal: commit the allocation without the key and a retry allocates
+    # again; commit the key without the allocation and a retry replays a
+    # success for work that never happened.
+    #
+    # `flush()` first, because the response body needs the id the database
+    # assigns and the `created_at` its default computes. Flushing emits the
+    # INSERT inside this transaction without ending it -- the row is
+    # invisible to everyone else until the commit two lines down, which is
+    # exactly the property being relied on.
+    if idempotency_key is not None:
+        db.flush()
+        idempotency.record_response(
+            db,
+            idempotency_key,
+            user.id,
+            GPUReservationRead.model_validate(reservation).model_dump(mode="json"),
+            201,
+        )
+
     db.commit()
     db.refresh(reservation)
 

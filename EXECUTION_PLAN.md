@@ -10,8 +10,9 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-4 met (sessions 4, 7, 9 and 10).
-> Deadline 5 — idempotency and the concurrency harness — is next.**
+> **Status: Deadlines 1-4 met (sessions 4, 7, 9 and 10). Deadline 5 is
+> half met — A's idempotency column landed in session 11 and is verified;
+> the deadline closes on B's harness and Benchmark 1.**
 
 ## 0. Scope
 
@@ -330,23 +331,49 @@ four verified (session 10):** `scripts/check_gpus.py` 44/44 and
 > the POST route — `DELETE /{resource}/{id}/reservations/{id}` — so one
 > id can no longer name rows in two tables.
 
-### Deadline 5 - Idempotency vs. Harness
+### Deadline 5 - Idempotency vs. Harness  ◐ A'S COLUMN MET (session 11)
 
 ``` text
-A      idempotency/ module: IdempotencyKey, UNIQUE(key, user_id)
-       wire in as step (1) of the GPU transaction
-       CRITICAL: key insert and allocation commit in the SAME transaction
-       replay path returns the stored response and status
+A ✅   idempotency/ module: IdempotencyKey, UNIQUE(key, user_id)
+       NO MIGRATION NEEDED -- the table and its UNIQUE shipped at
+       Deadline 1 in 705b757e5df2; `alembic check` reports no drift.
+       This deadline is pure application code, which is not what the
+       column implied.
+A ✅   wire in as step (1) of the GPU transaction
+A ✅   CRITICAL: key insert and allocation commit in the SAME transaction
+A ✅   replay path returns the stored response and status
+A ✅   SAVEPOINT around the claim -- NOT in this column as written, and
+       nothing works without it: a unique violation aborts the whole
+       transaction, so the read that fetches the stored response cannot
+       run. Measured: 86 of 120 concurrent retries return 500 without it.
+A ✅   `Idempotency-Key` header is OPTIONAL, settled deliberately --
+       Benchmark 3 is the contrast between sending it and not, so
+       requiring it would delete one column of its own table.
 B      tests/concurrency/harness.py - asyncio + httpx, fires N
        simultaneous requests, collects status codes
        BLOCKER: tests/ does not exist and pytest-asyncio is not in
-       requirements.txt. Add it before starting.
+       requirements.txt. Add it before starting.  <- STILL TRUE at
+       session 11; verified, not assumed.
        BENCHMARK 1 (capacity): 500 concurrent registrations, capacity 50
          unlocked build -> record over-allocation
          locked build   -> exactly 50, zero over-allocation
 ```
 
 **Checkpoint:** first broken-vs-fixed table with real numbers.
+— **A's half produced one** (`scripts/check_idempotency.py`, 37/37, three
+builds measured; see DECISIONS.md). The checkpoint as written names
+Benchmark 1, which is B's, so **the deadline is not met until B's harness
+lands.**
+
+> **The A column here did not depend on B at any point**, which is worth
+> recording because the plan's phrasing implied a shared deliverable.
+> `check_idempotency.py` uses threads exactly as `check_gpus.py` does, so
+> the exactly-once evidence exists without the asyncio harness.
+>
+> **Still owed, and now blocking B rather than A:** `session.py` sets no
+> `pool_size`, so SQLAlchemy defaults to 5 + 10 overflow = 15 against a
+> 500-request harness. Carried since session 5. It is a shared file and
+> needs both people.
 
 ### Deadline 6 - Quota Rollout, Benchmarks 2-3, SWAP
 

@@ -1320,6 +1320,114 @@ Four deadlines met, ten sessions.
 
 ---
 
+## Session 11 — 2026-08-23 — A
+
+**Advances:** Deadline 5 (idempotency) — A's column only. **Not the
+deadline**, which closes on B's harness and Benchmark 1.
+
+**Plan:** build the exactly-once guarantee: `idempotency/` module, wired
+in as step (1) of the GPU transaction, with the key and the allocation
+committing together.
+
+**Shipped**
+
+- `app/idempotency/service.py` — new. `request_fingerprint`, `claim`,
+  `record_response`, and three exceptions. Same contract as `quotas/`:
+  takes a Session it did not create, never commits, knows nothing
+  about HTTP.
+- `app/gpus/service.py` — `reserve_gpu` takes an optional
+  `idempotency_key`. Claim at step (1) above both locks;
+  `record_response` after `flush()` and **before** the existing commit.
+  No second commit was added.
+- `app/gpus/router.py` — `Idempotency-Key` header (optional), and three
+  new branches: replay via `JSONResponse` carrying the stored status,
+  `422 IDEMPOTENCY_KEY_REUSED`, `409 IDEMPOTENCY_IN_PROGRESS`.
+- `scripts/check_idempotency.py` — new, sixth gate, 37 assertions.
+
+**No migration.** `alembic check` reports no drift: `idempotency_keys`
+and its `UNIQUE(key, user_id)` shipped at Deadline 1. Checked rather
+than assumed, which is the only reason a pointless empty revision did
+not get generated.
+
+**Verification run**
+
+``` text
+scripts/check_idempotency.py -> 37/37 PASS
+  no key, twice                    -> 2 reservations, distinct ids
+  same key, twice                  -> 1 reservation, 201, identical body
+  same key, different body         -> 422 IDEMPOTENCY_KEY_REUSED
+  same key, different cluster      -> 422      <- fingerprint covers gpu_id
+  same key STRING, different users -> 2 reservations, 2 key rows
+  over quota with a key            -> 409, ZERO key rows left behind
+  same key after cancelling        -> 201, allocates for real
+  BENCHMARK 3, 8 retries x 15      -> {201: 120}, exactly 1 row per trial
+
+BROKEN-VS-FIXED, three builds actually run (not reconstructed):
+  correct (savepoint, one commit)   201:120  409:0   500:0   rows 1
+  check-then-insert, no savepoint   201:34   409:0   500:86  rows 1
+  key commits separately            201:22   409:98  500:0   rows 1
+
+regression after touching the flagship transaction:
+  check_jwt / check_auth / check_rbac / check_rooms /
+  check_gpus / check_courses        -> all pass
+alembic check                       -> no drift, head 1ca8b85b7626
+```
+
+**The finding that changes what we claim.** **No build over-allocated —
+not one.** `UNIQUE(key, user_id)` holds the row count to exactly one
+even in the deliberately broken builds. "Idempotency prevents
+double-booking" is therefore *false for this system*, and we were one
+README sentence away from asserting it. What the correct implementation
+actually buys is that the retry gets the **original response**: without
+the savepoint 86 of 120 retries become 500s, with a split commit 98 of
+120 become spurious 409s. The corrected claim is in DECISIONS.md and
+`ARCHITECTURE_AND_WORKFLOWS.md` §6.
+
+**Two things the plan's Deadline 5 column did not mention**
+
+- **The SAVEPOINT.** A unique violation aborts the whole transaction, so
+  the read that fetches the stored response cannot run. `begin_nested()`
+  is not a detail — without it the feature does not work under
+  concurrency at all.
+- **The `Idempotency-Key` header must be optional.** Benchmark 3 is the
+  contrast between sending it and not; requiring it would delete one
+  column of its own table.
+
+**A doc contradiction, settled.** §7 said a replay returns `200`, §14
+said `200/201`. It returns **the stored status** — `201` — because a
+replay must be indistinguishable from the original call. Both lines
+fixed.
+
+**Deadline 5 status: A's column MET, deadline still OPEN.** The
+checkpoint is *"first broken-vs-fixed table with real numbers"* and names
+Benchmark 1, which is B's. A's half produced a broken-vs-fixed table with
+real numbers; that is not the same as the checkpoint being met.
+
+**Open / carried forward**
+
+1. **B is still blocked and nothing changed there.** `tests/` is still
+   empty and `pytest-asyncio` is still absent from `requirements.txt`.
+   Verified this session, not assumed.
+2. **The connection pool is now the top joint item.** `session.py` sets
+   no `pool_size`, so it is 5 + 10 overflow = 15 against a 500-request
+   harness. Carried since session 5; Benchmark 1 is the thing it
+   distorts. Shared file — needs both people.
+3. Item 11 (stale locked read on the GPU path) is **unchanged and
+   untouched** this session. Still the thing to resolve before Deadline
+   7's promotion transaction.
+4. Items 7, 9, 10 remain joint calls blocking Deadline 7. Item 9 (lock
+   order vs. promotion) is still the urgent one.
+5. `POST /courses` / `POST /offerings` still belong to no deadline.
+6. Idempotency is wired into **the GPU path only**. Room and course
+   registration do not take a key. That matches the plan — the flagship
+   is where exactly-once is claimed — but it should be said out loud in
+   the README rather than left for someone to notice.
+7. No expiry or cleanup on `idempotency_keys`. Rows accumulate forever.
+   Fine for a demo, and a real answer would be a TTL sweep; worth a
+   sentence in "Designed, not implemented."
+
+---
+
 ## Template
 
 ```markdown
