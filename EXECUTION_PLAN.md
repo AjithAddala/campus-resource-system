@@ -11,8 +11,10 @@
 > deadlines were met because three dated sessions existed.
 >
 > **Status: Deadlines 1-5 met (sessions 4, 7, 9, 10, 11 and 12).
-> Deadline 6 — quota rollout, Benchmarks 2-3, and the swap review — is
-> next.**
+> Deadline 6 is OPEN with B's column done (session 13: Benchmarks 2 and
+> 3, both on the harness, both tables in `WORK_LOG.md`). Outstanding:
+> A's quota rollout, the admin quota and resource-status endpoints,
+> `GET /me/quota`, and the joint swap review.**
 
 ## 0. Scope
 
@@ -412,12 +414,29 @@ A      apply the quota helper inside B's modules:
          to a caller is fine; the allocation transaction is what has to
          be right.
        fix whatever B's benchmarks break
-B      BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
+B ✅   BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
          DIFFERENT clusters
-         resource lock only -> both succeed, held = 4
-         + user-row lock    -> exactly one succeeds
-       BENCHMARK 3 (exactly-once): identical request twice, same key
+         resource lock only -> both succeed, held = 4  MEASURED 25/25
+         + user-row lock    -> exactly one succeeds     MEASURED 25/25
+       On the asyncio harness, not threads. This REPRODUCES the threaded
+       table in DECISIONS.md (24/25 over-quota) rather than replacing it;
+       one trial of difference is not evidence that either barrier hits a
+       window the other misses. The port is for uniformity -- one
+       instrument, four benchmarks, achieved concurrency sampled from
+       pg_stat_activity rather than assumed.
+B ✅   BENCHMARK 3 (exactly-once): identical request twice, same key
          no key -> 2 reservations;  key -> 1 reservation, identical response
+       Fired 8 times rather than twice, 15 trials: no key -> 8 holds;
+       same key -> 1 hold, 1 key row, 1 distinct body, and all 120
+       responses 201 -- the STORED status, not 200. Racers are FACULTY,
+       because a STUDENT's quota of 2 would truncate the unkeyed column
+       and the table would be measuring the wrong gate.
+B ✅   harness `Result` gained a `body` field -- "identical response" is
+       a claim about bodies and a status code cannot carry it.
+       Benchmarks 2 and 3 are now off threads; the threaded versions in
+       check_gpus.py / check_idempotency.py STAY. They are gates, not
+       benchmarks: they assert, exit non-zero, and cover the sequential
+       cases the benchmarks deliberately skip.
 
 BOTH (1 hour, before closing the deadline) - SWAP REVIEW
        A walks B line-by-line through the GPU transaction

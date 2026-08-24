@@ -2195,3 +2195,52 @@ warning when the buckets do not sum to the request count.
 > A benchmark that can silently drop 500 responses is not an instrument.
 > It is the same class of error as a test that passes against the broken
 > build, and it cost two long runs before the numbers were even readable.
+
+# Deadline 6 — Benchmarks 2 and 3 on the harness (B)
+
+## The racers in Benchmark 3 must be FACULTY, or it measures the wrong gate
+
+Benchmark 3's unkeyed column has to be free to allocate on every retry.
+Run it as a STUDENT and the GPU quota of 2 refuses retries 3..N, so the
+column reports "2 reservations" — which is the number the plan predicts,
+arrived at through the **quota** gate rather than through the absence of
+an idempotency key. The table would look exactly right and would be
+evidence for nothing.
+
+FACULTY (quota 10) removes the interference, and the benchmark refuses to
+start when `--retries` exceeds that cap rather than silently producing
+the truncated number.
+
+> This is the Deadline 4 lesson wearing a different hat. There, a test
+> passed against the build it was meant to indict; here, a column would
+> report the *expected* value for the wrong reason. Both are instruments
+> agreeing with you for reasons you did not check.
+
+## `--retries` defaults to 8 where the plan says "twice"
+
+Two requests cannot separate "every retry allocates" from noise. Eight
+makes the unkeyed row count track N, which is the claim. `--retries 2`
+reproduces the plan's literal shape and was run: `no key -> 2 holds,
+key -> 1 hold, identical bodies`, exactly as written.
+
+## The threaded checks stay; the benchmarks are not their replacement
+
+`check_gpus.py` and `check_idempotency.py` keep their thread-based races.
+They are **gates** — they assert, they exit non-zero, and they cover the
+sequential cases the benchmarks deliberately skip. The benchmarks are
+**instruments**: they produce tables and, on the broken build, are
+*supposed* to record failure without failing. Deleting the checks in
+favour of the benchmarks would trade an assertion for a number.
+
+## The claim we were about to overstate, again
+
+The first draft of the session-13 log credited the asyncio barrier with
+turning Benchmark 2's broken column "from a coin flip into 25/25". The
+threaded measurement recorded above was already **24/25**. One trial of
+difference is not evidence about barriers or the GIL, and the harness
+port reproduces the threaded table rather than improving on it — the
+reason to port was uniformity, not accuracy.
+
+> Twice now the mistake has been the same shape: reading a difference
+> into a sample too small to carry one. It is what this project's own
+> benchmarks are built to refuse, in the sentences describing them.

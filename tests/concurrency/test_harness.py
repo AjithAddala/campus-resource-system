@@ -96,6 +96,28 @@ async def test_error_codes_are_extracted():
 
 
 @pytest.mark.asyncio
+async def test_bodies_are_captured_and_survive_a_non_json_response():
+    """Benchmark 3 asserts that keyed replays return the SAME body, so
+    the body has to reach it. A status code cannot carry that claim.
+
+    The second half matters as much as the first: a body that does not
+    decode must arrive as None rather than raising, or one 204 or one
+    proxy error page takes down a 500-request trial.
+    """
+    calls = [Call("GET", "/health"), Call("GET", "/api/v1/gpus")]  # ok, then 401
+    results = await fire_async(calls, base_url=ROOT)
+    assert results[0].body == {"status": "ok"}
+    # The 401 body is JSON too; what is asserted here is that `body` is
+    # populated on failures, not only on the happy path.
+    assert results[1].status == 401 and results[1].body is not None
+
+    unreachable = await fire_async(
+        [Call("GET", "/health")], base_url="http://127.0.0.1:9", timeout=2.0
+    )
+    assert unreachable[0].body is None
+
+
+@pytest.mark.asyncio
 async def test_transport_errors_are_captured_not_raised():
     """A connection failure is a datum, not a crash.
 

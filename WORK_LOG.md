@@ -1578,6 +1578,176 @@ Five deadlines met, twelve sessions.
 6. `POST /courses` / `POST /offerings` still belong to no deadline;
    Benchmark 1 creates offerings by direct insert for want of an endpoint.
 
+## Session 13 — 2026-08-24 — B
+
+**Advances:** Deadline 6 (Quota Rollout, Benchmarks 2-3, SWAP) — **B's
+column only.** A's quota rollout and the joint swap review are untouched,
+so the deadline stays open.
+
+**Plan:** Benchmarks 2 and 3, built on the session-12 harness rather than
+on threads. This is carried item 5 from session 12 as well as B's
+Deadline 6 column: the two races already existed inside
+`scripts/check_gpus.py` and `scripts/check_idempotency.py`, and nothing
+was wrong with them — but Deadline 9 asks a stranger to reproduce four
+tables, and four scripts in two styles is a worse answer than four
+benchmarks in one.
+
+**Shipped**
+
+- `tests/concurrency/benchmark_2_quota.py` — one student, two 2-unit
+  requests fired simultaneously at two DIFFERENT clusters, 25 trials,
+  selected between builds by `BENCHMARK_UNSAFE_NO_USER_LOCK`.
+- `tests/concurrency/benchmark_3_exactly_once.py` — the same request
+  fired 8 times at once, twice: once without an `Idempotency-Key` and
+  once with one, 15 trials. Both columns are honest behaviour, not a
+  broken build and a fixed one, which is why the header is optional.
+- `harness.py`: `Result` gained a `body` field. Benchmark 3's claim is
+  *"1 reservation, identical response"* and the second half is a
+  statement about response BODIES — a status code cannot carry it. The
+  JSON is now decoded once per response and handed to both `body` and
+  the code extractor, where `_code_of` used to decode it alone; adding
+  `body` any other way meant a second parse of all 500 bodies in
+  Benchmark 1 for a value already in hand. Last field, defaulted, so
+  every existing construction is unchanged.
+- A sixth harness test, `test_bodies_are_captured_and_survive_a_non_json_
+  response`. The instrument gets a test for the same reason the other
+  five exist: a body that fails to decode must arrive as `None` rather
+  than raise, or one 204 takes down a 500-request trial.
+
+**Both benchmarks build their own fixtures** — own clusters, own users,
+tokens minted rather than obtained from `/auth/login` — and clean up on
+the way out, verified below. They run against a seeded database without
+disturbing the seed. Benchmark 2 reads the STUDENT/GPU cap from
+`role_quotas` rather than hardcoding 2: that row is admin-editable
+policy, and a benchmark that hardcodes policy silently stops testing the
+system the day A's `PUT /admin/quotas/{role}/{resource}` changes it.
+
+**BENCHMARK 2 — quota under concurrency**
+
+``` text
+1 student, quota 2, 2 x 2-unit requests at DIFFERENT clusters, 25 trials
+
+  build                    held units      successes    OVER-QUOTA
+  ---------------------------------------------------------------
+  BROKEN (no user lock)    {4: 25}         {2: 25}      25/25
+  FIXED  (user row locked) {2: 25}         {1: 25}       0/25
+
+  5xx / transport: 0 in both.  peak DB concurrency: 2 of 2 submitted.
+```
+
+**This reproduces the threaded table rather than replacing it**, and the
+comparison is worth being exact about, because the loose version of this
+sentence is an overclaim. `DECISIONS.md` records the threaded 25-trial
+measurement as **24/25** over-quota, `{2: 1, 4: 24}`; the harness gives
+**25/25**, `{4: 25}`. That is one trial of difference. It is not evidence
+that the asyncio barrier hits a window `threading.Barrier` misses, and
+this log is not going to claim it is on a sample of one.
+
+What the threaded version actually did wrong was earlier and cruder: its
+*first* run was a SINGLE trial, and that run PASSED against the unlocked
+build. Trials were the fix, and they worked on threads. The harness port
+is for uniformity — one instrument, four benchmarks, achieved concurrency
+sampled rather than assumed — not because the old numbers were wrong.
+
+Worth stating plainly because it is the sentence both of us must be able
+to say unprompted: **both requests are correct as far as any resource is
+concerned.** Two different cluster rows, so the two `FOR UPDATE`s never
+contend; each cluster has room; neither is overbooked. Every capacity
+check passes honestly and the student still ends up holding 4 against a
+limit of 2. The fix is not "add a lock" — the resource lock was already
+there and was already right. It was the **wrong lock for that
+invariant**, and the right one is the user row.
+
+**BENCHMARK 3 — exactly-once under concurrent retries**
+
+``` text
+The SAME request fired 8 times at once, 15 trials, FACULTY racers
+
+  mode          reservations   idempotency_keys   distinct 201 bodies
+  ------------------------------------------------------------------
+  no key        {8: 15}        n/a                8 per trial
+  same key      {1: 15}        {1: 15}            1 per trial
+
+  statuses: 201 x 120 in BOTH columns.  5xx: 0.  divergent-body trials: 0.
+  peak DB concurrency: 8 of 8 submitted.
+```
+
+Note the status column: **all 120 keyed responses are 201, not 200.** A
+replay is meant to be indistinguishable from the original call, so the
+stored status is returned rather than a fresh one — a caller branching on
+201 must not take a different path on the retry, which is the bug
+idempotency exists to remove.
+
+The racers are FACULTY (GPU quota 10) rather than students (quota 2), and
+that is load-bearing: with students the unkeyed column would report 2
+reservations because the QUOTA gate refused retries 3-8, and the table
+would be measuring the wrong guarantee while looking correct. The
+benchmark refuses to run with `--retries` above the faculty cap for the
+same reason, rather than silently producing that number.
+
+`--retries` defaults to 8 where the plan says "twice". Two requests
+cannot distinguish "retries double-allocate" from noise; watching the row
+count track N makes the claim unmissable. `--retries 2` reproduces the
+plan's literal shape.
+
+**Verification run**
+
+- `docker compose exec app python -m pytest tests/ -q` → `6 passed in
+  2.15s` (5 harness tests plus the new body test).
+- `python -m tests.concurrency.benchmark_2_quota --trials 25` on the
+  default build → `RESULT: PASS — exactly one success and held == 2 in
+  every trial`.
+- Same, with `BENCHMARK_UNSAFE_NO_USER_LOCK=true` in `.env` and
+  `docker compose up -d --force-recreate app` → `RESULT: broken build
+  recorded — over quota in 25/25 trials`. `.env` restored and the
+  container recreated afterwards; `alembic current` is `1ca8b85b7626
+  (head)` throughout.
+- `python -m tests.concurrency.benchmark_3_exactly_once --trials 15` →
+  `RESULT: PASS — 8 retries produced 8 holds unkeyed and exactly 1 keyed,
+  with identical bodies, in every trial`.
+- Cleanup checked by querying, not assumed: after all three runs, `users
+  3, clusters 2, resources 4, gpu_reservations 0, idempotency_keys 0`,
+  both seed clusters at `allocated = 0` and `AVAILABLE`.
+- Benchmark 1 re-run after the `Result` change (`--trials 2 --students
+  200 --seats 20`) → `PASS — exactly 20 in every trial`, peak DB
+  concurrency 39 of 40 in flight. The harness edit is backward
+  compatible in fact and not only in principle.
+
+**Cost incurred**
+
+- None to speak of. One near-miss, caught on re-reading rather than in
+  the run: the first draft of this entry credited the asyncio barrier
+  with turning Benchmark 2's broken column "from a coin flip into 25/25",
+  which is a causal claim about scheduling drawn from 24/25 versus 25/25.
+  The threaded measurement in `DECISIONS.md` was already 24/25. Corrected
+  above. It is the same failure mode as the benchmark it describes:
+  reading a difference into one trial.
+
+**Deadline 6 status: still open.** B's column is done. Outstanding:
+A's quota rollout into the room and course modules, the admin quota and
+resource-status endpoints, `GET /me/quota`, and the joint swap review.
+
+**Open / carried forward**
+
+1. **`session.py` still needs A's review** — unchanged from session 12,
+   still the top of the next joint session. Both benchmarks here ran
+   against that pool and neither strains it (peak 8 connections), so this
+   is not urgent for the reason it was, but it is still a shared file
+   changed solo.
+2. **Benchmark 4 (waitlist) is the last one still off the harness**, and
+   it does not exist yet — Deadline 7. Benchmarks 2 and 3 now live in
+   `tests/concurrency/`; the threaded versions inside `check_gpus.py` and
+   `check_idempotency.py` **stay where they are on purpose.** They are
+   gates, not benchmarks: they assert, they exit non-zero, and they cover
+   the sequential cases the benchmarks deliberately skip. Carried item 5
+   is closed as to benchmarks 2 and 3; do not delete the checks.
+3. Items 7, 9, 10 and 11 are untouched by this session and still block
+   Deadline 7; item 9 (lock order vs. promotion) is still the urgent one.
+4. The in-flight ceiling still needs to reach the README (Deadline 9).
+   Benchmarks 2 and 3 are small enough that it does not bite them —
+   8 in flight against a pool of 50 — which is exactly the kind of thing
+   that makes the ceiling easy to forget.
+
 ---
 
 ## Template

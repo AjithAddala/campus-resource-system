@@ -90,12 +90,19 @@ class Result:
     """What came back. `code` is the machine-readable error code from
     `core/errors.py`, pulled out because every benchmark asserts on it and
     none of them should be parsing prose.
+
+    `body` is the decoded JSON, or None if there was none to decode.
+    Added for Benchmark 3, whose claim is *"1 reservation, identical
+    response"* -- the second half of that is a statement about response
+    BODIES, and a status code cannot carry it. Kept as the last field with
+    a default so every existing construction of `Result` is unchanged.
     """
 
     status: int | None
     code: str | None
     elapsed_ms: float
     error: str | None = None
+    body: Any = None
 
 
 @dataclass
@@ -106,11 +113,22 @@ class Peak:
     samples: list[int] = field(default_factory=list)
 
 
-def _code_of(response: httpx.Response) -> str | None:
+def _json_of(response: httpx.Response) -> Any:
+    """The decoded body, or None if it did not decode.
+
+    Parsed ONCE per response and handed to both `Result.body` and
+    `_code_of`. An earlier version decoded inside `_code_of` alone, so
+    adding `body` would have meant a second parse of all 500 bodies in
+    Benchmark 1 for a value already in hand.
+    """
     try:
-        detail = response.json().get("detail")
-    except Exception:
+        return response.json()
+    except Exception:  # noqa: BLE001 - empty or non-JSON body is not an error here
         return None
+
+
+def _code_of(payload: Any) -> str | None:
+    detail = payload.get("detail") if isinstance(payload, dict) else None
     return detail.get("code") if isinstance(detail, dict) else None
 
 
@@ -147,10 +165,12 @@ async def _one(
             elapsed_ms=(time.perf_counter() - started) * 1000,
             error=f"{type(exc).__name__}: {exc}",
         )
+    payload = _json_of(response)
     return Result(
         status=response.status_code,
-        code=_code_of(response),
+        code=_code_of(payload),
         elapsed_ms=(time.perf_counter() - started) * 1000,
+        body=payload,
     )
 
 
