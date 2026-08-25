@@ -83,9 +83,19 @@ STUDENTS = 500
 SEATS = 50
 TRIALS = 5
 # Requests allowed inside the server at once. Not a tuning knob: a
-# connection is held for the whole request (see harness.fire_async),
-# so in-flight requests ARE connections, and the pool is 50. 40 keeps
-# a margin and matches the server's worker-thread ceiling.
+# connection is held for the whole request (see harness.fire_async), so
+# in-flight requests ARE connections, and the pool is 40 + 10 = 50.
+# **40 is derived from that budget** -- it is the largest round number
+# leaving margin under 50 for the server's own bookkeeping.
+#
+# Two facts, stated separately because they happen to be the same number
+# and A read them as one at the Deadline 6 swap review: uvicorn's anyio
+# worker pool is ALSO 40. That is agreement, not derivation. If the
+# thread pool were the binding constraint, the argument in
+# `harness.fire_async` -- that the ceiling is requests in flight rather
+# than worker threads -- would be the thing that is wrong. It is not:
+# raise the thread pool and this number does not move, because the
+# connections run out first.
 IN_FLIGHT = 40
 
 made_users: list[int] = []

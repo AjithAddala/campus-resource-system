@@ -457,7 +457,13 @@ models, not the plan: `users.name` (not `full_name`),
    → **A's proposal is written**, at the end of the Deadline 6 section:
    promotion takes candidate user rows with `SKIP LOCKED` and never
    waits, so it cannot join a cycle and the global order needs no
-   exception. Still needs B.
+   exception.
+   → **B has responded** (session 15, the section after A's): agreed,
+   **on one condition** — Benchmark 4 as specified cannot see the skip
+   clause at all, because its waitlisted students are idle and no
+   candidate row is ever locked. It gains a third column that holds a
+   candidate's row and asserts promotion *completes* while it is held.
+   Ratifying still needs both people saying so.
 10. **Is joining a waitlist automatic or explicit?**
     `ARCHITECTURE_AND_WORKFLOWS.md` Workflow D falls through to the
     waitlist when an offering is full (`else → waitlist`);
@@ -474,7 +480,16 @@ models, not the plan: `users.name` (not `full_name`),
     two different things — the same defect the Deadline 5 replay-status
     decision refused. Item 7 follows: `WAITLISTED` is never written, and
     the enum value stays because removing it costs a migration and buys
-    nothing. Both still need B.
+    nothing.
+    → **B has responded** (session 15): agreed on both, with the
+    observation that `check_waitlist.py` Part 1 **already asserts the
+    explicit behaviour today** — a full offering returns
+    `409 CAPACITY_EXHAUSTED` and writes no waitlist row — so
+    auto-waitlisting would turn a currently-green assertion red. B needs
+    four interface answers item 10 does not contain before the endpoints
+    can be written: `OFFERING_NOT_FULL`, `ALREADY_WAITLISTED`,
+    `NOT_WAITLISTED`, and whether queueing counts against the
+    course-load quota (B proposes it does not).
 11. **Why does the GPU path not reproduce the stale locked read?** A
     two-session probe shows `SELECT ... FOR UPDATE` returning a stale
     `GPUCluster.allocated` exactly as it did for `CourseOffering.
@@ -489,6 +504,12 @@ models, not the plan: `users.name` (not `full_name`),
     keyword — but until this is understood, it is a precaution rather
     than a diagnosed fix. **Matters before Deadline 7**, which introduces
     the next locked read (the promotion transaction), and it is A's.
+    → **B has sharpened it into a prediction** (session 15): nothing
+    between steps (0) and (3) of `reserve_gpu` expires the cluster, so
+    the identity-map explanation predicts twelve racers all writing `2`
+    — `allocated = 2` against 12 committed reservations. A measured 8/8
+    with the counter matching `SUM(active)`. Both cannot be right, so
+    the next step is one instrumented re-run, not more argument.
 
 ---
 
@@ -3052,3 +3073,557 @@ Deadline 7. Ratified, A writes the promotion transaction and B writes the
 waitlist endpoints against a settled entry point. Item 11 remains open
 and is worth resolving in the same session, because promotion is the next
 locked read anyone writes and it is the read most likely to be bitten.
+
+---
+
+# Deadline 7 groundwork — B's side of the ratification (B)
+
+> Written before the joint session, for the same reason A's proposal was
+> written before it: arriving with a position rather than with a
+> question. **This is one half.** Items 9, 10 and 7 are ratified when
+> both people have said so, and nothing below is ratified by having been
+> written down.
+
+## The four questions A left out of the swap review
+
+A's session-14 entry records four questions asked out of the harness
+reading, and notes that the answers were never written anywhere. Three
+are answerable from the code, and are answered here rather than
+remembered.
+
+**1. Is `max_in_flight = 40` derived or coincidental?** Derived — from
+the *connection* budget, not from the thread pool. The comment at
+`tests/concurrency/benchmark_1_capacity.py` says the pool is 40 + 10
+overflow = 50 and that 40 leaves a margin under it. The agreement with
+uvicorn's 40 anyio worker threads is a second fact that happens to hold,
+not the reason for the number.
+
+A's worry was that if 40 came *from* the thread pool, then the docstring
+above it — arguing the ceiling is requests-in-flight rather than threads
+— would be the thing that is wrong. It does not, so that argument
+stands. But A was right that the comment reads ambiguously with both
+numbers at 40, and the two facts are now named separately in it.
+
+**2. What is `DBConcurrencyObserver` counting?** Every backend on this
+database in state `active`, minus its own — so it includes the
+benchmark's own bookkeeping connections and any stray `psql`, not only
+the requests under test. It is an **upper bound on our concurrency, not
+a measurement of it**, and the docstring now says so.
+
+That is still the right instrument for the claim it supports. The
+question the peak answers is *"did this run measure a lock or a pool?"*,
+and a run that asks for 40 and peaks at 3 has answered it whichever
+process the 3 belonged to. It would be the wrong instrument for a
+throughput number, and no benchmark uses it for one.
+
+**3. Has anything been checked for positional construction of `Result`?**
+Checked, not assumed: `Result(` appears at exactly two sites, both inside
+`harness.py::_one`, and both pass every field by keyword. Nothing else in
+`tests/` or `scripts/` constructs one. Adding `body` as a trailing field
+with a default was safe, and a **reordering** of the existing fields
+would still be safe today — but only by luck, and that is not worth
+relying on twice.
+
+**4. The pre-lock `User` in the identity map.** Agreed, and agreed out
+loud as A asked: harmless *here*, for a reason narrower than "role does
+not change".
+
+`get_current_user` loads the `User` during dependency resolution, before
+any lock exists. `reserve_gpu` then locks with `select(User.id)`, a Core
+select that refreshes no ORM object, so `enforce_gpu_quota` reads
+`user.role` from the pre-lock copy. It is harmless because **`role` is
+not the invariant that lock is protecting.** The invariant is held units,
+and those are read fresh under the lock by `held_gpu_units`' `SUM`. The
+stale field only selects *which policy row* to compare against, and
+entitlement has already been decided by `require_role` reading the
+database row.
+
+The line that makes this a rule rather than a coincidence: **it stops
+being harmless the moment a quota decision reads any mutable field off
+that pre-lock object.** If a per-user override ever lands on `users`, it
+must be read after the lock, not off `user`.
+
+---
+
+## Item 9 — agreed, with one condition
+
+`SKIP LOCKED` is the right shape. The alternatives A rejected are
+rejected for the right reasons, and the argument that carries it is that
+**removing the wait is stronger than ordering the wait**: a path that
+never blocks on a user row cannot appear in a cycle at all, so the global
+order needs no exception written into it and §14's "every path" claim
+survives intact.
+
+B agrees on one condition, and it is not a detail.
+
+### The condition: the mechanism must be measured, and Benchmark 4 as specified cannot see it
+
+A's proposal notes, as reassurance, that `SKIP LOCKED` *"does not affect
+Benchmark 4 as specified — 2 concurrent drops against 3 waitlisted
+students who are otherwise idle, so no candidate row is locked and order
+is preserved exactly."*
+
+That is exactly the problem. If no candidate row is ever locked, **the
+skip clause never executes**, and Deadline 7 would ship its most subtle
+mechanism with no measurement of it at all. This project has been burned
+by that shape three times and has written each one down:
+
+``` text
+Benchmark 2       passed against the build it existed to indict
+Deadline 3 rooms  green while dependencies.py was still a stub
+Session 14        8-racer room test stopped contending the exclusion
+                  constraint and WOULD STILL HAVE PASSED
+```
+
+The third is A's own finding, and it is the same failure from the same
+direction: a correct assertion that quietly stops exercising the thing it
+is named for.
+
+**So Benchmark 4 gets a third column, and the gate gets a ninth
+assertion.** Hold candidate 1's user row `FOR UPDATE` from a second
+session, then drop a seat, and assert:
+
+``` text
+the held candidate is PASSED OVER, not waited for
+the next eligible entry is promoted instead
+FIFO holds among the candidates that were not locked
+promotion COMPLETES while the row is still held   <- the actual claim
+```
+
+The fourth line is the one that matters and the one nothing else tests.
+*"Never waits"* is a claim about time, and it is only true if promotion
+returns while the lock it declined to wait for is still held by someone
+else. Hold the row for 5 seconds; promotion must finish in well under
+that. If it blocks, `SKIP LOCKED` is not doing what the design says —
+and every other assertion in Benchmark 4 would still pass.
+
+**This one is deterministic, which is worth noting given everything else
+here is measured over trials.** Benchmarks 1-3 count over trials because
+they race a sub-millisecond window and a single run is a coin flip.
+Holding a lock deliberately is not a race — the row is held or it is not
+— so this assertion needs one run, not twenty-five. A concurrency test
+that can be made deterministic should be.
+
+### Two smaller things B wants recorded with the ratification
+
+**The skip must leave a trace.** A queued student passed over for a seat
+they were first in line for is invisible: no row changes, nothing is
+written, and the next `GET /waitlist` shows them still at position 1 with
+no indication of what happened. At minimum it is logged. And the README
+says **oldest *eligible*, not oldest** — A already proposes this and B is
+holding them to it, because it is the one place where this system's
+behaviour is weaker than the obvious reading of the word "waitlist".
+
+**The scan is unbounded, and it runs holding two locks.** Promotion
+iterates candidates until one is promoted, inside the drop transaction,
+which already holds user(dropper) and the offering row. A waitlist whose
+first K candidates are all at their course-load cap means K lock attempts
+and K quota `SUM`s with the offering row held — and every registration
+for that offering queues behind it for the duration. Bounded in practice
+by waitlist length, which nothing bounds. Either cap the scan at a stated
+K and promote nobody beyond it, or accept it and say so in the README.
+B's preference is to accept and document at this scale, and to say why:
+capping introduces a seat that stays empty while eligible students are
+queued, which is a worse failure than a slow drop.
+
+---
+
+## Item 10 — agreed, and three interface questions it does not settle
+
+Explicit joining, `POST /offerings/{id}/waitlist`. A's argument is the
+one that decides it: auto-waitlisting makes a `201` from
+`POST /register` mean either "you have a seat" or "you are queued", and
+Deadline 5 already refused exactly that shape when it settled the replay
+status. `409 CAPACITY_EXHAUSTED` keeps meaning one thing.
+
+B adds one piece of evidence A's section does not have: **the assertion
+already exists and already passes.** `check_waitlist.py` Part 1 asserts
+today that a full offering returns `409 CAPACITY_EXHAUSTED` and writes
+**no** waitlist row. Auto-waitlisting would not be a new feature landing
+on untested ground; it would be a change that turns a currently-green
+assertion red. That is the cheapest possible confirmation that the two
+readings really are incompatible, and it lands on the explicit side.
+
+**Workflow D in `ARCHITECTURE_AND_WORKFLOWS.md` needs correcting** — it
+still reads `else → waitlist`. Same class of doc correction §13 needed at
+Deadline 6, and it falls in B's half of the README at Deadline 9.
+
+The endpoints are B's, so B needs three answers the item does not
+contain. Proposed here so they are settled in the same conversation
+rather than invented mid-implementation:
+
+``` text
+join a NOT-full offering     -> refuse. 409 OFFERING_NOT_FULL.
+                                A queue for an available seat is not a
+                                queue; the student should register.
+join twice                   -> 409 ALREADY_WAITLISTED, from the
+                                UNIQUE(student, offering) already on the
+                                table -- caught, not pre-checked, the
+                                same rule duplicate registration follows
+join while ACTIVELY enrolled -> 409 ALREADY_ENROLLED  (code exists)
+leave when not queued        -> 409 NOT_WAITLISTED, mirroring NOT_ENROLLED
+```
+
+**And the one that is really a quota question: queueing does not count
+against the course-load quota.** `held_course_enrollments` counts
+`ACTIVE` enrollments, and a queued student has no enrollment row at all —
+so a student at their cap of 6 may still join waitlists, and the quota is
+enforced at *promotion* time, where A's proposal already checks it and
+skips. That is the correct place for it: a waitlist entry costs nothing
+and holds nothing, so charging quota for one would refuse a student
+something they are not yet receiving.
+
+---
+
+## Item 7 — agreed, no changes
+
+`EnrollmentStatus.WAITLISTED` is never written; membership lives in
+`waitlist_entries` and nowhere else. The enum value stays, with a comment
+saying it is never written, because removing it costs a migration on
+`models/` — a shared file needing both people — and buys no behavioural
+difference.
+
+Two tables holding one fact is the failure this project has now found
+four times: the `position` column, `enrolled_count` versus the
+enrollments rows, the idempotency key versus the allocation, and this.
+Worth saying once in the README rather than four times.
+
+---
+
+## Item 11 — not B's, but the two observations cannot both mean what they appear to
+
+Not B's item, and not resolved here. But B read the GPU path closely
+enough during Deadline 6 to sharpen it into something falsifiable, which
+is more useful than carrying it forward as "unexplained" for a third
+deadline.
+
+**The prediction, if the identity map is the whole story.**
+`get_cluster` at step (0) puts the `GPUCluster` in the Session's identity
+map holding its request-start value. Nothing between step (0) and step
+(3) commits, rolls back, or expires anything — `enforce_gpu_quota` issues
+two plain SELECTs, and `idempotency.claim`'s savepoint only expires on
+the rollback path, which the capacity race never takes because it sends
+no key. So with `populate_existing()` removed, every racer should read
+its own request-start `allocated`, and the write is `cluster.allocated +=
+requested` — a read-modify-write on the stale attribute, not a SQL
+`allocated = allocated + n`.
+
+Twelve racers all starting from `allocated = 0` should therefore all pass
+the capacity gate and all write `2`, ending with **`allocated = 2`
+against 12 committed reservations** — lost updates, catastrophic, and
+exactly what the course path did with 20 of 5 seats and a counter reading
+3.
+
+**A measured the opposite** — 8/8 correct on four consecutive runs, with
+`allocated` matching `SUM(active)` every time. That reconciliation is
+what makes the result hard to wave away: it is the one check lost updates
+could not survive.
+
+So the two observations are not both measuring what they look like, and
+the cheap next step is not more reasoning. Re-run the
+no-`populate_existing()` race printing, per trial: the value read under
+the lock, `allocated` at commit, and `SUM(gpu_count)` over active rows.
+If the locked read is genuinely fresh in the request flow, then the
+two-session probe is demonstrating something narrower than "this path
+reads stale" — and that narrower sentence is what item 11 is missing.
+**A's to run**; B's contribution is the prediction it has to contradict.
+
+---
+
+# Deadline 7 — the waitlist endpoints (B)
+
+Written against items 9, 10 and 7 as **proposed by A and agreed by B**,
+both halves recorded above. A's promotion transaction does not exist yet;
+everything here is the half that can be built without it.
+
+## The offering lock is `FOR SHARE`, and that is the same argument the room gate made
+
+Joining reads `enrolled_count` to decide whether the offering is full and
+never writes it. That is exactly the distinction Deadline 3 used to give
+the room path a share lock while the GPU and registration paths take
+`FOR UPDATE`: **lock exclusively only what you write.**
+
+A share lock is still sufficient, and the reason is worth stating rather
+than assuming. `register` and `drop` both take the offering row
+`FOR UPDATE`, and `FOR SHARE` conflicts with `FOR UPDATE` — so a seat can
+neither appear nor vanish between the fullness check and the commit. What
+the share lock permits is two students joining the same full queue at
+once, which is correct: they contend on nothing, and their entries differ
+in `id` even when `created_at` collides.
+
+Taking `FOR UPDATE` here would have been the safe-looking choice and
+would have serialized every join of one offering behind every other, for
+an exclusion nothing needs.
+
+## Joining locks the user row, and the failure without it is the Benchmark 2 shape again
+
+A student's concurrent `register` and waitlist-join touch **no common
+row**: one writes an enrollment, the other a waitlist entry, and the
+offering row is shared only under a lock that permits both. Without the
+user lock the student ends up holding a seat *and* queueing for it.
+
+That is the cross-cluster GPU quota race with different nouns. The
+invariant — *a seat and a place in the queue are mutually exclusive* — is
+a fact about the **user**, and no lock on an offering can see it. The
+user row is the only thing the two paths share.
+
+It also means the duplicate-join check can be a pre-check rather than a
+caught `IntegrityError`: two joins by the same student serialize on that
+lock, so the second one reads the first one's committed row.
+`waitlist_unique` stays as the backstop, which is what would make a
+mistake here fail loudly instead of queueing one student twice.
+
+## Leaving takes the offering lock, and this is the one that is easy to miss
+
+`leave_waitlist` deletes one row and touches no counter, so it looks like
+it needs no offering lock at all. It does, and the reason is A's
+transaction rather than B's:
+
+``` text
+promotion (inside drop)          leave
+  holds offering FOR UPDATE
+  reads oldest entry = X
+                                   DELETE X        <- no lock: allowed
+  promotes X
+  COMMIT
+```
+
+Promotion would seat a student who had asked to be removed. The share
+lock makes the leave wait for the promotion to commit, after which the
+row is either already gone (promoted) or still there to delete.
+
+And the reverse direction cannot deadlock, which is item 9 doing the job
+it was proposed for: promotion takes candidate user rows `SKIP LOCKED`,
+so a promotion meeting this transaction's user lock skips that candidate
+rather than waiting on a transaction that is itself waiting on the
+offering row.
+
+## Leaving DELETES; dropping a seat does not
+
+Asymmetric with `drop`, deliberately. An enrollment must keep a
+`DROPPED` row because `enrollment_unique` is unconditional, so
+re-registration is an UPDATE. A waitlist entry carries no history anyone
+reads and **its absence is the state**.
+
+A `LEFT` status would have to be excluded from every FIFO read — the
+promotion query, the position window, the gate's row counts — and one
+forgotten exclusion promotes a student who left. Deleting removes the
+failure mode instead of documenting it.
+
+The visible consequence is that leaving is not naturally idempotent the
+way dropping is: a second `DELETE` gets `409 NOT_WAITLISTED` rather than
+replaying the same body. That is the schema being honest — there is no
+row left to describe.
+
+## `OFFERING_NOT_FULL`: the new code that could have gone either way
+
+Joining a queue for an offering that still has seats is refused rather
+than quietly accepted. Accepting it would leave a student queued behind a
+seat they could simply have taken, waiting for a promotion that only ever
+fires on a **drop** — so a queue on a half-empty section is a student
+waiting for nothing.
+
+The alternative reading (accept it, promote them at the next drop) is
+defensible but makes `position` meaningless: a student could be position
+1 in a queue for a section with four free seats. Refusing keeps the
+waitlist meaning one thing.
+
+Three codes are new at this deadline, all `409`, all with different
+remedies — which is the standing rule for why coded errors exist here:
+
+``` text
+ALREADY_WAITLISTED   you are already queued        -> nothing to do
+NOT_WAITLISTED       you are not queued            -> nothing to leave
+OFFERING_NOT_FULL    seats remain                  -> register instead
+```
+
+## Queueing costs no course-load quota
+
+`held_course_enrollments` counts ACTIVE enrollments, and a queued student
+has no enrollment row at all — so this falls out of the schema rather
+than being a policy bolted on. A student at their cap of 6 may still
+queue, and the quota is enforced at **promotion** time, where A's
+transaction checks it and skips a candidate who would breach.
+
+That is the right place for it. A waitlist entry holds nothing and costs
+nothing, so charging quota for one refuses a student something they have
+not yet received. Recorded with item 10's ratification.
+
+## Position has exactly one definition, used twice
+
+`_positions()` computes `ROW_NUMBER() OVER (ORDER BY created_at, id)` and
+is called by both `GET /waitlist` and the number reported on a successful
+join. The point is that the two cannot drift: "you are 3rd" from the join
+response means precisely what the next `GET` will say.
+
+The join reports its position **after** the commit and without a lock,
+because it is a display value. The one place a stale position would
+matter is promotion, which does not read this function at all — it
+recomputes the order under the offering lock.
+
+`DELETE` reports the position the student **held**, read before the row
+is removed. It is the last true statement about an entry that no longer
+exists, and recomputing it afterwards would report someone else's place.
+
+## The gate is red on purpose, and it says one thing rather than seven
+
+`scripts/check_waitlist.py` was written by A before either half existed,
+with Part 2 failing the moment a `/waitlist` route appeared. Shipping B's
+endpoints therefore turns it red, which is exactly what A built it to do
+— **Deadline 7 is half-built and the gate is supposed to say so.**
+
+What changed is precision. Part 2 now:
+
+- runs **12 endpoint assertions** for real, all passing, including the
+  eighth of A's original list — position moves 2 → 1 when the student
+  ahead leaves, with the row's `id` and `created_at` untouched, which is
+  what proves `ROW_NUMBER()` and not a stored column;
+- probes for promotion **behaviourally** (fill, queue, drop, count) and
+  reports its absence as **one** failure naming A's column, rather than
+  seven separate broken-looking things;
+- keeps the tripwire pointing both ways: if promotion lands while the
+  seven promotion assertions are still unwritten, that is a **failure**,
+  not a skip. A pending test that quietly passes forever is the thing the
+  file exists to prevent.
+
+---
+
+# Deadline 7 — the promotion transaction and Benchmark 4 (written by B)
+
+> **OWNERSHIP.** `EXECUTION_PLAN.md` assigns the promotion transaction to
+> A. It was written by B because A's column had not started and Deadline 7
+> could not close without it. It implements A's own proposal on item 9 as
+> written, with one addition flagged below. **A has not reviewed any of
+> it**, and that is a real cost: Deadline 10 asks each person to present
+> the other's modules, and A now has one fewer module of their own.
+
+## THE FINDING — Benchmark 4, as the plan specifies it, passes against the broken build
+
+`EXECUTION_PLAN.md` specifies Benchmark 4 as *"2 concurrent drops on a
+course with 3 waitlisted students; no offering lock -> same entry
+promoted twice / seat lost."* Built and measured, the broken build
+**passes it 15/15**:
+
+``` text
+2 droppers, 3 queued          promotions   (enrolled_count, active rows)
+------------------------------------------------------------------------
+no offering lock              {2: 15}      {(2, 2): 15}      <- PASSES
++ offering lock               {2: 15}      {(2, 2): 15}
+```
+
+This is the Benchmark 2 finding a second time, and it was found the same
+way: by building the broken build first and running it, rather than
+assuming the specified test would fail on it.
+
+**Two independent reasons, and the first one is the interesting one.**
+
+1. **`SKIP LOCKED` already prevents the double promotion.** Two drops
+   racing on one queue both read the same oldest entry — but the first to
+   take that candidate's user row keeps it, and the second is *skipped*
+   onto the next entry. So the failure the plan predicts, *"the same
+   entry promoted twice"*, cannot happen even without the offering lock.
+   The mechanism item 9 introduced to avoid a **deadlock** turns out to
+   also prevent this **double-write**, for free and by accident.
+
+   Worth stating plainly because it inverts the plan's claim: the
+   offering lock is *not* what stops the same student being promoted
+   twice. `UNIQUE(student_id, course_offering_id)` and `SKIP LOCKED` are.
+
+2. **With one promotion per drop, the counter arithmetic nets to zero.**
+   Each transaction does `enrolled_count - 1 + 1`. A lost update writes
+   back the same number it would have written anyway, so the corruption
+   is real and invisible.
+
+### What the offering lock actually protects, and the scenario that shows it
+
+`enrolled_count` — exactly as at Benchmark 1. Promotion did not change
+what that row's lock is for. Break the net-zero arithmetic by making the
+drops outnumber the queue, and the builds separate cleanly:
+
+``` text
+8 droppers, 3 queued          promotions   (enrolled_count, active rows)
+------------------------------------------------------------------------
+no offering lock              {3: 10}      {(7, 3): 10}   <- 10/10 WRONG
++ offering lock               {3: 10}      {(3, 3): 10}
+```
+
+**Seven seats recorded as taken against three real enrollments.** Every
+later registration is refused against a number that is a fiction, and
+`offering_enrollment_sane` does not catch it because 7 is still ≤ the
+capacity of 8.
+
+Both scenarios ship and both run by default. The plan's is kept
+deliberately: *"the specified test passes on the broken build"* is a
+result, not a nuisance to be re-specified away.
+
+> The generalisation, now twice-earned: **a concurrency test proves
+> nothing until the broken build has been run against it.** Deadline 5
+> learned to assert over trials rather than once; this adds that the
+> trials must also be pointed at a failure the build can actually
+> produce.
+
+## Column 3: `SKIP LOCKED`, measured deterministically
+
+B's condition on ratifying item 9 (session 15), and it found nothing
+wrong — which is the point, because nothing else runs the clause at all.
+Both scenarios above leave the queued students idle, so no candidate row
+is ever locked.
+
+Column 3 holds candidate 1's user row `FOR UPDATE` from a second session
+for five seconds, then drops a seat:
+
+``` text
+candidate 1's user row : HELD for 5s by another session
+drop returned in       : 0.05s        <- item 9's actual claim
+still queued           : [candidate 1] <- skipped, kept its place
+promoted               : [candidate 2] <- next eligible
+```
+
+`0.05s against a 5s hold` is the whole of item 9 in one number. *"Never
+waits"* is a claim about time, and this is the only assertion in the
+project that measures it.
+
+**Deterministic on purpose.** Benchmarks 1-3 count over trials because
+they race a sub-millisecond window where a single run is a coin flip.
+Holding a lock is not a race — the row is held or it is not — so this
+runs once. A concurrency test that can be made deterministic should be.
+
+## The addition to A's proposal: promotion also skips a schedule clash
+
+A's proposal skips a candidate whose **course-load quota** would breach,
+following the Deadline 7 spec. It says nothing about **schedule
+conflicts** — and without that check, promotion can seat a student in a
+class that clashes with one they already hold, which `register` refuses
+outright. The same illegal state, reached through a different door.
+
+A schedule clash is a fact about the student, guarded by the user lock,
+for exactly the reason a quota is. Both are now checked, and a candidate
+failing either is *skipped* rather than refused, because "refuse" has no
+meaning on a path nobody is waiting on.
+
+**Flagged rather than folded in silently:** it widens the eligibility
+rule that item 9 defined, so A should agree with it explicitly. It is one
+call to `_conflicting_offering`, the same helper `register` uses.
+
+## Every skip is logged
+
+The other half of B's condition. A student passed over changes no row —
+no status, no timestamp, nothing — so without a log line a student can
+lose their turn with no record anywhere that it happened. All three skip
+reasons log at INFO with the entry id, the student id and the offering:
+`user row busy`, `course-load quota`, `clashes with offering N`.
+
+This is what makes *"the promise is oldest **eligible**, not oldest"* an
+auditable statement rather than a disclaimer.
+
+## The seat moves; it is never released and re-taken
+
+Promotion runs **inside** the drop transaction, holding the two locks the
+drop already took. The counter goes `-1` for the drop and `+1` for the
+promotion before a single commit, so there is no instant at which the
+freed seat is visible to an ordinary `register`. A queued student cannot
+lose their seat to someone who happened to be refreshing the page.
+
+That is also why the reconciliation assertion is the sharp one: the seat
+moving atomically means `enrolled_count` and the ACTIVE row count must
+agree after every trial, and the broken build is caught precisely there.

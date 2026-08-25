@@ -10,14 +10,22 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-6 MET.** Deadline 6 closed on the joint SWAP
+> **Status: Deadlines 1-7 MET.** Deadline 6 closed on the joint SWAP
 > REVIEW being held, after B session 13 (Benchmarks 2 and 3) and A
 > session 14 (quota rollout, admin endpoints, `GET /me/quota`, plus A's
 > review of B's solo change to `session.py` — approved, two findings).
 >
-> Deadline 7 is blocked on outstanding items 7, 9 and 10 in
-> `DECISIONS.md`, all joint calls. Item 9 — the global lock order versus
-> waitlist promotion — is A's transaction and the urgent one.**
+> Deadline 7 turned on outstanding items 7, 9 and 10 in `DECISIONS.md`,
+> all joint calls, item 9 — the global lock order versus waitlist
+> promotion — being the load-bearing one.
+>
+> **Both positions are written** (A session 14, B session 15) and they
+> agree on all three. **Deadline 7 was then built against that agreement
+> without the ratifying conversation having happened** (B, sessions 16
+> and 17) — endpoints, promotion transaction and Benchmark 4. The three
+> items are therefore settled in code and unratified on paper, which is
+> the wrong way round. Ratifying them now is confirmation rather than
+> decision, and A still owes a review of the promotion transaction.
 
 ## 0. Scope
 
@@ -472,10 +480,15 @@ Benchmark 2 is your strongest artifact: the fix is not "add a lock" -
 the resource lock was already correct. It was the **wrong lock for that
 invariant**. Both of you must be able to say this unprompted.
 
-### Deadline 7 - Waitlist (a fourth concurrency problem)
+### Deadline 7 - Waitlist (a fourth concurrency problem)  ✅ MET (sessions 16, 17)
 
 ``` text
-A      promotion transaction. The race: two students drop the same
+A ✅   promotion transaction -- **WRITTEN BY B, session 17**, because A's
+       column had not started and the deadline could not close. Follows
+       A's own item-9 proposal exactly, plus one flagged addition: a
+       candidate whose SCHEDULE clashes is skipped as well as one whose
+       quota would breach. A has not reviewed it.
+       The race: two students drop the same
        offering simultaneously, and both promote the SAME waitlist entry.
        LOCK the offering row -> read oldest entry
        (ORDER BY created_at, id -- no position column; the id tiebreak
@@ -484,17 +497,49 @@ A      promotion transaction. The race: two students drop the same
        -> check that student's course-load quota
        -> if it would breach, skip to the next eligible entry
        -> promote exactly one: DELETE its waitlist row, no renumbering
-B      waitlist endpoints: join on full course, leave, GET waitlist
+B ✅   waitlist endpoints: join on full course, leave, GET waitlist
        (position is a display value: ROW_NUMBER() OVER (ORDER BY
         created_at, id) at read time, never stored)
-       BENCHMARK 4 (waitlist): 2 concurrent drops on a course with 3
+       POST/DELETE/GET on one path, /offerings/{id}/waitlist. Locks are
+       user FOR UPDATE then offering FOR SHARE -- the global order, and
+       a share lock because this path READS enrolled_count and never
+       writes it, the same distinction the room gate makes.
+       Three new codes: OFFERING_NOT_FULL, ALREADY_WAITLISTED,
+       NOT_WAITLISTED. Queueing costs no course-load quota; it holds
+       nothing, and promotion is where the quota is enforced.
+       check_waitlist.py Part 2: 12 endpoint assertions written and
+       passing, including the ROW_NUMBER one (position moves 2 -> 1
+       when the student ahead leaves, row untouched).
+B ✅   BENCHMARK 4 (waitlist): 2 concurrent drops on a course with 3
          waitlisted students
          no offering lock -> same entry promoted twice / seat lost
          with lock        -> exactly 2 distinct promotions, order preserved
+       THIS SCENARIO DOES NOT SEPARATE THE BUILDS. Measured: the broken
+       build PASSES it 15/15. SKIP LOCKED already stops the same entry
+       being promoted twice, and one promotion per drop makes the
+       counter arithmetic net to zero, so the lost update is invisible.
+       Benchmark 2's finding, a second time.
+       THE SCENARIO THAT DOES: 8 droppers, 3 queued -- the arithmetic
+       stops netting out and enrolled_count lands on 7 against 3 real
+       enrollments, 10/10 trials. Both ship; both run by default.
+       THIRD COLUMN, added by B's response to item 9: hold a candidate's
+       user row FOR UPDATE from another session. Measured -- the held
+       candidate is skipped, the next eligible one is promoted, and the
+       drop RETURNS IN 0.05s AGAINST A 5s HOLD. That number is item 9's
+       entire claim, and nothing else in the project measures it.
 ```
 
 **Checkpoint:** promotion follows FIFO, respects quota, and never
-double-promotes under concurrent drops.
+double-promotes under concurrent drops. — **All three verified**
+(`scripts/check_waitlist.py`, 27 assertions in Part 2, plus Benchmark 4).
+
+> **Deadline 7 status: MET, with one thing that is not a checkpoint item
+> and does not reopen it.** Both columns were written by B, in sessions
+> 16 and 17, because A's had not started. The plan's whole premise is
+> that *each person's benchmark is the proof of the other's work*, and
+> for this deadline that did not happen. **A should review the promotion
+> transaction before Deadline 10**, where the cross-presentation assumes
+> each person has modules of their own to be questioned on.
 
 ### Deadline 8 - FEATURE FREEZE
 

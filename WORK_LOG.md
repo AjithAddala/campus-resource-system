@@ -1954,6 +1954,462 @@ which closes the third line of the column and the deadline with it.
 
 ---
 
+## Session 15 — 2026-08-25 — B
+
+**Advances:** **Not** Deadline 7. This session did the things that stand
+*between* Deadline 6 and Deadline 7 — B's half of the ratification, and
+the two answers A asked for that had never been written down. No waitlist
+code exists at the end of it, deliberately: items 9, 10 and 7 are still
+unratified and writing endpoints against an unsettled entry point is the
+thing the blocker exists to prevent.
+
+**Plan:** answer A's four swap-review questions in `DECISIONS.md` while
+they are still cheap to answer, take a position on A's proposal for items
+9, 10 and 7 so the joint session is a decision rather than a briefing,
+and fix whatever the answers turned out to be about.
+
+**Shipped**
+
+- `DECISIONS.md` — new section, *Deadline 7 groundwork: B's side of the
+  ratification*. Three parts: the four answers, B's response to items 9,
+  10 and 7, and a falsifiable prediction for item 11.
+- `tests/concurrency/harness.py` — `DBConcurrencyObserver` now documents
+  **what it counts**: every `active` backend on the database minus its
+  own, so the peak is an upper bound on the concurrency of the requests
+  under test, not a measurement of it. A asked; the docstring implied
+  narrower than the SQL does.
+- `tests/concurrency/benchmark_1_capacity.py` — the `IN_FLIGHT = 40`
+  comment now states the connection budget and the anyio worker ceiling
+  as **two facts that agree**, rather than one. They are both 40 and A
+  read them as one derivation.
+
+**The position, in one line each**
+
+``` text
+item 9   AGREED -- SKIP LOCKED, with one condition (below)
+item 10  AGREED -- explicit join, plus 4 interface answers B needs
+item 7   AGREED -- WAITLISTED never written, enum value stays
+item 11  not B's; the prediction is now sharp enough to falsify
+```
+
+**THE CONDITION ON ITEM 9 — Benchmark 4 as specified cannot see the
+mechanism item 9 adds**
+
+A's proposal notes as *reassurance* that `SKIP LOCKED` does not affect
+Benchmark 4, because its three waitlisted students are idle and no
+candidate row is ever locked. That is the problem. If no candidate row is
+locked the skip clause never executes, and Deadline 7 would ship its most
+subtle mechanism with no measurement of it at all.
+
+This project has now recorded that exact shape three times — Benchmark 2
+passing against the build it indicts, the room checks green against a
+stub `dependencies.py`, and A's own session-14 finding where the 8-racer
+room test stopped contending the exclusion constraint **and would still
+have passed**.
+
+So: a third column on Benchmark 4 and a ninth assertion on the gate. Hold
+candidate 1's user row `FOR UPDATE` from a second session, drop a seat,
+and assert the held candidate is passed over, the next eligible one is
+promoted, FIFO holds among the rest — and that **promotion completes
+while the row is still held**, which is the actual claim of item 9 and
+the only one nothing else tests.
+
+It is also the one assertion here that is **deterministic**. Benchmarks
+1-3 count over trials because they race a sub-millisecond window; holding
+a lock on purpose is not a race, so this needs one run rather than
+twenty-five.
+
+**Verification run**
+
+``` text
+pytest tests/concurrency/test_harness.py -q        -> 6 passed in 3.75s
+python -c "import harness, benchmark_1"            -> imports OK,
+                                                      IN_FLIGHT = 40,
+                                                      Result fields unchanged
+                                                      (status, code,
+                                                       elapsed_ms, error, body)
+scripts/check_waitlist.py                          -> all Part 1 PASS,
+                                                      8 promotion assertions
+                                                      still PENDING
+```
+
+The one claim in the new `DECISIONS.md` section that rests on a live
+result was re-run rather than quoted:
+
+``` text
+PASS  full offering -> 409 CAPACITY_EXHAUSTED, not a silent waitlist
+PASS  the refused registration created NO waitlist row  -> 0 rows
+```
+
+That is the evidence for item 10 that A's section does not have:
+auto-waitlisting would not be a feature landing on untested ground, it
+would turn a **currently-green assertion red**.
+
+Not re-run this session: the other six `check_*.py` gates and Benchmarks
+1-3. Nothing touched application code — the only edits were two comments
+and a docstring — so the regression surface is a docstring, and claiming
+a full-suite pass without running one would be the habit this log exists
+to prevent.
+
+**Cost incurred** — none worth recording. One stack restart; the
+containers had been brought down between sessions.
+
+**Deadline 7 status: NOT STARTED, and still blocked on the same three
+items.** What changed is that the blocker is now one conversation rather
+than one conversation plus the preparation for it. Both halves are
+written: A's proposal at the end of the Deadline 6 section, B's response
+immediately after it. Ratification needs both people saying so out loud;
+neither section ratifies anything by existing.
+
+**Open / carried forward**
+
+1. **Items 9, 10, 7 — ratify.** Both positions are now on paper and they
+   agree on all three. What is left is the condition on item 9 (the third
+   Benchmark 4 column) and the four interface answers B needs for the
+   endpoints — `OFFERING_NOT_FULL`, `ALREADY_WAITLISTED`,
+   `NOT_WAITLISTED`, and *queueing does not count against the course-load
+   quota*. Those four are new codes and new semantics, so they are a
+   joint call and not B's to assume.
+2. **Workflow D in `ARCHITECTURE_AND_WORKFLOWS.md` still reads
+   `else → waitlist`** and contradicts item 10 as proposed. It is a
+   correction, not a rewrite, and it belongs in B's half of the README at
+   Deadline 9.
+3. **Item 11 is A's, and the next step is now a measurement rather than
+   an argument.** B's prediction: with `populate_existing()` removed,
+   nothing between step (0) and step (3) of `reserve_gpu` expires the
+   cluster, so twelve racers should all read their request-start
+   `allocated` and all write `2` — lost updates, `allocated = 2` against
+   12 committed reservations. A measured 8/8 correct with the counter
+   matching `SUM(active)`. Both cannot be right. Re-run printing the
+   locked read, the committed counter and the active SUM per trial.
+4. **The gates still import the server-sized `SessionLocal`** — A's
+   finding 2 from the `session.py` review, latent rather than live, and
+   joint because the fix touches B's scripts. Due before the Deadline 9
+   clean-room run.
+5. **Benchmark 4 does not exist** (Deadline 7), and now has a third
+   column specified before it is written.
+6. **`POST /courses` / `POST /offerings` still belong to no deadline.**
+   Four scripts now create offerings by direct insert. The waitlist gate
+   is the fourth.
+7. **The in-flight ceiling still needs to reach the README** (Deadline
+   9), and there is still no README.
+
+---
+
+## Session 16 — 2026-08-25 — B
+
+**Advances:** Deadline 7 (Waitlist) — **B's endpoint column, complete.**
+Benchmark 4 is not started and cannot be: there is nothing to measure
+until A's promotion transaction exists.
+
+**Plan:** build the waitlist endpoints against items 9, 10 and 7 as
+proposed by A and agreed by B in session 15, and make
+`scripts/check_waitlist.py` Part 2 tell the truth about what now exists.
+
+**Shipped**
+
+- `app/courses/service.py` — `join_waitlist`, `leave_waitlist`,
+  `list_waitlist`, `_positions`, and three exceptions
+  (`OfferingNotFull`, `AlreadyWaitlisted`, `NotWaitlisted`).
+- `app/courses/router.py` — `POST` / `DELETE` / `GET` on one path,
+  `/offerings/{id}/waitlist`. Join and leave are STUDENT-only; the read
+  is open to any authenticated role.
+- `app/courses/schemas.py` — `WaitlistEntryRead`, carrying `position`,
+  which is not an attribute of the model and never will be.
+- `scripts/check_waitlist.py` — Part 2's endpoint half implemented: 12
+  assertions, all passing.
+- Three new error codes: `OFFERING_NOT_FULL`, `ALREADY_WAITLISTED`,
+  `NOT_WAITLISTED`.
+- `ARCHITECTURE_AND_WORKFLOWS.md` — **Workflow D corrected** (it still
+  read `else → waitlist`), new Workflow F, three codes in §7, two rows in
+  the role matrix.
+
+28 → 31 routes. **No migration**: `WaitlistEntry` shipped at Deadline 1
+and `alembic check` reports no drift.
+
+**The locking, in one line each**
+
+``` text
+join    user FOR UPDATE -> offering FOR SHARE -> INSERT
+leave   user FOR UPDATE -> offering FOR SHARE -> DELETE
+GET     no lock at all
+```
+
+`FOR SHARE` on the offering because both paths **read** `enrolled_count`
+and never write it — the same distinction that gave the room gate a share
+lock at Deadline 3. It still excludes `register` and `drop`, which take
+`FOR UPDATE`, so a seat can neither appear nor vanish inside the
+transaction. Locking exclusively would have serialized every join of one
+offering behind every other for an exclusion nothing needs.
+
+**The user lock on join is the Benchmark 2 shape with different nouns.** A
+student's concurrent `register` and waitlist-join touch no common row —
+one writes an enrollment, the other a waitlist entry — so without it the
+student ends up holding a seat *and* queueing for it. The invariant is a
+fact about the **user**, and no lock on an offering can see it.
+
+**THE FINDING — `leave` needs the offering lock, and it is A's
+transaction that makes it necessary**
+
+Leaving deletes one row and touches no counter, so it looks like it needs
+no offering lock at all. It does:
+
+``` text
+promotion (inside drop)          leave
+  holds offering FOR UPDATE
+  reads oldest entry = X
+                                   DELETE X      <- unlocked: allowed
+  promotes X, COMMIT
+```
+
+Promotion would seat a student who had asked to be removed. The share
+lock makes the leave wait for the promotion to commit, after which the
+row is either already gone or still there to delete. Nothing in B's own
+column would have surfaced this — it is only visible from A's side of the
+deadline, which is what the swap review was for.
+
+The reverse direction cannot deadlock, and that is item 9 doing the job
+it was proposed for: promotion takes candidate user rows `SKIP LOCKED`,
+so a promotion meeting this transaction's user lock skips the candidate
+instead of waiting on a transaction that is itself waiting on the
+offering row.
+
+**Verification run**
+
+``` text
+scripts/check_waitlist.py
+  PART 1  all pass (unchanged)
+  PART 2  12 endpoint assertions PASS:
+            join a full offering            -> 201, position 1
+            second joiner                   -> position 2
+            GET waitlist                    -> [(s1,1), (s2,2)], oldest first
+            joining twice                   -> 409 ALREADY_WAITLISTED
+            the student holding the seat    -> 409 ALREADY_ENROLLED
+            joining a NOT-full offering     -> 409 OFFERING_NOT_FULL
+            FACULTY token on join           -> 403
+            GET on a nonexistent offering   -> 404, not []
+            leave                           -> 200 with the position held
+            position from ROW_NUMBER()      -> moved 2 -> 1, row untouched
+            leaving twice                   -> 409 NOT_WAITLISTED
+          1 FAIL, deliberate:
+            promotion runs when a seat is dropped (A's column)
+          7 promotion assertions PENDING
+
+full regression, all seven other gates:
+  check_jwt / check_auth / check_rbac / check_rooms /
+  check_gpus / check_courses / check_idempotency / check_quotas -> all pass
+pytest tests/ -q      -> 6 passed
+alembic check         -> no drift, head 1ca8b85b7626
+```
+
+**The gate is red, and that is the gate working.** A wrote
+`check_waitlist.py` before either half existed, with Part 2 failing the
+moment a `/waitlist` route appeared — precisely so that a half-built
+Deadline 7 could not sit unnoticed. Shipping B's endpoints triggers it.
+
+What changed is precision, not the tripwire. Part 2 now probes for
+promotion **behaviourally** — fill a seat, queue a student, drop it,
+count what is left — and reports its absence as **one** failure naming
+A's column, rather than seven separate broken-looking things. And it
+still points both ways: if promotion lands while those seven assertions
+are unwritten, that is a failure, not a skip.
+
+**Cost incurred** — none worth recording.
+
+**Deadline 7 status: still open, half-built.** B's column is complete and
+asserted. A's promotion transaction is not started, and Benchmark 4 is
+blocked behind it.
+
+**Open / carried forward**
+
+1. **A's promotion transaction is the whole remaining critical path.**
+   Items 9, 10 and 7 have both positions written and agreeing, but
+   **ratification is still a conversation that has not happened.** B has
+   now built against the proposal, which raises the cost of changing it —
+   worth saying plainly rather than letting it be discovered: if item 10
+   is reopened and joining becomes automatic, three endpoints and 12
+   assertions move.
+2. **Benchmark 4 needs A's transaction, and it needs the third column**
+   agreed in session 15: hold a candidate's user row from another session
+   and assert promotion *completes* while it is held. The two idle-student
+   columns in the plan never exercise `SKIP LOCKED` at all.
+3. **The seven promotion assertions in Part 2 are written as skips and
+   must be implemented against A's transaction** the moment it lands. The
+   gate fails if they are not.
+4. **`POST /courses` / `POST /offerings` still belong to no deadline.**
+   Now five scripts create offerings by direct insert.
+5. **The gates still import the server-sized `SessionLocal`** — joint fix,
+   due before the Deadline 9 clean-room run.
+6. **Item 11 is still A's**, with B's falsifiable prediction from session
+   15 waiting on one instrumented re-run.
+7. **Still no README**, and the in-flight ceiling still needs to reach it
+   (Deadline 9).
+
+---
+
+## Session 17 — 2026-08-25 — B (writing A's column)
+
+**Advances:** Deadline 7 (Waitlist) — **MET.** The promotion transaction,
+the seven promotion assertions, and Benchmark 4.
+
+**Plan:** clear what was blocking Deadline 7. The blocker was A's
+promotion transaction, which had not started.
+
+> **This session crossed the ownership line, deliberately and on
+> instruction.** `EXECUTION_PLAN.md` assigns the promotion transaction to
+> A. B wrote it. The plan's premise is that *each person's benchmark is
+> the proof of the other's work*, and for this deadline that did not
+> happen — B wrote the endpoints, the transaction, the gate and the
+> benchmark. **A should review `_promote_one` before Deadline 10**, where
+> the cross-presentation assumes each person has modules of their own.
+
+**Shipped**
+
+- `app/courses/service.py` — `_promote_one`, called from inside `drop`
+  while it holds both of its locks. Implements A's item-9 proposal:
+  candidates oldest-first, each one's user row attempted `FOR UPDATE
+  SKIP LOCKED`, skipped if unavailable or ineligible, exactly one
+  promoted.
+- `drop` now takes its offering lock conditionally, behind
+  `BENCHMARK_UNSAFE_NO_OFFERING_LOCK`, so Benchmark 4 has a broken build
+  to measure.
+- `scripts/check_waitlist.py` — Part 2 complete: **27 assertions**, all
+  passing. The seven promotion ones plus an eighth for `SKIP LOCKED`.
+- `tests/concurrency/benchmark_4_waitlist.py` — two scenarios and a
+  deterministic third column.
+
+**THE FINDING — Benchmark 4 as specified passes against the broken
+build**
+
+The plan specifies *"2 concurrent drops on a course with 3 waitlisted
+students; no offering lock -> same entry promoted twice / seat lost."*
+Built the broken build first and ran it, as `DECISIONS.md` requires. It
+**passes 15/15**:
+
+``` text
+2 droppers, 3 queued        promotions   (enrolled_count, active rows)
+----------------------------------------------------------------------
+no offering lock            {2: 15}      {(2, 2): 15}      <- PASSES
++ offering lock             {2: 15}      {(2, 2): 15}
+```
+
+Two reasons, and the first inverts the plan's claim:
+
+1. **`SKIP LOCKED` already prevents the double promotion.** Two drops
+   racing on one queue both read the same oldest entry, but the first to
+   take that candidate's user row keeps it and the second is skipped onto
+   the next. The mechanism item 9 introduced to avoid a **deadlock** also
+   prevents this **double-write**, by accident. The offering lock is not
+   what stops the same entry being promoted twice.
+2. **One promotion per drop makes the counter arithmetic net to zero** —
+   `enrolled_count - 1 + 1` — so the lost update writes back the number
+   it would have written anyway and the corruption is invisible.
+
+This is Benchmark 2's finding a second time, found the same way.
+
+**The scenario that does separate them:** make the drops outnumber the
+queue.
+
+``` text
+8 droppers, 3 queued        promotions   (enrolled_count, active rows)
+----------------------------------------------------------------------
+no offering lock            {3: 10}      {(7, 3): 10}   <- 10/10 WRONG
++ offering lock             {3: 10}      {(3, 3): 10}
+```
+
+Seven seats recorded against three real enrollments, and
+`offering_enrollment_sane` does not catch it because 7 ≤ 8. Both
+scenarios ship and both run by default — *"the specified test passes on
+the broken build"* is a result, not something to re-specify away.
+
+**COLUMN 3 — the one the plan did not ask for, and item 9's only real
+measurement**
+
+``` text
+candidate 1's user row : HELD for 5s by another session
+drop returned in       : 0.05s     <- "promotion never waits", measured
+still queued           : [candidate 1]   skipped, kept its place
+promoted               : [candidate 2]   next eligible
+```
+
+Both scenarios above leave the queued students idle, so no candidate row
+is ever locked and the skip clause never executes. Without this column
+`SKIP LOCKED` would have shipped with no measurement at all — B's
+condition on ratifying item 9, and the reason it was a condition.
+
+Deterministic on purpose: holding a lock is not a race, so one run, not
+twenty-five.
+
+**One addition beyond A's proposal, flagged not folded in:** promotion
+also skips a candidate whose **schedule** clashes, not only one whose
+quota would breach. Without it, promotion can seat a student in a class
+that clashes with one they hold — a state `register` refuses outright,
+reached through a different door. It widens the eligibility rule item 9
+defined, so A should agree to it explicitly.
+
+**Verification run**
+
+``` text
+scripts/check_waitlist.py     -> PART 1 all pass, PART 2 27/27 pass
+  promotion follows FIFO by (created_at, id)
+  promotion DELETES the waitlist row, renumbering nothing
+  promoted student's enrollment is an UPDATE of the DROPPED row
+  the seat moved rather than vanishing: counter == active rows
+  a student at their course cap may still QUEUE
+  promotion respects the promoted student's course-load quota
+  a quota-breaching candidate is SKIPPED, next eligible promoted
+  2 concurrent drops -> exactly 2 DISTINCT promotions
+  2 concurrent drops -> no entry promoted twice
+  a candidate whose user row is LOCKED is skipped, not waited for
+  the next eligible entry is promoted instead
+  promotion COMPLETES while the row is still held  -> 0.06s vs 5s hold
+
+benchmark_4_waitlist          -> PASS (both scenarios + column 3)
+benchmark_1 / 2 / 3           -> PASS
+all nine gates                -> PASS
+pytest tests/ -q              -> 6 passed
+alembic check                 -> no drift, head 1ca8b85b7626
+```
+
+**Cost incurred**
+
+- **My own benchmark leaked rows.** `column_three` runs after the last
+  scenario, but `cleanup()` was inside `run()`'s `finally` — so column
+  3's users and offering survived, and the next three gates failed on
+  their "test users removed" assertions rather than on anything real.
+  Cleanup now lives in `main`, in a `finally`, after everything that
+  makes rows. The database was cleaned by hand once.
+  Worth recording because it is the same shape as session 14's
+  self-inflicted loop: a broken *test fixture* reading as a broken
+  *system*.
+
+**Deadline 7 status: MET.** Promotion follows FIFO, respects quota, and
+never double-promotes under concurrent drops — all three asserted, plus
+the reconciliation and the `SKIP LOCKED` timing.
+
+**Open / carried forward**
+
+1. **A owes a review of `_promote_one`**, and the ratification of items
+   9, 10 and 7 is now a confirmation of what is already built rather
+   than a decision. That is the wrong way round and it is worth saying
+   out loud rather than letting the code stand as the record.
+2. **The schedule-conflict skip needs A's explicit agreement** — it
+   widens item 9's eligibility rule.
+3. **Deadline 8 is FEATURE FREEZE and is next.** The integration pass,
+   the `enrolled_count` reconciliation query after Benchmark 1 (B's), and
+   a re-run of all four benchmarks for final numbers.
+4. **The gates still import the server-sized `SessionLocal`** — joint,
+   due before the Deadline 9 clean-room run.
+5. **`POST /courses` / `POST /offerings` still belong to no deadline.**
+   Six scripts now create offerings by direct insert. If they are not
+   going to exist, that should be a written decision rather than a gap.
+6. **Item 11 is still A's**, with B's falsifiable prediction from
+   session 15 waiting on one instrumented re-run.
+7. **Still no README.** All four benchmark tables now have real measured
+   numbers, so B's half of Deadline 9 is unblocked in full.
+
+---
+
 ## Template
 
 ```markdown

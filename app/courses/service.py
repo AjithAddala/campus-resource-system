@@ -1,12 +1,19 @@
-from sqlalchemy import select
+import logging
+
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
 from app.models.course import Course, CourseOffering
-from app.models.enrollment import Enrollment
+from app.models.enrollment import Enrollment, WaitlistEntry
 from app.models.enums import EnrollmentStatus
 from app.models.user import User
 from app.quotas import service as quotas
+
+# Promotion passes candidates over silently -- no row changes when a
+# student is skipped -- so the skip is logged. Without it a student can
+# lose their turn in the queue with no record anywhere that it happened.
+log = logging.getLogger(__name__)
 
 
 def list_courses(db: Session) -> list[Course]:
@@ -285,12 +292,20 @@ def drop(db: Session, offering_id: int, student: User) -> Enrollment | None:
 
     db.execute(select(User.id).where(User.id == student.id).with_for_update())
 
-    locked = db.execute(
+    # Benchmark 4's broken column removes ONLY this lock, exactly as
+    # Benchmark 1 does for `register`. Everything else -- including
+    # `populate_existing()` -- stays, so the broken build reads a FRESH
+    # waitlist and still promotes the same entry twice: two droppers each
+    # read the same oldest candidate because nothing serialized them on
+    # the offering row. Default is locked.
+    seat_read = (
         select(CourseOffering)
         .where(CourseOffering.id == offering_id)
-        .with_for_update()
         .execution_options(populate_existing=True)
-    ).scalar_one()
+    )
+    if not get_settings().BENCHMARK_UNSAFE_NO_OFFERING_LOCK:
+        seat_read = seat_read.with_for_update()
+    locked = db.execute(seat_read).scalar_one()
 
     enrollment = db.execute(
         select(Enrollment).where(
@@ -307,6 +322,511 @@ def drop(db: Session, offering_id: int, student: User) -> Enrollment | None:
 
     enrollment.status = EnrollmentStatus.DROPPED
     locked.enrolled_count -= 1
+
+    # --- PROMOTION, Deadline 7 ------------------------------------------
+    # In THIS transaction, holding both locks the drop already took. The
+    # seat is not released and then re-taken: it moves from one student to
+    # another atomically, so there is never a moment when a queued student
+    # could lose it to an ordinary registration.
+    _promote_one(db, locked)
+
     db.commit()
     db.refresh(enrollment)
     return enrollment
+
+
+# ---------------------------------------------------------------------------
+# Waitlist — Deadline 7, B's column (the endpoints; promotion is A's)
+# ---------------------------------------------------------------------------
+#
+# Joining is EXPLICIT: `POST /offerings/{id}/waitlist`, never a
+# fall-through from a full `register`. Outstanding item 10, A's proposal
+# and B's response both agreeing, because auto-waitlisting would make one
+# `201` from `register` mean either "you have a seat" or "you are queued"
+# -- the same defect Deadline 5 refused when it settled the replay status.
+#
+# Item 7 follows and is enforced by construction: no code path below
+# writes `EnrollmentStatus.WAITLISTED`. A queued student has a row in
+# `waitlist_entries` and nothing else. Putting the same fact in two tables
+# is the failure this project has now found four times.
+
+
+class OfferingNotFull(Exception):
+    """Tried to queue for an offering that still has seats.
+
+    Refused rather than silently accepted: a queue for an available seat
+    is not a queue, and a student holding a waitlist entry on a section
+    they could simply register for would be waiting for a promotion that
+    only fires on a DROP. The remedy is to register.
+    """
+
+    def __init__(self, capacity: int, enrolled: int):
+        self.capacity = capacity
+        self.enrolled = enrolled
+        super().__init__(f"{enrolled}/{capacity} seats taken, not full")
+
+
+class AlreadyWaitlisted(Exception):
+    """The student already holds a waitlist entry for this offering."""
+
+
+class NotWaitlisted(Exception):
+    """Leave was called by a student with no waitlist entry here."""
+
+
+def _positions(db: Session, offering_id: int) -> list[tuple[WaitlistEntry, int]]:
+    """Every entry for one offering, oldest first, paired with its position.
+
+    **Position is computed at read time and never stored.** There is no
+    `position` column -- it was dropped in revision `c86676652ca2` -- and
+    its absence is load-bearing rather than a simplification: renumbering
+    a stored position after a promotion transiently violates a unique
+    constraint mid-UPDATE, and every row after the promoted one would have
+    to be rewritten. `ROW_NUMBER()` makes a promotion touch exactly one
+    row: the one it deletes.
+
+    **`ORDER BY created_at, id`, and the `id` tiebreak is the whole
+    guarantee, not a formality.** `func.now()` is TRANSACTION start time,
+    so entries written inside one transaction share a `created_at` to the
+    microsecond and `created_at` alone cannot express FIFO between them.
+    `scripts/check_waitlist.py` Part 1 proves that against the live
+    database rather than asserting it in prose.
+
+    One definition of position, used by both the GET endpoint and the
+    number reported on a successful join -- so the two can never drift.
+    """
+    position = (
+        func.row_number()
+        .over(order_by=(WaitlistEntry.created_at, WaitlistEntry.id))
+        .label("position")
+    )
+    rows = db.execute(
+        select(WaitlistEntry, position)
+        .where(WaitlistEntry.course_offering_id == offering_id)
+        .order_by(WaitlistEntry.created_at, WaitlistEntry.id)
+    ).all()
+    return [(entry, pos) for entry, pos in rows]
+
+
+def list_waitlist(
+    db: Session, offering_id: int
+) -> list[tuple[WaitlistEntry, int]] | None:
+    """The queue for an offering. None if the offering does not exist.
+
+    **Read-only, and it takes no lock** -- the same rule `GET /me/quota`
+    follows. A position shown to a caller is a display value that may be
+    stale by the time they read it; the promotion transaction is what has
+    to be right, and it recomputes the order under the offering lock.
+    Taking a lock here would serialize browsing against promoting and buy
+    a number that is stale anyway the moment it is serialized.
+    """
+    if get_offering(db, offering_id) is None:
+        return None
+    return _positions(db, offering_id)
+
+
+def join_waitlist(
+    db: Session, offering_id: int, student: User
+) -> tuple[WaitlistEntry, int] | None:
+    """Queue for a seat in a FULL offering. None if the offering does not exist.
+
+    Raises `AlreadyEnrolled`, `AlreadyWaitlisted` or `OfferingNotFull`.
+
+    ==================================================================
+    LOCK ORDER -- USER ROW FIRST, OFFERING ROW SECOND. AS EVERYWHERE.
+    ==================================================================
+    Same global order as allocation, registration and cancellation, and
+    it matters more here than anywhere else in B's code: Deadline 7 is
+    the deadline where a second path starts touching two user rows, and
+    outstanding item 9 exists because promotion cannot obey this order.
+    Every path that CAN obey it must, or the argument that promotion is
+    the sole exception stops being true.
+
+      (1) LOCK the student's user row   FOR UPDATE
+      (2) LOCK the offering row         FOR SHARE
+      (3) INSERT the entry, COMMIT
+
+    **Why the user row is locked at all.** Without it, a student's
+    concurrent `register` and `join_waitlist` touch no common row: the
+    register writes an enrollment, the join writes a waitlist entry, and
+    the student ends up holding a seat AND queueing for it. That is the
+    two-tables-one-fact failure again, arriving through a race rather
+    than through a schema choice. The user row is the only thing both
+    paths share, exactly as it is for the cross-cluster GPU quota.
+
+    **Why the offering row is FOR SHARE and not FOR UPDATE.** This
+    transaction READS the offering to decide fullness and never writes
+    it -- the same distinction that made the room gate a share lock at
+    Deadline 3, while the GPU and registration gates take FOR UPDATE
+    because they write `allocated` / `enrolled_count`. A share lock still
+    excludes the writers, which is the whole requirement: `register` and
+    `drop` both take FOR UPDATE, so a seat cannot appear or vanish
+    between the fullness check below and this transaction's commit.
+
+    **What FOR SHARE buys against promotion, specifically.** Promotion
+    runs inside `drop`, holding the offering row FOR UPDATE while it
+    scans candidates. A join therefore cannot commit an entry in the
+    middle of that scan -- it waits for the drop to finish, and then sees
+    a settled queue. And the reverse direction cannot deadlock: promotion
+    takes candidate user rows `SKIP LOCKED` (item 9), so a promotion that
+    meets this transaction's user lock skips that candidate rather than
+    waiting for a transaction that is itself waiting on the offering.
+    Neither side waits on the other; that is item 9's proposal doing the
+    job it was proposed for.
+
+    **No course-load quota check.** Queueing costs nothing and holds
+    nothing: `held_course_enrollments` counts ACTIVE enrollments and a
+    queued student has no enrollment row at all. A student at their cap
+    of 6 may still queue, and the quota is enforced at PROMOTION time,
+    where A's transaction checks it and skips a candidate who would
+    breach. Charging quota here would refuse a student something they
+    are not yet receiving. Recorded with item 10's ratification.
+    """
+    offering = get_offering(db, offering_id)
+    if offering is None:
+        return None
+
+    # (1) user row.
+    db.execute(select(User.id).where(User.id == student.id).with_for_update())
+
+    # A seat and a place in the queue are mutually exclusive states, and
+    # this is the check that keeps them so. Held under the user lock, so a
+    # concurrent register cannot slip a seat in behind it.
+    enrollment = db.execute(
+        select(Enrollment).where(
+            Enrollment.student_id == student.id,
+            Enrollment.course_offering_id == offering_id,
+        )
+    ).scalar_one_or_none()
+    if enrollment is not None and enrollment.status is EnrollmentStatus.ACTIVE:
+        raise AlreadyEnrolled(offering_id)
+
+    # (2) offering row, FOR SHARE. `populate_existing` for the reason
+    # `register` documents at length: `get_offering` above put this row in
+    # the Session's identity map, and a SELECT returning an
+    # already-mapped row hands back the existing object WITHOUT
+    # refreshing it -- so the lock would be real and the value read under
+    # it would be from before the lock. That bug is invisible in review
+    # and cost 20-of-5 seats in the course path at Deadline 4.
+    locked = db.execute(
+        select(CourseOffering)
+        .where(CourseOffering.id == offering_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    if locked.enrolled_count < locked.capacity:
+        raise OfferingNotFull(locked.capacity, locked.enrolled_count)
+
+    # Pre-checked under the user lock rather than caught from
+    # `waitlist_unique`, and here that is genuinely sufficient rather than
+    # merely convenient: two concurrent joins by the SAME student
+    # serialize on the user row taken in step (1), so the second one reads
+    # the first one's committed entry. The UNIQUE constraint stays as the
+    # backstop it is everywhere else -- it is what would make a mistake
+    # here fail loudly instead of queueing one student twice.
+    existing = db.execute(
+        select(WaitlistEntry).where(
+            WaitlistEntry.student_id == student.id,
+            WaitlistEntry.course_offering_id == offering_id,
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise AlreadyWaitlisted(offering_id)
+
+    entry = WaitlistEntry(student_id=student.id, course_offering_id=offering_id)
+    db.add(entry)
+    db.commit()
+    db.refresh(entry)
+
+    # Reported from the same `_positions` query the GET endpoint uses, so
+    # "you are 3rd" means exactly what `GET /waitlist` will say. Read
+    # after the commit and without a lock: it is a display value.
+    position = next(p for e, p in _positions(db, offering_id) if e.id == entry.id)
+    return entry, position
+
+
+def leave_waitlist(
+    db: Session, offering_id: int, student: User
+) -> WaitlistEntry | None:
+    """Give up a place in the queue. None if the offering does not exist.
+
+    Raises `NotWaitlisted`.
+
+    **Deletes the row rather than flagging it.** Unlike an enrollment,
+    which keeps a DROPPED row because `enrollment_unique` is
+    unconditional and re-registration must be an UPDATE, a waitlist entry
+    carries no history anyone reads and its absence IS the state. A
+    `LEFT` status would also have to be excluded from every FIFO read,
+    and forgetting that exclusion in the promotion query would promote a
+    student who had left.
+
+    **Takes the offering row FOR SHARE, and that is not decoration.**
+    Promotion (A's, item 9) runs inside `drop` holding the offering row
+    FOR UPDATE: it reads the oldest entry, then attempts that student's
+    user row. Without a lock here, this transaction could DELETE the very
+    entry promotion has already selected, and promotion would hand a seat
+    to a student who had left the queue -- writing an enrollment for
+    somebody who asked to be removed. The share lock makes the leave wait
+    for the promotion to commit, after which the row is either already
+    gone (promoted) or still ours to delete.
+
+    Lock order is the global one, user row first, for the same reason as
+    `join_waitlist`.
+    """
+    offering = get_offering(db, offering_id)
+    if offering is None:
+        return None
+
+    db.execute(select(User.id).where(User.id == student.id).with_for_update())
+
+    db.execute(
+        select(CourseOffering)
+        .where(CourseOffering.id == offering_id)
+        .with_for_update(read=True)
+        .execution_options(populate_existing=True)
+    ).scalar_one()
+
+    entry = db.execute(
+        select(WaitlistEntry).where(
+            WaitlistEntry.student_id == student.id,
+            WaitlistEntry.course_offering_id == offering_id,
+        )
+    ).scalar_one_or_none()
+
+    if entry is None:
+        raise NotWaitlisted(offering_id)
+
+    # Detached copy for the response: the row is about to stop existing,
+    # and the caller is owed the entry they just gave up rather than a
+    # 204 with nothing in it. Same shape as `drop` returning the DROPPED
+    # enrollment.
+    left = WaitlistEntry(
+        id=entry.id,
+        student_id=entry.student_id,
+        course_offering_id=entry.course_offering_id,
+        created_at=entry.created_at,
+    )
+
+    db.delete(entry)
+    db.commit()
+
+    # **Nothing is renumbered.** Everyone behind the departing student
+    # moves up by one the next time a position is COMPUTED, because
+    # position was never stored. This is the same property that makes
+    # promotion a single-row delete.
+    return left
+
+
+# ---------------------------------------------------------------------------
+# Waitlist promotion — Deadline 7
+# ---------------------------------------------------------------------------
+#
+# **OWNERSHIP NOTE.** `EXECUTION_PLAN.md` assigns this transaction to A
+# and the waitlist endpoints to B. It was written by B in session 17
+# because A's column had not started and Deadline 7 could not close.
+# It implements A's proposal (outstanding item 9) as written, with one
+# addition flagged below. **A has not reviewed it.**
+
+
+def _promote_one(db: Session, offering: CourseOffering) -> Enrollment | None:
+    """Give the freed seat to the oldest ELIGIBLE queued student, or nobody.
+
+    Called from inside `drop`, which already holds:
+
+        user(dropper)   FOR UPDATE      <- the global lock order
+        offering        FOR UPDATE      <- the row whose counter moves
+
+    ==================================================================
+    THE DEADLOCK THIS AVOIDS, AND WHY `SKIP LOCKED` RATHER THAN ORDER
+    ==================================================================
+    Outstanding item 9. Promotion needs a SECOND user row -- the
+    candidate's -- to check their course-load quota under a lock. It
+    cannot know which one until it has read the waitlist, and reading the
+    waitlist consistently needs the offering lock it is already holding.
+    So its order is offering -> user, while `register`'s is user ->
+    offering:
+
+        T1  X drops offering O      holds user(X) -> O, wants user(Y)
+        T2  Y registers for O       holds user(Y),      wants O
+                                    -> cycle, deadlock
+
+    There is no ordering fix, because Y's identity is the *output* of the
+    read that requires the lock. **So the wait is removed instead of
+    ordered.** Each candidate's row is attempted `FOR UPDATE SKIP
+    LOCKED`; a row that is not immediately free is skipped and the next
+    candidate tried. A transaction that never blocks on a user row cannot
+    appear in a cycle at all -- which is a stronger statement than
+    promotion obeying the global order, and it means §14's "every path"
+    claim needs no exception written into it.
+
+    **The cost, stated rather than hidden: the promise is *oldest
+    ELIGIBLE*, not *oldest*.** A queued student who happens to be doing
+    something else at that instant is passed over, and nothing about
+    their row changes when it happens. This is not a new concession --
+    the Deadline 7 spec already defines FIFO over eligible entries by
+    letting a quota-breaching candidate be skipped. This adds one clause
+    to eligibility: "and their row is not currently locked".
+
+    **The quota check stays under a real lock**, which is the half of
+    item 9 that matters most. An unprotected quota check is precisely the
+    failure Benchmark 2 exists to demonstrate, and shipping one in the
+    promotion path would contradict the project's central claim.
+
+    ==================================================================
+    ONE ADDITION BEYOND A'S PROPOSAL -- NEEDS A'S REVIEW
+    ==================================================================
+    A's proposal skips a candidate whose **course-load quota** would
+    breach. It says nothing about **schedule conflicts**, and without
+    that check promotion can seat a student in a class that clashes with
+    one they already hold -- a state `register` refuses outright, reached
+    through a different door.
+
+    A schedule clash is a fact about the student, guarded by the user
+    lock, exactly like the quota. Both are checked here, and a candidate
+    failing either is skipped rather than refused, because "refuse" has
+    no meaning in a path nobody is waiting on. Flagged rather than
+    folded in silently: it widens the eligibility rule that item 9
+    ratified, so A should agree with it explicitly.
+    """
+    # Defensive, and cheap: promotion is only ever called from a path that
+    # has just freed a seat, but the check makes this function safe to
+    # call from anywhere later. Reading the counter off the row the caller
+    # holds FOR UPDATE, never a boundary read.
+    if offering.enrolled_count >= offering.capacity:
+        return None
+
+    # ORDER BY created_at, id -- and the `id` tiebreak is the entire FIFO
+    # guarantee, not a formality. `func.now()` is TRANSACTION start time,
+    # so entries written inside one transaction share a `created_at` to
+    # the microsecond. `scripts/check_waitlist.py` Part 1 proves it on the
+    # live database.
+    #
+    # Read under the offering lock, so the candidate list cannot change
+    # underneath this loop: joins take the offering FOR SHARE and leaves
+    # take it FOR SHARE, both of which conflict with the FOR UPDATE the
+    # caller holds.
+    candidates = (
+        db.execute(
+            select(WaitlistEntry)
+            .where(WaitlistEntry.course_offering_id == offering.id)
+            .order_by(WaitlistEntry.created_at, WaitlistEntry.id)
+        )
+        .scalars()
+        .all()
+    )
+
+    for entry in candidates:
+        # `SKIP LOCKED` returns no row rather than waiting. This is the
+        # single line outstanding item 9 exists to justify.
+        acquired = db.execute(
+            select(User.id)
+            .where(User.id == entry.student_id)
+            .with_for_update(skip_locked=True)
+        ).scalar_one_or_none()
+
+        if acquired is None:
+            # The skip leaves a trace. Nothing about the entry changes
+            # when a student is passed over, so without this line a
+            # student can lose their turn with no record anywhere that it
+            # happened. B's condition on ratifying item 9.
+            log.info(
+                "waitlist: skipped entry %s (student %s) on offering %s -- "
+                "user row busy",
+                entry.id,
+                entry.student_id,
+                offering.id,
+            )
+            continue
+
+        # Fresh read under the lock just taken. `populate_existing` for
+        # the reason `register` documents at length -- an
+        # already-identity-mapped row otherwise comes back with its
+        # pre-lock attribute values, which is invisible in review and
+        # cost 20-of-5 seats at Deadline 4.
+        candidate = db.execute(
+            select(User)
+            .where(User.id == entry.student_id)
+            .execution_options(populate_existing=True)
+        ).scalar_one()
+
+        try:
+            quotas.enforce_course_quota(db, candidate.id, candidate.role)
+        except (quotas.QuotaExceeded, quotas.QuotaNotConfigured):
+            # Skipped, not refused: there is no caller to tell. A missing
+            # policy row fails closed here exactly as it does everywhere
+            # else -- no policy is not the same as an unlimited one.
+            log.info(
+                "waitlist: skipped entry %s (student %s) on offering %s -- "
+                "course-load quota",
+                entry.id,
+                entry.student_id,
+                offering.id,
+            )
+            continue
+
+        # The addition flagged in the docstring. Same lock, same class of
+        # invariant, and without it promotion can create a timetable
+        # clash that `register` would have refused.
+        clash = _conflicting_offering(db, candidate.id, offering)
+        if clash is not None:
+            log.info(
+                "waitlist: skipped entry %s (student %s) on offering %s -- "
+                "clashes with offering %s",
+                entry.id,
+                entry.student_id,
+                offering.id,
+                clash.id,
+            )
+            continue
+
+        # --- promote exactly one, then stop ----------------------------
+        # `enrollment_unique` is UNCONDITIONAL, so a student who dropped
+        # this offering earlier STILL OWNS A ROW. Promotion must UPDATE
+        # it, never INSERT alongside it -- the same trap registration hit
+        # at Deadline 4, and the one `check_waitlist.py` Part 1 pins down
+        # before this code existed. A queued student who never enrolled
+        # has no row, so both branches are reachable.
+        existing = db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == candidate.id,
+                Enrollment.course_offering_id == offering.id,
+            )
+        ).scalar_one_or_none()
+
+        if existing is None:
+            enrollment = Enrollment(
+                student_id=candidate.id,
+                course_offering_id=offering.id,
+                status=EnrollmentStatus.ACTIVE,
+            )
+            db.add(enrollment)
+        else:
+            existing.status = EnrollmentStatus.ACTIVE
+            enrollment = existing
+
+        # The counter and the enrollment move together, in the same
+        # transaction, always -- `enrolled_count` is derived state and
+        # Deadline 8's reconciliation query exists to catch any path that
+        # forgets. The caller decremented for the drop; this puts the seat
+        # straight into the promoted student's hands.
+        offering.enrolled_count += 1
+
+        # DELETE, and nothing is renumbered: there is no `position`
+        # column to renumber (dropped in revision c86676652ca2). Everyone
+        # behind this entry moves up the next time a position is
+        # COMPUTED. That is what makes a promotion a single-row write.
+        db.delete(entry)
+
+        log.info(
+            "waitlist: promoted entry %s (student %s) into offering %s",
+            entry.id,
+            candidate.id,
+            offering.id,
+        )
+        return enrollment
+
+    # Nobody eligible. The seat stays free and the queue is untouched --
+    # an ordinary registration may now take it, which is correct: every
+    # queued student was either busy or ineligible at this instant.
+    return None

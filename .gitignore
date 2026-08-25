@@ -6,4 +6,4 @@ __pycache__/
 .pytest_cache/
 .idea/
 .vscode/
-.claude/
+.claude

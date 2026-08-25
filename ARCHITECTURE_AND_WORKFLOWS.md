@@ -295,6 +295,9 @@ testing proves the user-row lock is a bottleneck.
 409  ALREADY_ENROLLED       you already hold this seat
 409  SCHEDULE_CONFLICT      clashes with an enrollment you hold
 409  NOT_ENROLLED           drop called with no enrollment
+409  ALREADY_WAITLISTED     you are already queued for this offering
+409  NOT_WAITLISTED         leave called with no waitlist entry
+409  OFFERING_NOT_FULL      seats remain -- register, do not queue
 409  QUOTA_NOT_CONFIGURED   no policy row for (role, resource) -- fails closed
 409  IDEMPOTENCY_IN_PROGRESS  claim committed, response not yet recorded
 409  CAPACITY_BELOW_ALLOCATED admin shrink below units currently held
@@ -395,6 +398,8 @@ Reserve a room                         ✓         ✓        ✓
 Reserve GPU capacity                   ✓         ✓        ✓
 Cancel own reservation                 ✓         ✓        ✓
 Register for a course                  ✓         ✗        ✗
+Join / leave a course waitlist         ✓         ✗        ✗
+View a course waitlist                 ✓         ✓        ✓
 Create a course                        ✗         ✓        ✓
 Create a resource                      ✗         ✗        ✓
 Modify resource availability/status    ✗         ✗        ✓
@@ -551,7 +556,7 @@ POST /api/v1/offerings/{id}/register      [STUDENT only → else 403]
       active enrollments = 5, quota 6      ✓ course-load quota
       no schedule overlap with existing    ✓ else 409
     LOCK course_offering row
-      enrolled_count 49 < capacity 50      ✓ else → waitlist
+      enrolled_count 49 < capacity 50      ✓ else 409 CAPACITY_EXHAUSTED
     UPSERT enrollment                      ← UNIQUE(student, offering)
                                              blocks duplicates; a student
                                              who dropped still owns a row,
@@ -610,6 +615,133 @@ Course registration gets **deduplication for free** from the unique
 constraint, but not full idempotency — a retry returns a duplicate error
 rather than the original success. That is an accepted, documented
 trade-off; only GPU allocation carries idempotency keys.
+
+> **CORRECTED at Deadline 7, when the waitlist endpoints were written.**
+> This block used to read `enrolled_count < capacity ✓ else → waitlist`,
+> which made `POST /register` auto-enrol *or* auto-queue depending on a
+> number the caller could not see. Outstanding item 10 settled it the
+> other way: **joining is explicit**, and a full offering returns
+> `409 CAPACITY_EXHAUSTED` and writes nothing. See Workflow F.
+>
+> The argument that decided it is the one Deadline 5 already made about
+> the replay status: a `201` from this route would have meant either "you
+> have a seat" or "you are queued", and a client branching on the status
+> code would take the wrong branch. `409 CAPACITY_EXHAUSTED` keeps
+> meaning exactly one thing. `scripts/check_waitlist.py` had been
+> asserting the explicit behaviour since before the endpoints existed.
+
+## 12b. Workflow F — Student queues, and is promoted
+
+The fourth concurrency problem, and the only one whose two halves are
+written by different people: B owns the endpoints below, A owns the
+promotion transaction that consumes their rows.
+
+``` text
+POST /api/v1/offerings/{id}/waitlist       [STUDENT only → else 403]
+
+  BEGIN
+    LOCK user row            FOR UPDATE   ← a seat and a place in the
+      already ACTIVE here?   → 409 ALREADY_ENROLLED    queue are mutually
+      already queued here?   → 409 ALREADY_WAITLISTED  exclusive states
+    LOCK offering row        FOR SHARE    ← read-only gate; see below
+      enrolled_count < capacity → 409 OFFERING_NOT_FULL
+    INSERT waitlist_entries
+  COMMIT
+  → 201  { id, student_id, course_offering_id, created_at, position }
+
+DELETE /api/v1/offerings/{id}/waitlist     [STUDENT only]
+  same two locks → DELETE the row → 200 with the position that was held
+  → 409 NOT_WAITLISTED when there is nothing to leave
+
+GET  /api/v1/offerings/{id}/waitlist       [any authenticated role]
+  no lock. position = ROW_NUMBER() OVER (ORDER BY created_at, id)
+```
+
+**The offering lock is `FOR SHARE`, not `FOR UPDATE`.** Joining reads
+`enrolled_count` to decide fullness and never writes it — the same
+distinction that made the room gate a share lock at Deadline 3, while the
+GPU and registration gates take `FOR UPDATE` because they write a
+counter. A share lock still excludes the writers, which is the entire
+requirement: `register` and `drop` both take `FOR UPDATE`, so a seat can
+neither appear nor vanish between the fullness check and the commit.
+
+**Why the user row is locked at all.** Without it a student's concurrent
+`register` and waitlist-join touch no common row — one writes an
+enrollment, the other a waitlist entry — and the student ends up holding
+a seat *and* queueing for it. Same shape as the cross-cluster GPU quota
+race: the invariant is a fact about the **user**, and the user row is the
+only thing both paths share.
+
+**Queueing costs no course-load quota.** `held_course_enrollments` counts
+ACTIVE enrollments, and a queued student has no enrollment row at all, so
+a student at their cap of 6 may still queue. The quota is enforced at
+*promotion* time, where the transaction skips a candidate who would
+breach it. A waitlist entry holds nothing, so charging quota for one
+would refuse a student something they have not yet received.
+
+**Leaving deletes the row; dropping a seat does not.** An enrollment must
+keep a `DROPPED` row because `enrollment_unique` is unconditional and
+re-registration is therefore an UPDATE. A waitlist entry carries no
+history anyone reads, and its absence *is* the state — a `LEFT` status
+would have to be excluded from every FIFO read, and one forgotten
+exclusion would promote a student who had left.
+
+### Position is computed, never stored
+
+There is no `position` column; it was dropped in revision
+`c86676652ca2`. Position is `ROW_NUMBER() OVER (ORDER BY created_at, id)`
+evaluated at read time, which is what makes a promotion touch **exactly
+one row** — the one it deletes. A stored position would have to be
+renumbered for everyone behind the promoted student, and renumbering
+transiently violates a unique constraint mid-UPDATE.
+
+**The `id` tiebreak is the whole guarantee, not a formality.**
+`func.now()` is transaction start time, so entries written inside one
+transaction share a `created_at` to the microsecond and `created_at`
+alone cannot express FIFO between them. `scripts/check_waitlist.py`
+Part 1 proves this against the live database rather than asserting it.
+
+### Promotion (A's column) — the FIFO promise is *oldest eligible*
+
+``` text
+DELETE /api/v1/offerings/{id}/drop        → frees a seat
+  BEGIN                                     (already holding user + offering)
+    for each entry, ORDER BY created_at, id:
+        try LOCK user(candidate) FOR UPDATE SKIP LOCKED
+        not acquired           → skip to the next entry
+        course-load quota full → skip to the next entry
+        schedule clash         → skip to the next entry
+        otherwise              → promote exactly one, DELETE its row, stop
+  COMMIT
+```
+
+**The seat moves; it is never released and re-taken.** The `-1` for the
+drop and the `+1` for the promotion happen before a single commit, so
+there is no instant at which the freed seat is visible to an ordinary
+`register`. A queued student cannot lose their place to someone
+refreshing the page.
+
+**The schedule-clash skip is an addition to the ratified proposal**
+(B, Deadline 7). Item 9 named only the quota. Without it, promotion can
+seat a student in a class that clashes with one they already hold —
+which `register` refuses outright — so the same illegal state would be
+reachable through a different door. Both are facts about the student,
+both guarded by the same user lock.
+
+**Every skip is logged.** A passed-over student changes no row at all, so
+without a log line they lose their turn with no record anywhere.
+
+**`SKIP LOCKED` is why this cannot deadlock.** Promotion needs a second
+user row it cannot name until it has read the waitlist, and reading the
+waitlist needs the offering lock — so its order is offering → user while
+registration's is user → offering. Rather than order the wait, the design
+removes it: a transaction that never blocks on a user row cannot appear
+in a cycle at all. Outstanding item 9.
+
+The cost is stated rather than hidden: **the promise is *oldest
+eligible*, not *oldest***. A queued student who is concurrently doing
+something else is passed over, and nothing about their row changes when
+that happens.
 
 ## 13. Workflow E — Admin manages resources and policy
 

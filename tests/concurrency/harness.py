@@ -265,13 +265,26 @@ def latency(results: Iterable[Result]) -> dict[str, float]:
 
 
 class DBConcurrencyObserver:
-    """Samples how many backends are actually running our queries.
+    """Samples how many backends are running queries while a run is in flight.
 
     This is the honest half of the "500 concurrent" claim. It polls
-    `pg_stat_activity` from its own connection while the run is in flight
-    and keeps the maximum, so a benchmark can print the concurrency it
-    ACHIEVED next to the number it requested. If those two numbers differ
-    by an order of magnitude, the run measured a pool and not a lock.
+    `pg_stat_activity` from its own connection and keeps the maximum, so
+    a benchmark can print the concurrency it ACHIEVED next to the number
+    it requested. If those two numbers differ by an order of magnitude,
+    the run measured a pool and not a lock.
+
+    **What it counts, precisely** (A's question at the Deadline 6 swap
+    review): every backend on this database in state `active`, minus its
+    own `pg_backend_pid()`. That includes the benchmark process's own
+    bookkeeping connections and any stray `psql` -- so the peak is an
+    UPPER BOUND on the concurrency of the requests under test, not a
+    measurement of it.
+
+    That is still the right instrument for the only claim built on it.
+    The question the peak answers is "did this run measure a lock or a
+    pool?", and a run that asked for 40 and peaked at 3 has answered it
+    whichever process the 3 belonged to. It would be the wrong instrument
+    for a throughput number, and nothing uses it for one.
 
     Uses its own engine connection deliberately -- borrowing one from the
     application pool would consume the very resource being measured.
