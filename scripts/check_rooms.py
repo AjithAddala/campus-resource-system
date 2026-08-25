@@ -39,13 +39,18 @@ from sqlalchemy.exc import OperationalError
 # root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from app.core.security import hash_password  # noqa: E402
 from app.database.session import SessionLocal  # noqa: E402
 from app.models import (  # noqa: E402
     GPUCluster,
     Reservation,
     ReservationStatus,
     ResourceStatus,
+    ResourceType,
+    Role,
+    RoleQuota,
     Room,
+    User,
 )
 
 BASE = "http://localhost:8000/api/v1"
@@ -100,12 +105,84 @@ def code_of(r: httpx.Response) -> str | None:
 student = login("student@iitk.ac.in")
 admin = login("admin@iitk.ac.in")
 
+made_users: list[int] = []
+
+
+def make_students(n: int) -> list[str]:
+    """n fresh STUDENT accounts, as bearer tokens.
+
+    **Added at Deadline 6, and the reason is a regression this gate would
+    otherwise have hidden.** The barrier race below fires N identical
+    bookings at one room; before Deadline 6 they all used the seed
+    student's token, which was fine because `reserve_room` took no user
+    lock. It takes one now, for the room quota — so N requests from ONE
+    account would serialize on that user's row and reach the exclusion
+    constraint one at a time. The test would still pass, and it would be
+    measuring the user lock instead of the constraint it was written for.
+
+    Exactly the trap `check_gpus.py` fell into at Deadline 4: *"a capacity
+    race in which every racer shares one account is not a capacity
+    test."* Same fix, arriving on a different path.
+    """
+    db = SessionLocal()
+    emails = []
+    try:
+        # Seeded password, so this script's existing single-argument
+        # `login()` works on these accounts unchanged.
+        hashed = hash_password(SEED_PASSWORD)
+        for _ in range(n):
+            email = f"room-{uuid.uuid4().hex[:12]}@iitk.ac.in"
+            user = User(
+                name="Room Check", email=email, password_hash=hashed, role=Role.STUDENT
+            )
+            db.add(user)
+            db.flush()
+            made_users.append(user.id)
+            emails.append(email)
+        db.commit()
+    finally:
+        db.close()
+    return [login(e) for e in emails]
+
+
+SEEDED_STUDENT_ROOM_LIMIT = 2  # scripts/seed.py
+
 db = SessionLocal()
 try:
     room_id = db.query(Room).order_by(Room.id).first().id
     other_room_id = db.query(Room).order_by(Room.id).all()[1].id
     gpu_id = db.query(GPUCluster).order_by(GPUCluster.id).first().id
     reservations_before = db.query(Reservation).count()
+
+    # **Room quota lifted for the duration of this gate, and restored in
+    # cleanup.** Deadline 6 capped STUDENT room holds at 2. This script
+    # tests intervals, the BLOCKED gate and the exclusion constraint --
+    # none of which is about quota -- and it books roughly ten slots on
+    # one account to do it. Without this, eleven assertions fail with
+    # QUOTA_EXCEEDED where an interval result was expected: the right
+    # status code for entirely the wrong reason, which is the failure mode
+    # this project keeps catching in its own tests.
+    #
+    # Lifted rather than worked around by spreading bookings across users:
+    # several assertions below are specifically about ONE caller booking
+    # adjacent and overlapping slots, and rewriting them to use different
+    # callers would quietly change what they prove. The quota is tested
+    # in `check_quotas.py`, which is where it belongs.
+    # Restored to the SEEDED CONSTANT, not to whatever was found here. A
+    # run that crashes between this line and cleanup leaves the quota
+    # unlimited; capturing the current value would then record `None` as
+    # "the seeded limit" and the next run would restore the corruption.
+    # Learned by doing exactly that.
+    _student_room_quota = (
+        db.query(RoleQuota)
+        .filter(
+            RoleQuota.role == Role.STUDENT,
+            RoleQuota.resource_type == ResourceType.ROOM,
+        )
+        .one()
+    )
+    _student_room_quota.max_units = None  # unlimited, for this script only
+    db.commit()
 finally:
     db.close()
 
@@ -184,20 +261,28 @@ if r.status_code == 201:
 # barrier: exactly one may commit, and the assertion that matters is the
 # ROW COUNT, not the status codes, because status codes are what the
 # server said.
+#
+# **Every racer is a DIFFERENT student, as of Deadline 6.** They shared
+# the seed account until `reserve_room` took the user-row lock for the
+# room quota; from that moment one account would have serialized all
+# eight on the user row and fed them to the constraint one at a time. The
+# assertion would still have passed and would have stopped measuring the
+# thing it names. See `make_students`.
 RACERS = 8
+_racer_tokens = make_students(RACERS)
 _barrier = threading.Barrier(RACERS)
 _results: list[tuple[int, str | None]] = []
 _lock = threading.Lock()
 
 
-def _race() -> None:
+def _race(token: str) -> None:
     _barrier.wait()
-    resp = book(student, room_id, 20, 22)
+    resp = book(token, room_id, 20, 22)
     with _lock:
         _results.append((resp.status_code, code_of(resp)))
 
 
-_threads = [threading.Thread(target=_race) for _ in range(RACERS)]
+_threads = [threading.Thread(target=_race, args=(t,)) for t in _racer_tokens]
 for _t in _threads:
     _t.start()
 for _t in _threads:
@@ -436,7 +521,38 @@ try:
     db.query(Reservation).filter(Reservation.id.in_(set(created_ids))).delete(
         synchronize_session=False
     )
+
+    # The racers' holds are not in `created_ids` -- only one of the eight
+    # committed and the script never learns which. Delete by owner.
+    if made_users:
+        db.query(Reservation).filter(
+            Reservation.user_id.in_(made_users)
+        ).delete(synchronize_session=False)
+        db.query(User).filter(User.id.in_(made_users)).delete(
+            synchronize_session=False
+        )
+
+    # Restore the room quota this script lifted. A gate that leaves policy
+    # changed is a gate that breaks the next one.
+    db.query(RoleQuota).filter(
+        RoleQuota.role == Role.STUDENT,
+        RoleQuota.resource_type == ResourceType.ROOM,
+    ).one().max_units = SEEDED_STUDENT_ROOM_LIMIT
+
     db.commit()
+    check(
+        "room quota restored to its seeded value",
+        db.query(RoleQuota)
+        .filter(
+            RoleQuota.role == Role.STUDENT,
+            RoleQuota.resource_type == ResourceType.ROOM,
+        )
+        .one()
+        .max_units
+        == SEEDED_STUDENT_ROOM_LIMIT,
+        str(SEEDED_STUDENT_ROOM_LIMIT),
+    )
+    check("racer accounts removed", db.query(User).count() == 3, str(db.query(User).count()))
     after = db.query(Reservation).count()
     check(
         "reservations back to post-seed count",

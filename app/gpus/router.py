@@ -11,6 +11,7 @@ from app.gpus.schemas import (
     GPUAvailability,
     GPUClusterCreate,
     GPUClusterRead,
+    GPUClusterUpdate,
     GPUReservationCreate,
     GPUReservationRead,
 )
@@ -48,6 +49,45 @@ def create_gpu(
     happened.
     """
     return service.create_cluster(db, payload)
+
+
+@router.patch("/{gpu_id}", response_model=GPUClusterRead)
+def patch_gpu(
+    gpu_id: int,
+    payload: GPUClusterUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(Role.ADMIN)),
+) -> GPUClusterRead:
+    """Change a cluster's capacity or status. ADMIN only. Deadline 6.
+
+    The GPU twin of `PATCH /rooms/{id}`, with one gate the room path does
+    not need: **shrinking `gpu_count` below `allocated` is refused with
+    `409 CAPACITY_BELOW_ALLOCATED`.**
+
+    That refusal exists because the schema and the design document
+    disagree. `ARCHITECTURE_AND_WORKFLOWS.md` §13 says a reduction below
+    current usage is allowed and drains naturally; `gpu_capacity_sane`
+    (`allocated <= gpu_count`) makes that state impossible to store, so
+    the documented behaviour would arrive as a 500 from a CHECK violation.
+    Refusing keeps the constraint — which is what makes a locking bug in
+    the flagship transaction fail loudly — and preserves §13's actual
+    intent, that nothing is ever evicted. The admin shrinks to `allocated`
+    now and further as holds are released. See `service.update_cluster`
+    and the Deadline 6 entry in DECISIONS.md.
+    """
+    try:
+        cluster = service.update_cluster(db, gpu_id, payload)
+    except service.CapacityBelowAllocated as exc:
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "CAPACITY_BELOW_ALLOCATED",
+            f"{exc.allocated} units are currently held; gpu_count cannot be "
+            f"set below that. Existing reservations are never evicted.",
+        )
+
+    if cluster is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "GPU cluster not found")
+    return cluster
 
 
 @router.get("", response_model=list[GPUClusterRead])

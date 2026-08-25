@@ -1750,6 +1750,210 @@ resource-status endpoints, `GET /me/quota`, and the joint swap review.
 
 ---
 
+## Session 14 — 2026-08-25 — A
+
+**Advances:** Deadline 6 (Quota Rollout, Benchmarks 2-3, SWAP) — **A's
+column.** Both columns are now done; the deadline stays open on the
+joint swap review.
+
+**Plan:** apply the quota helper inside B's room and course modules, add
+the admin quota and resource-status endpoints and `GET /me/quota`, and
+fix whatever it breaks in B's gates.
+
+**Shipped**
+
+- `app/quotas/service.py` — `held_room_reservations`,
+  `enforce_room_quota`, `held_course_enrollments`,
+  `enforce_course_quota`, `usage_snapshot`. One mechanism, three
+  resources; the only difference is the unit (GPUs SUM, rooms and
+  courses COUNT).
+- `app/rooms/service.py` — the user-row lock, inserted exactly where the
+  Deadline 3 comment reserved space for it. `cancel_reservation` takes
+  it too now, on the reservation's **owner**.
+- `app/courses/service.py` — course-load quota inside the lock Deadline 4
+  already held. An addition, not a reordering, as predicted.
+- `app/quotas/router.py`, `app/quotas/schemas.py` — `GET/PUT
+  /admin/quotas/{role}/{resource}`.
+- `PATCH /rooms/{id}`, `PATCH /gpus/{id}`, `GET /me/quota`.
+- `scripts/check_quotas.py` — seventh gate, 61 assertions.
+
+21 → 26 API routes. **No migration**: `RoleQuota` shipped at Deadline 1
+and `alembic check` reports no drift.
+
+**Verification run**
+
+``` text
+scripts/check_quotas.py  -> 61/61 PASS
+  room 3 of 2                     -> 409 QUOTA_EXCEEDED, nothing created
+  faculty, same slot              -> INTERVAL_CONFLICT, not QUOTA
+  me/quota while user row LOCKED  -> answers      <- proves it takes no lock
+  (FACULTY,COURSE) via me/quota   -> configured:false, not unlimited
+  GET unseeded pair               -> 404, not a null limit
+  lower a quota under a holding   -> holds survive, next booking refused
+  course 2 of 1                   -> QUOTA_EXCEEDED, not SCHEDULE_CONFLICT
+  drop then register the other    -> 201          <- DROPPED stops counting
+  block a room                    -> RESOURCE_BLOCKED, hold NOT evicted
+  shrink GPU below allocated      -> 409 CAPACITY_BELOW_ALLOCATED, no change
+  PATCH allocated directly        -> ignored, still 2
+
+ROOM QUOTA RACE, 2 rooms, 20 trials
+  resource lock only  -> 19/20 over quota   held {2: 1, 3: 19}
+  + user-row lock     ->  0/20 over quota   held {2: 20}
+
+full regression, run TWICE:
+  check_jwt / check_auth / check_rbac / check_rooms /
+  check_gpus / check_courses / check_idempotency / check_quotas -> all pass
+B's benchmarks after the change:
+  benchmark_1 PASS (exactly 10 every trial)  benchmark_2 PASS  benchmark_3 PASS
+alembic check -> no drift, head 1ca8b85b7626
+```
+
+**THE FINDING — §13 describes a state the schema forbids**
+
+`ARCHITECTURE_AND_WORKFLOWS.md` §13 said an admin may lower a cluster
+from 8 to 4 while 6 are allocated, and that `allocated` drains
+naturally. `gpu_capacity_sane` is `allocated <= gpu_count`, so Postgres
+rejects that row outright — implemented literally, the documented
+behaviour arrives as a 500. The contradiction has been in the repo since
+Deadline 1 and nothing read the two against each other until an endpoint
+existed to try.
+
+Refused with `409 CAPACITY_BELOW_ALLOCATED` rather than dropping the
+CHECK: the constraint is what makes a locking bug in the flagship
+transaction fail loudly instead of quietly overselling a cluster. §13's
+intent — never evict — is intact; only its example is unavailable. §13
+corrected.
+
+**THE OTHER FINDING — my change silently weakened B's strongest room
+assertion**
+
+`check_rooms.py` failed eleven assertions on the new room cap, which was
+expected. What was not: its 8-racer barrier test used **one** account, so
+the new user-row lock serialized all eight and the exclusion constraint
+stopped being contended at all. **The assertion would still have passed**
+while no longer measuring the thing it is named for.
+
+This project caught the identical bug at Deadline 4 in its own words — *a
+capacity race in which every racer shares one account is not a capacity
+test* — but from the opposite direction: not a test written wrong, a
+correct test invalidated by a change somewhere else. Fixed with eight
+distinct racers.
+
+**Cost incurred**
+
+- One self-inflicted loop. `check_rooms.py` first restored the room quota
+  by capturing whatever value it found at startup. A crashed run left the
+  quota unlimited, so the next run recorded `None` as "the seeded value"
+  and faithfully restored the corruption, which then looked like two
+  unrelated assertion failures. It restores a named constant now. The
+  database was cleaned by hand once.
+
+**Deadline 6 status: MET.** Both columns were done in sessions 13 and 14;
+the swap review was held afterwards and **A reports it took place**,
+which closes the third line of the column and the deadline with it.
+`session.py` was reviewed and approved in the same stretch.
+
+> **What this entry does NOT record.** A listed four questions for B out
+> of the harness reading — whether `max_in_flight = 40` is derived or
+> coincidental, what exactly `DBConcurrencyObserver` counts, whether
+> anything constructs `Result` positionally, and the pre-lock `User` in
+> the identity map. Their answers are not written down here, because the
+> answers were not reported. **If B answered them, they belong in
+> `DECISIONS.md` while they are fresh** — that file is the interview
+> cheat-sheet and an answer nobody wrote down is an answer nobody has in
+> two months.
+>
+> Items 9, 7 and 10 were **not** discussed. The swap review and the
+> ratification were recommended as one session and happened as one; only
+> the first half did.
+
+**Open / carried forward**
+
+1. **Items 9, 7 and 10 are now the ONLY thing blocking Deadline 7.** A's
+   proposal is written and unratified. Item 9 first — it decides the
+   transaction's shape; 7 and 10 move smaller branches. This is a
+   conversation, not a work item.
+2. **`scripts/check_waitlist.py` is written — the gate before the
+   transaction.** Part 1 (14 assertions) runs and passes now; Part 2
+   (8 promotion assertions) skips until a `/waitlist` route appears in
+   `openapi.json`, and **fails** if one appears while Part 2 is still
+   unwritten. Seventh gate.
+   The payoff was immediate: the `created_at` trap — asserted in prose
+   since Deadline 2, never tested — is now **proven on the live
+   database**. Three rows written in one transaction share one
+   `created_at` exactly, so `ORDER BY created_at` alone cannot express
+   FIFO and the `id` tiebreak is the entire guarantee. Nothing in the
+   promotion tests themselves would have caught that breaking.
+2. **`session.py` still needs A's review** — carried from sessions 12 and
+   13. A shared file, changed solo, twice, with a measured justification.
+   Still unreviewed at the end of this session; it should have been the
+   first thing done and was not.
+3. **`session.py` review: DONE, APPROVED.** A's review of B's solo change
+   to the shared file is written up in `DECISIONS.md`. Every number in
+   B's justification was re-derived against the running system rather
+   than read off the comment — anyio ceiling 40, `max_connections` 100,
+   reserved 3, pool 40+10 — and the core argument holds. Two findings,
+   neither blocking: the comment's connection budget says the benchmark
+   pool is 15 when `tool_session_factory` makes it 7, and **all seven
+   `check_*.py` gates plus `seed.py` import the server-sized
+   `SessionLocal`**, which is the exact thing B's own factory docstring
+   forbids for benchmarks. Latent rather than live (the gates use one to
+   three connections in practice), but it should be fixed before the
+   Deadline 9 clean-room run because the failure would surface inside the
+   *server* and read like the bug the sizing fixed. The fix touches B's
+   scripts, so it is joint.
+4. **Swap review: NOT DONE, but A's half of it is.** Both directions are
+   now written up in `DECISIONS.md`: the GPU-transaction walkthrough A
+   owes B, and **A's study of B's modules written from B's code before
+   the session** — the exclusion constraint (why `btree_gist`, why
+   `'[)'`, why partial on ACTIVE, why no free-slot SELECT, why FOR SHARE)
+   and the harness (three throttles, the barrier, keepalive off). Doing
+   the reading first makes the live hour B *correcting* A rather than B
+   *teaching* A. Four questions A could not answer from the code alone
+   are listed for B.
+
+   **The finding that came out of reading B's harness lands on A's
+   files.** The concurrency ceiling is not the 40 anyio threads: a
+   connection is checked out during *dependency resolution*
+   (`get_current_user` reads the user row) and the Session holds it, with
+   an open transaction, until `get_db` closes it — so the ceiling is
+   requests **in flight**. Session-per-request is what caps this system,
+   which is why raising the pool did not fix it. That is
+   `core/dependencies.py` and `database/session.py`, both A's, both
+   settled at Deadlines 1 and 3 without this consequence in mind. "500
+   concurrent" appears in three documents and the honest number is the
+   in-flight bound — A should say this in the swap review before B has
+   to point at it.
+
+   **Preparation is still not the review.** The deliverable is two people
+   explaining each other's code with the other absent, and Deadline 6
+   stays open until that conversation happens.
+5. Items 7, 9 and 10 all block Deadline 7. **A's proposal for all three
+   is now written** (end of the Deadline 6 section in `DECISIONS.md`) —
+   promotion takes candidate user rows `SKIP LOCKED` so it never waits
+   and cannot join a deadlock cycle; joining a waitlist is explicit;
+   `WAITLISTED` is never written. **Proposed, not ratified — all three
+   need B**, and nothing is implemented. Item 11 is still open and is
+   worth taking in the same session, because promotion is the next
+   locked read anyone writes.
+   The concrete deadlock was verified against the code rather than
+   argued from the docs: `drop` holds user(dropper) → offering, so a
+   dropper promoting Y deadlocks against Y registering for the same
+   offering. Six paths now take user→resource, so the cost of promotion
+   contradicting the order has gone up again.
+4. **Room quota is not time-aware**, deliberately: a reservation whose
+   `end_time` has passed but whose status is ACTIVE still counts. Nothing
+   in the system expires reservations. Documented in
+   `held_room_reservations`; worth a README line at Deadline 9 because a
+   reader will ask.
+5. `POST /courses` / `POST /offerings` still belong to no deadline.
+   `check_quotas.py` creates an offering by direct insert, the third
+   script to do so.
+6. Benchmark 4 (waitlist) still does not exist — Deadline 7.
+7. The in-flight ceiling still needs to reach the README (Deadline 9).
+
+---
+
 ## Template
 
 ```markdown

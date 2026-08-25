@@ -8,6 +8,7 @@ from app.courses.router import offerings_router
 from app.courses.router import router as courses_router
 from app.database.session import get_db
 from app.gpus.router import router as gpus_router
+from app.quotas.router import router as quotas_router
 from app.rooms.router import router as rooms_router
 from app.users.router import router as users_router
 
@@ -58,6 +59,13 @@ app.include_router(users_router, prefix=API_PREFIX)
 app.include_router(gpus_router, prefix=API_PREFIX)
 app.include_router(rooms_router, prefix=API_PREFIX)
 app.include_router(courses_router, prefix=API_PREFIX)
+
+# Admin quota policy, Deadline 6. Under the same version prefix as
+# everything else -- /admin is a section of the API, not infrastructure,
+# so unlike the health checks it is versioned. It lives in `quotas/`
+# because the module that owns an invariant should own the endpoint that
+# configures it.
+app.include_router(quotas_router, prefix=API_PREFIX)
 # Course reads are course-shaped; offering reads are offering-shaped, and
 # the write paths that land at Deadline 4 attach to the offerings router
 # because the offering is the row holding enrolled_count.

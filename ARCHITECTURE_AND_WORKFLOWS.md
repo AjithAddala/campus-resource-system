@@ -297,6 +297,7 @@ testing proves the user-row lock is a bottleneck.
 409  NOT_ENROLLED           drop called with no enrollment
 409  QUOTA_NOT_CONFIGURED   no policy row for (role, resource) -- fails closed
 409  IDEMPOTENCY_IN_PROGRESS  claim committed, response not yet recorded
+409  CAPACITY_BELOW_ALLOCATED admin shrink below units currently held
 422  malformed request body
 422  IDEMPOTENCY_KEY_REUSED same key, different request
 201  idempotent replay      (the ORIGINAL response, the ORIGINAL status)
@@ -622,10 +623,28 @@ PUT   /api/v1/admin/quotas/STUDENT/GPU [ADMIN]  { max_units: 3 }
 Any non-admin token is rejected with `403` **before the handler runs** —
 no partial state change is possible.
 
-**Capacity-reduction rule:** if an admin lowers a cluster from 8 to 4
-while 6 are allocated, existing reservations are *not* retroactively
-evicted. The new limit applies only to future allocations; `allocated`
-drains naturally as reservations are released.
+**Capacity-reduction rule:** existing reservations are *not* retroactively
+evicted when an admin lowers a cluster's capacity. The new limit applies
+only to future allocations; `allocated` drains as reservations are
+released.
+
+> **CORRECTED at Deadline 6, when the endpoint that does this was first
+> written.** The original wording gave the example *"lowers a cluster from
+> 8 to 4 while 6 are allocated"* — and that state cannot be stored.
+> `gpu_capacity_sane` is `allocated >= 0 AND allocated <= gpu_count`, so
+> Postgres rejects `gpu_count = 4` with `allocated = 6`, and a literal
+> implementation would reach the caller as a 500 from a CHECK violation.
+> This document described a database state the schema forbids, and had
+> since Deadline 1; nothing read the two against each other until
+> `PATCH /gpus/{id}` existed to try.
+>
+> **`PATCH /gpus/{id}` refuses the reduction with
+> `409 CAPACITY_BELOW_ALLOCATED`**, decided against the row it holds
+> `FOR UPDATE`. The CHECK stays, because it is what makes a locking bug in
+> the flagship transaction fail loudly rather than quietly overselling a
+> cluster. The rule's intent is unchanged — nothing is ever evicted — and
+> an admin shrinks to `allocated` now and further as holds are released.
+> Only the original example is unavailable. See DECISIONS.md, Deadline 6.
 
 **Quota-change rule:** raising a quota takes effect immediately.
 Lowering it below a user's current holding does not evict — the user
@@ -640,6 +659,10 @@ No token                          401
 Student calls POST /gpus          403, no state change
 Cluster full                      409 CAPACITY_EXHAUSTED
 Student already holds 2 GPUs      409 QUOTA_EXCEEDED
+Student already holds 2 rooms     409 QUOTA_EXCEEDED     (Deadline 6)
+Student at their course load      409 QUOTA_EXCEEDED     (Deadline 6)
+Admin shrinks GPUs below held     409 CAPACITY_BELOW_ALLOCATED, nothing evicted
+Admin lowers a role quota         existing holds survive; next request refused
 Retried request (same key)        201 replay of the STORED response
 Same key, different request       422 IDEMPOTENCY_KEY_REUSED
 Retry of a request that FAILED    allocates for real -- the key rolled

@@ -454,6 +454,10 @@ models, not the plan: `users.name` (not `full_name`),
    cancellation and course registration and does *not* claim promotion.
    §14 over-claims relative to it. **Needs deciding before Deadline 7**;
    it is A's transaction.
+   → **A's proposal is written**, at the end of the Deadline 6 section:
+   promotion takes candidate user rows with `SKIP LOCKED` and never
+   waits, so it cannot join a cycle and the global order needs no
+   exception. Still needs B.
 10. **Is joining a waitlist automatic or explicit?**
     `ARCHITECTURE_AND_WORKFLOWS.md` Workflow D falls through to the
     waitlist when an offering is full (`else → waitlist`);
@@ -465,6 +469,12 @@ models, not the plan: `users.name` (not `full_name`),
     explicit joining leaves `WAITLISTED` dead and it should come out of
     the enum. Answer one and the other follows.
     **Needs deciding before Deadline 7**, with item 7.
+    → **A's proposal is written**, at the end of the Deadline 6 section:
+    joining is EXPLICIT, because auto-waitlisting makes one `201` mean
+    two different things — the same defect the Deadline 5 replay-status
+    decision refused. Item 7 follows: `WAITLISTED` is never written, and
+    the enum value stays because removing it costs a migration and buys
+    nothing. Both still need B.
 11. **Why does the GPU path not reproduce the stale locked read?** A
     two-session probe shows `SELECT ... FOR UPDATE` returning a stale
     `GPUCluster.allocated` exactly as it did for `CourseOffering.
@@ -2244,3 +2254,801 @@ reason to port was uniformity, not accuracy.
 > Twice now the mistake has been the same shape: reading a difference
 > into a sample too small to carry one. It is what this project's own
 > benchmarks are built to refuse, in the sentences describing them.
+
+---
+
+# Deadline 6 — the quota rollout and the admin endpoints (A)
+
+## One mechanism, three resources — and the third one measured
+
+Deadline 4 proved the quota mechanism on GPUs. Deadline 6 applies it to
+rooms and courses, and the interesting question was whether the argument
+generalises or whether GPUs were a special case. It generalises, and the
+room path now has its own number:
+
+``` text
+2 concurrent bookings, 2 DIFFERENT rooms, one student at 1 of 2, 20 trials
+
+  resource lock only (no user lock)   19/20 over quota   held {2: 1, 3: 19}
+  + user-row lock                      0/20 over quota   held {2: 20}
+```
+
+Compare Benchmark 2 at Deadline 4: **24/25 versus 0/25**. Same shape, same
+cause, third invariant. The rooms case is arguably the cleaner
+demonstration, because rooms have *no counter at all* — the overlap
+invariant is enforced entirely by a GiST exclusion constraint, and that
+constraint is perfectly correct throughout. It simply cannot see a fact
+about the user. Two different rooms are two different resources; nothing
+serializes them but the user row.
+
+The unit differs and nothing else does. GPUs are held in units, so the
+GPU quota SUMs `gpu_count`; a room hold and a course seat are
+indivisible, so those COUNT rows.
+
+## The course-load quota was an addition, not a reordering
+
+`courses.service.register` has taken the user lock since Deadline 4, for
+the schedule-overlap check — which is a fact about the student for
+exactly the reason the quota is. So Deadline 6 added a gate *inside* a
+lock that already existed. The Deadline 4 write-up predicted this in
+those words, and it held.
+
+**Gate order: `ALREADY_ENROLLED` → quota → `SCHEDULE_CONFLICT` →
+`CAPACITY_EXHAUSTED`.** Each boundary is deliberate. Quota comes *after*
+already-enrolled because a caller asking about a seat they hold should be
+told that, not told they are at their limit — the count includes the seat
+they are asking about. It comes *before* the other two because a student
+at their limit cannot register for anything, so a clash or a full section
+is a detail about a request that was never going to succeed. That also
+matches the GPU path, where `check_gpus.py` already asserts quota fires
+before capacity.
+
+## `resources.status` is now written as well as read
+
+Deadlines 3 and 4 built the gates that READ `status` under a row lock.
+`PATCH /rooms/{id}` and `PATCH /gpus/{id}` are the only things that write
+it. That order was the right one: a flag nothing enforces is worth less
+than an enforced flag nothing can set, and the second is one endpoint
+away from the first.
+
+Neither PATCH needs a lock for the status write itself. `reserve_room`
+holds `FOR SHARE` on that row across its gate, so a concurrent booking
+either commits before the UPDATE can proceed or waits and then sees
+BLOCKED — the serialization is already paid for by the reader.
+
+## THE FINDING — §13's capacity-reduction rule contradicts the schema
+
+`ARCHITECTURE_AND_WORKFLOWS.md` §13 says:
+
+> *if an admin lowers a cluster from 8 to 4 while 6 are allocated,
+> existing reservations are not retroactively evicted; the new limit
+> applies only to future allocations and `allocated` drains naturally.*
+
+**That state cannot be stored.** `gpu_capacity_sane` is
+`allocated >= 0 AND allocated <= gpu_count`, so `gpu_count = 4` with
+`allocated = 6` is rejected by Postgres. Implemented literally, §13 would
+arrive at the caller as a 500 from a CHECK violation. The document
+describes a database state the schema forbids, and it has said so since
+Deadline 1 — nothing read it against the constraint until an endpoint
+existed to try.
+
+**Resolved by refusing the reduction, not by dropping the CHECK.**
+`409 CAPACITY_BELOW_ALLOCATED`, decided against the row just locked
+`FOR UPDATE` so an allocation cannot commit between the check and the
+write.
+
+The reasoning for keeping the constraint: it is what makes a locking bug
+in the flagship transaction fail *loudly* instead of quietly overselling
+a cluster. `check_gpus.py` leans on it — a clean capacity race is also
+evidence that no request had to be saved by the CHECK. Trading that for
+one sentence of documented convenience is a bad exchange.
+
+And §13's *intent* survives intact: nothing is ever evicted. An admin
+shrinks to `allocated` immediately and further as holds are released.
+Only the literal example — 8 down to 4 with 6 held — is unavailable.
+**§13 needs the correction**; it is made in that file at this deadline.
+
+## The read endpoint must not fail closed the way the transaction does
+
+`limit_for` raises `QuotaNotConfigured` on a missing policy row, which is
+right inside an allocation: no policy means no permission, and one
+un-seeded row must not silently switch the invariant off.
+
+It is wrong in `GET /me/quota`. `(FACULTY, COURSE)` is deliberately
+absent, so a faculty member asking "what are my limits?" would get a 409
+for asking a reasonable question. `usage_snapshot` catches it and reports
+`configured: false` per row instead.
+
+Note the response carries two different meanings of `limit: null` —
+unlimited, and unconfigured — which is the same conflation
+`QuotaNotConfigured` exists to prevent inside the transaction. `unlimited`
+is true only when a row exists *and* says NULL, so a client can tell them
+apart without inferring.
+
+## `GET /me/quota` takes no lock, and the test proves it
+
+The plan says read-only, must not take the user lock. The reason is worth
+keeping: a number shown to a caller is stale the moment it is rendered,
+and that is fine — the allocation transaction re-reads everything under
+the lock and is what has to be right. Locking the user row to render a
+dashboard would put a GET in contention with the flagship write path.
+
+Asserted rather than asserted-about: `check_quotas.py` holds the user row
+`FOR UPDATE` in a separate session and calls the endpoint with a 5-second
+timeout. If it took the lock it would block; it answers.
+
+## Admin quota policy: PUT upserts, and absent ≠ NULL
+
+`PUT /admin/quotas/{role}/{resource}` creates the row if it does not
+exist. PUT is the right verb precisely *because* it creates: the URL
+identifies the (role, resource) pair rather than a row id, so the same
+call is correct either way and repeating it changes nothing.
+
+It also gives an admin the only in-band way to fix a missing policy.
+Before this endpoint, `(FACULTY, COURSE)` 409ing every faculty
+registration with `QUOTA_NOT_CONFIGURED` meant reaching for psql.
+
+`GET` on a missing pair returns **404, not a row with a null limit** —
+absent and NULL are different, and an endpoint that flattened them would
+teach an admin the wrong model of their own policy table. Three states,
+three spellings, and `max_units = 0` is a fourth meaning again ("none at
+all"), which is why the write schema is `ge=0` rather than `ge=1`.
+
+Nothing here takes a lock, for the reason `limit_for` already records:
+these are policy rows, not per-user state. Lowering a limit below what
+users hold does not evict, and the *implementation* of that rule is that
+nothing here looks at anyone's holdings.
+
+## The regression this deadline nearly hid in B's gate
+
+`check_rooms.py` failed eleven assertions the moment the room quota
+landed — the seed student books about ten slots to test intervals, and
+the cap is 2. Expected, and the plan's *"fix whatever B's benchmarks
+break"* is exactly this.
+
+**The second effect was not expected and matters more.** That script's
+strongest assertion fires eight simultaneous identical bookings at one
+room and requires exactly one row to land. All eight used the *same*
+student token. Once `reserve_room` took the user-row lock, those eight
+serialized on that user's row and reached the exclusion constraint one at
+a time — the assertion would still have passed, while no longer measuring
+the constraint it is named for.
+
+This project has caught the identical bug once before, in its own words
+at Deadline 4: *"a capacity race in which every racer shares one account
+is not a capacity test."* It arrived here from the opposite direction —
+not a test written wrong, but a correct test invalidated by a change
+elsewhere. Fixed by giving the racers eight distinct accounts.
+
+The quota itself is lifted for the duration of `check_rooms.py` and
+restored in cleanup, rather than spreading its bookings across users:
+several of its assertions are specifically about ONE caller booking
+adjacent and overlapping slots, and rewriting those would quietly change
+what they prove. Quota is tested in `check_quotas.py`, which is where it
+belongs.
+
+**A smaller lesson, learned by doing it wrong:** the restore first
+captured the current limit and put it back. A run that crashed midway
+left the quota unlimited, so the next run recorded `None` as "the seeded
+value" and faithfully restored the corruption. It restores a named
+constant now.
+
+## `cancel_reservation` gained a lock it did not need before
+
+The Deadline 3 docstring predicted this too. Cancelling a room hold still
+touches no shared counter — but `held_room_reservations` COUNTs ACTIVE
+rows for the owner, so flipping this row's status *is* a write to a
+quantity the quota reads. Without the user lock, a cancel and a
+concurrent booking by the same user interleave and the caller is refused
+at quota by a hold that no longer exists.
+
+The lock is on the reservation's **owner**, not the caller — an ADMIN
+releasing someone else's hold must serialize against that user's
+bookings. Same rule, same reason, as the GPU cancel path.
+
+## Smaller decisions
+
+**The admin router lives in `quotas/`, not a new `admin/` package.** The
+module that owns an invariant should own the endpoint that configures it;
+`role_quotas` is read by `limit_for` inside three transactions, and
+splitting the policy writer elsewhere would put the read and the write of
+one table in two packages. A owns both halves.
+
+**`GET /me/quota` did not bring a `users/service.py`**, contradicting
+that file's own Deadline 3 prediction. There is real domain logic, but it
+belongs to `quotas/`, which already owns every other reader of that
+policy. The router stays an HTTP wrapper — which is how the plan
+described the endpoint in the first place.
+
+**`PATCH /rooms/{id}` takes `status` only.** The plan names it *"block a
+room for maintenance."* `capacity` and `building` are editable in
+principle, in no requirement, and two deadlines from a freeze.
+
+**`allocated` is not a field on `GPUClusterUpdate`**, for the same reason
+it is absent from `GPUClusterCreate`: it is derived state owned by the
+allocation transaction. An admin who could set it directly could make it
+disagree with `SUM(active reservations)`, the invariant `check_gpus.py`
+asserts after every phase. Asserted: PATCHing it changes nothing.
+
+## Verification
+
+`scripts/check_quotas.py` — **61/61 PASS**, the seventh gate. No
+migration: `RoleQuota` shipped at Deadline 1 and `alembic check` reports
+no drift.
+
+``` text
+room 3 of 2                      -> 409 QUOTA_EXCEEDED, nothing created
+faculty, same slot               -> INTERVAL_CONFLICT, not QUOTA
+cancel then rebook               -> 201            <- cancel frees quota
+admin (NULL policy)              -> 3 bookings, unlimited
+me/quota, three resources        -> limits 2/2/6, held reflects reality
+me/quota while user row LOCKED   -> answers        <- takes no lock
+(FACULTY, COURSE) via me/quota   -> configured:false, not unlimited
+student GET/PUT /admin/quotas    -> 403 x2, policy unchanged
+GET unseeded pair                -> 404, not a null limit
+PUT creates / null / 0 / -1      -> 200, 200, 200, 422
+lower quota under a holding      -> holds survive, new booking refused
+course 2 of 1                    -> QUOTA_EXCEEDED, not SCHEDULE_CONFLICT
+re-register same offering        -> ALREADY_ENROLLED, not QUOTA
+drop then register the other     -> 201            <- DROPPED stops counting
+block a room                     -> RESOURCE_BLOCKED, hold NOT evicted
+shrink GPU below allocated       -> 409 CAPACITY_BELOW_ALLOCATED, no change
+shrink TO allocated              -> 200            <- boundary allowed
+PATCH allocated directly         -> ignored, still 2
+ROOM QUOTA RACE, 20 trials       -> 0/20 over quota   (19/20 without the lock)
+```
+
+Full regression, run **twice** to prove each gate leaves the state the
+next one assumes: `check_jwt`, `check_auth`, `check_rbac`, `check_rooms`,
+`check_gpus`, `check_courses`, `check_idempotency`, `check_quotas` — all
+pass, both times. B's three benchmarks re-run after the change:
+Benchmark 1 `PASS — exactly 10 in every trial`, Benchmark 2 `PASS`,
+Benchmark 3 `PASS`.
+
+---
+
+## Deadline 6 joint work, part 1: A's review of `session.py` — APPROVED
+
+B changed a shared file solo across sessions 12 and 13, flagged it for A's
+review three times, and attached a measured failure as the justification.
+This is that review. **Verdict: approved, with two findings, neither
+blocking.**
+
+### What was checked against the running system, not the comment
+
+Every number in B's justification block was re-derived rather than read:
+
+``` text
+claim in the comment              verified                     result
+--------------------------------------------------------------------------
+anyio thread ceiling = 40         current_default_thread_       40      OK
+                                  limiter().total_tokens
+max_connections = 100             SHOW max_connections          100     OK
+superuser_reserved = 3            SHOW superuser_reserved_      3       OK
+                                  connections
+pool_size + overflow = 50         engine.pool.size() = 40,      50      OK
+                                  _max_overflow = 10
+50 > 40 (pool exceeds threads)    arithmetic                    holds   OK
+```
+
+**The core argument is correct and is the right diagnosis.** FastAPI runs
+`def` endpoints in anyio's worker thread pool, so at most 40 requests are
+ever inside a handler; a pool smaller than that ceiling guarantees
+starvation regardless of load shape. Sizing the pool *above* the ceiling
+is what makes checkout non-blocking, and dropping `pool_timeout` from 30s
+to 10s follows from it: with 50 > 40 a timeout can no longer be
+contention, so it should surface fast as the misconfiguration it now is.
+
+**Approved because the finding was measured, not reasoned.** 500
+concurrent registrations on the defaults returned `errors=500/500` with a
+126-second median — the run measured the pool and never reached a lock.
+A shared-file change made solo needs a stronger justification than
+convenience, and "the benchmark produces no number at all" is one.
+
+### Finding 1 — the connection budget in the comment is wrong (minor)
+
+The budget table says `benchmark script's own pool  15`. It is not 15.
+`tests/concurrency/harness.py::tool_session_factory` creates `pool_size=5,
+max_overflow=2` — **7**. The number 15 is the old SQLAlchemy default,
+which after this very change applies nowhere in the project.
+
+Worst case is therefore `50 + 7 + 1 psql ≈ 58`, not the stated 65. The
+conclusion is unaffected — 58 is further under 97 than 65 was — so this
+is a documentation defect rather than a sizing defect. It matters only
+because that table *is* the argument for a solo change to a shared file,
+and a wrong number in the argument invites a reader to distrust the rest
+of it.
+
+### Finding 2 — the gates use the server's pool, which B's own rule forbids
+
+`tool_session_factory` exists precisely because a benchmark process
+importing the application's `SessionLocal` silently reserves a second
+50-connection pool, and B measured the consequence: 387 of 500 requests
+returned `500` while the harness competed for the same 100 connections.
+The docstring is emphatic that benchmarks must not do this.
+
+**Eight scripts do exactly that.** All seven `scripts/check_*.py` gates
+and `scripts/seed.py` import `app.database.session.SessionLocal`, so each
+run holds an engine sized for the server.
+
+They get away with it today because their database use is essentially
+sequential — measured at one to three connections in practice — while
+their concurrency is HTTP-side through `httpx`. So this is latent, not
+live, and it is not a reason to withhold approval.
+
+It is worth fixing before Deadline 9's clean-room run for one reason:
+**the failure would be silent and misattributed.** A check script that
+ever grows a threaded database section reserves up to 50 connections, and
+the symptom appears inside the *server* as a `QueuePool` timeout — which
+reads exactly like the bug this change fixed, in a file nobody would
+think to look at.
+
+**Proposed fix, not applied here:** the gates take the same small pool
+the benchmarks take. That touches two of B's scripts (`check_rooms`,
+`check_courses`) and `seed.py`, so it is a joint change rather than
+something to land inside a review. Recorded for the same session that
+ratifies items 9, 10 and 7.
+
+### What this review does NOT cover
+
+`get_db()` and `SessionLocal` are unchanged by B and were not re-reviewed;
+`expire_on_commit=False` and the deliberate absence of a commit in
+`get_db` remain as settled at Deadline 1, and the GPU transaction's
+correctness depends on both.
+
+---
+
+## Deadline 6 joint work, part 2: swap review — HELD; this was the preparation
+
+> **The review took place** and closed Deadline 6. What follows is what
+> was written *before* it — the walkthrough A owed B, and what A should
+> be able to answer when B reciprocated. It is kept unedited rather than
+> rewritten in hindsight, because the value of a prepared walkthrough is
+> that it shows what A understood going in.
+>
+> **What is not here: B's answers.** The four questions at the end of
+> part 3 were the point of holding the session, and their answers were
+> not recorded. If they were given, they belong in this file — an answer
+> nobody wrote down is an answer nobody has in two months, which is the
+> entire reason this file exists.
+
+### A walks B through the GPU transaction — the spine of the walkthrough
+
+`gpus/service.py::reserve_gpu`. Three guarantees meet in one function and
+each has a *different* serialization point. That is the whole talk:
+
+``` text
+exactly-once  a fact about the REQUEST   -> UNIQUE(key,user_id) index
+quota         a fact about the USER      -> user row  FOR UPDATE
+capacity      a fact about the RESOURCE  -> cluster row FOR UPDATE
+```
+
+Six points to make in order, each with the reason it is not the obvious
+alternative:
+
+1. **Step (0) reads existence without a lock, and that is safe** because
+   `resource_type` is immutable while `status` is not. The mutable one is
+   read under the lock at step (3); the immutable one is not. Without
+   step (0) an over-quota caller naming a nonexistent cluster gets
+   `QUOTA_EXCEEDED` instead of a 404 — found by running it.
+2. **Step (1) is above both locks** so a replayed request never queues
+   for them. The serialization point is an index, not a lock, because
+   *there is nothing to lock until somebody creates the row, and creating
+   it is exactly the window a retry arrives in.*
+3. **The SAVEPOINT.** A unique violation aborts the whole transaction, so
+   the read that fetches the stored response cannot run without it.
+   Measured: 86 of 120 concurrent retries become 500s.
+4. **Step (2) locks the USER, not the resource** — and this is the
+   sentence B must be able to say unprompted: *the lock was never
+   missing, it was the wrong lock for that invariant.* Two 2-unit
+   requests at two different clusters contend on no common row; both
+   cluster locks work perfectly and the student ends up holding 4.
+5. **Step (3) is `FOR UPDATE` here and `FOR SHARE` in rooms**, because
+   this path writes the row it locks and the room path does not. B should
+   be asked to explain that difference in the other direction.
+6. **`populate_existing()` is load-bearing**, and item 11 is still open:
+   the probe says the locked read is stale on this path too, yet the race
+   will not reproduce it. Present it as unresolved, because it is.
+
+### What A must be able to answer when B reciprocates
+
+B's half is the exclusion constraint and the harness. A should come out
+of it able to say, without B present:
+
+- why `EXCLUDE USING gist` with `'[)'` makes adjacent bookings succeed,
+  and why the constraint is partial on `status = 'ACTIVE'`;
+- why the room path takes no "is this slot free?" SELECT — the check
+  passes exactly when it does not matter;
+- why the harness reports **achieved** concurrency rather than requested,
+  and what the 40-thread ceiling means for the phrase "500 concurrent"
+  that appears in three documents;
+- why Benchmark 1's broken build reads a *fresh* value and still
+  oversells — it is not a stale read, so `populate_existing` does not fix
+  it and only the lock does.
+
+### Deadline 10's four questions, to be rehearsed here rather than there
+
+Each writes their own answer, separately, then compares:
+
+``` text
+Why is the quota lock on the user, not the resource?
+Why must the idempotency key commit in the same transaction?
+Why does fixed lock ordering prevent deadlock -- and where does
+  waitlist promotion sit relative to that claim? (see items 9/10/7)
+What did you deliberately NOT build, and why?
+```
+
+The third has changed since it was written: promotion is now *proposed*
+to sit outside the ordering argument entirely, by never waiting. Both
+people should be able to explain why that is stronger than obeying the
+order, not weaker.
+
+---
+
+## Deadline 6 joint work, part 3: A's study of B's modules
+
+> Written by A, from B's code, **before** the swap review rather than
+> after it. The point of the swap is that each person can explain the
+> other's module unprompted; doing the reading first means the live
+> session is B *correcting* A rather than B *teaching* A, which is a
+> better use of an hour and a harder test of whether A actually
+> understood it. **Errors below are A's and are exactly what B should be
+> looking for.** Unresolved questions are listed at the end rather than
+> guessed at.
+
+### The exclusion constraint — `e0fbfe421403`
+
+``` sql
+EXCLUDE USING gist (
+    resource_id                              WITH =,
+    tstzrange(start_time, end_time, '[)')    WITH &&
+) WHERE (status = 'ACTIVE');
+```
+
+Four things carry the whole room guarantee, and A should be able to name
+each without the file open:
+
+1. **`btree_gist` is not optional.** GiST handles ranges natively but not
+   scalar equality; the extension is what allows `resource_id WITH =` and
+   the range overlap to live in **one** index. Two separate indexes could
+   not express "same room AND overlapping time" as a single constraint.
+2. **`'[)'` — half-open.** `[10,12)` and `[12,14)` do not overlap, so
+   back-to-back bookings both succeed. With `'[]'` a booking ending at
+   12:00 would collide with one starting at 12:00. This is the same
+   half-open convention `courses.service._times_overlap` uses with `<`
+   rather than `<=`, and the two must agree or the system contradicts
+   itself across modules.
+3. **Partial on `status = 'ACTIVE'`.** A cancelled reservation must stop
+   blocking its old slot. This is also why cancelling a room hold needs
+   no lock — releasing a slot is just making the constraint stop
+   objecting to it.
+4. **It is an index, so it serves reads too.** This is why outstanding
+   item 3 closed with *no* btree on `(resource_id, status)`: the GiST
+   index already has that exact shape, and a second index would have been
+   a duplicate nobody measured.
+
+**Why there is no "is this slot free?" SELECT before the INSERT.** The
+check passes exactly when it does not matter: two concurrent bookings can
+both run it, both see free, and both proceed. The INSERT *is* the check.
+This is the same argument as duplicate registration at Deadline 2, where
+a "does this email exist?" query was rejected for the same reason and
+`UNIQUE(email)` was made to do the work.
+
+**`FOR SHARE`, not `FOR UPDATE`, and A must be able to argue this in
+B's direction.** The room path never writes the row it locks — rooms have
+no counter, unlike `GPUCluster.allocated`. What the `BLOCKED` gate needs
+is for `status` not to *change* under it, so an admin `PATCH` cannot land
+between the check and the INSERT. `FOR SHARE` says precisely that: blocks
+writers, does not block other bookers. Taking `FOR UPDATE` would also be
+correct, and would quietly serialise every booking of one room behind
+every other — making the *application lock* rather than the constraint
+the thing deciding a slot race. The invariant would survive; the design
+claim would not.
+
+**So the room path and the GPU path are the project's cleanest contrast,
+and it is a contrast about mechanism rather than about care:** rooms have
+a constraint that can express their invariant, so the database enforces
+it and the lock is incidental. Quota has no such constraint — no
+`EXCLUDE` can say "this user holds at most 2" — so a row lock is the only
+mechanism available. Same rigour, different tool, and the reason is a
+property of the invariant, not of who wrote it.
+
+### The harness — and the finding that lands on A's file
+
+B's `tests/concurrency/harness.py` documents three throttles between
+`asyncio.gather` and a row lock: httpx `max_connections` (100 by
+default), the server's anyio thread pool (40), and the SQLAlchemy pool
+(15 by default). The harness owns only the first, fixes it, and
+**measures** the other two — `DBConcurrencyObserver` samples
+`pg_stat_activity` so a run reports the concurrency it achieved next to
+the number it requested.
+
+**The part A needs to own, because it is a consequence of A's design:**
+
+> B's first reading was that the ceiling is the 40 worker threads. It is
+> not. A connection is checked out during **dependency resolution** —
+> `get_current_user` reads the user row — and the Session holds it, with
+> an open transaction, until `get_db` closes it at the end of the
+> request. The connection is therefore held across event-loop hops, so
+> the ceiling is **requests in flight**, not threads.
+
+That is `core/dependencies.py` and `database/session.py` — both A's, both
+settled at Deadlines 1 and 3, and neither written with this consequence
+in mind. Measured by B: 500 unbounded requests gave
+`{201: 60, 500: 440}` with 50 connections sitting `idle in transaction`
+waiting on Client — the entire pool held and doing nothing.
+
+**Session-per-request, held across the whole request, is what caps this
+system's concurrency.** Not the pool size, which is why raising the pool
+did not fix it, and not the harness. A should say this in the swap review
+before B has to point at it, because "500 concurrent" appears in three of
+our documents and the honest number is the in-flight bound.
+
+Two smaller pieces of the harness worth being able to explain:
+
+- **`asyncio.Barrier` before every request.** Without it the first
+  request can complete before the last coroutine is constructed, and a
+  "concurrent" benchmark quietly becomes a sequential one — the async
+  cousin of the Deadline 4 bug where twelve racers shared one account and
+  the contended lock was never contended.
+- **`max_keepalive_connections=0`.** A reused connection is a request
+  that waited for an earlier one to finish, which is the opposite of what
+  is being measured.
+
+### Questions A could not answer from the code — for B
+
+1. **Is `max_in_flight = 40` derived or coincidental?** The docstring
+   argues the ceiling is requests-in-flight rather than the 40 anyio
+   threads, and then the number chosen is also 40. If those are
+   independent facts that happen to agree, the comment should say so;
+   if 40 was picked *because* of the thread pool, the argument above it
+   is the one that is wrong.
+2. **What exactly is the observer counting?** It excludes its own
+   `pg_backend_pid()` but counts every `active` backend on the database,
+   which would include the benchmark's own bookkeeping connections and
+   any stray `psql`. Is the reported peak meant to be "our requests" or
+   "everything"?
+3. **`Result.body` was added last with a default** so existing
+   constructions stayed valid — has anything been checked for
+   *positional* construction of `Result`, where a new trailing field is
+   safe but a reordering would not be?
+4. **A related trap A should flag, not ask about.**
+   `get_current_user` puts the `User` in the identity map during
+   dependency resolution — *before* any lock. `reserve_gpu` then locks
+   with `select(User.id)`, a Core select that does not refresh that
+   object, and `enforce_gpu_quota` reads `user.role` from the pre-lock
+   copy. Harmless today, because role is not the invariant being
+   protected and a stale role is already ruled out by `require_role`
+   reading the database row. But it is the same shape as item 11, and it
+   is worth both of us agreeing out loud that it is harmless rather than
+   discovering later that it was not.
+
+---
+
+## Deadline 7 groundwork: the gate written before the transaction
+
+`scripts/check_waitlist.py`, the seventh gate. **Part 1 runs and passes
+today; Part 2 holds the promotion assertions and skips while the waitlist
+routes do not exist.** It detects them from the live `openapi.json`
+rather than from a hardcoded path, because item 10 is unratified and the
+route may land as `POST /offerings/{id}/waitlist` or as a fall-through on
+register.
+
+**Why write it before the code.** This project has been bitten twice by
+tests written afterwards: Benchmark 2 passed against the build it existed
+to indict, and Deadline 3's room checks were green while
+`dependencies.py` was still a stub accepting any token and no token
+alike. A test written after the code tends to test the code, not the
+claim. The Deadline 7 checkpoint is already specific, and **none of its
+assertions depends on how items 9, 10 or 7 are ratified** — item 9
+decides how the transaction takes its locks, not what must be true when
+it commits.
+
+### Part 1 is not filler — it proves the ground promotion stands on
+
+The FIFO guarantee is `ORDER BY created_at, id`, and the `id` tiebreak is
+load-bearing because **`func.now()` is transaction start time**, so every
+row written in one transaction shares a `created_at` exactly. That has
+been asserted in prose since Deadline 2 and was never tested. It is now:
+
+``` text
+3 waitlist rows, ONE transaction  -> 3 rows, 1 distinct created_at
+ORDER BY created_at alone         -> cannot express FIFO. Proven, not quoted.
+ORDER BY created_at, id           -> insertion order, ids strictly increasing
+ROW_NUMBER() OVER (...)           -> positions 1,2,3 with nothing stored
+```
+
+If that ever stops being true the promotion transaction's ordering
+becomes undefined, and **nothing in the promotion tests themselves would
+catch it** — the entries would simply come back in some order and the
+assertions would pass.
+
+Part 1 also pins three things promotion will collide with:
+
+- **no `position` column** — dropped in `c86676652ca2`; its reappearance
+  would be a regression, since renumbering after a promotion transiently
+  violates a unique constraint mid-UPDATE;
+- **a DROPPED student still owns an enrollment row**, because
+  `enrollment_unique` is unconditional — so promotion must **UPDATE, not
+  INSERT**, the same trap registration hit at Deadline 4 and the one
+  `courses/service.py` predicted promotion would hit next;
+- **a full offering returns `409 CAPACITY_EXHAUSTED` and writes no
+  waitlist row** — item 10 *observed* rather than decided, so whichever
+  way it is ratified the change to what `POST /register` means shows up
+  here instead of silently.
+
+### The eight pending assertions
+
+``` text
+promotion follows FIFO by (created_at, id)
+promotion respects the promoted student's course-load quota
+a quota-breaching candidate is SKIPPED, next eligible promoted
+2 concurrent drops -> exactly 2 DISTINCT promotions
+2 concurrent drops -> no entry promoted twice
+promotion DELETES the waitlist row, renumbering nothing
+promoted student's enrollment is an UPDATE of the DROPPED row
+GET waitlist reports position from ROW_NUMBER(), never stored
+```
+
+The gate exits 0 while they are pending and **turns red the moment
+Deadline 7 is half-built** — if a waitlist route appears and Part 2 has
+not been written against it, that is a failure, not a skip. A pending
+test that quietly passes forever is the thing this design exists to
+avoid.
+
+---
+
+## Extra item, carried out of Deadline 6: A's proposal on items 9, 10 and 7
+
+> **PROPOSED, NOT RATIFIED.** All three are joint calls and none of them
+> is settled by this section being written. It exists because item 9 is
+> *A's transaction to design*, and arriving at the joint session with a
+> recommendation is A's job rather than arriving with the question. The
+> shape follows outstanding item 6, which sat here as "proposed, still
+> needs ratifying" until Deadline 3 signed it off.
+>
+> **Nothing below is implemented.** No waitlist code exists.
+
+### The deadlock is real, and here it is concretely
+
+`courses.service.drop` holds **user(dropper) → offering**, verified in the
+code rather than assumed. Promotion hangs off that transaction, so by the
+time it runs, both of those locks are held. To check the promoted
+student's course-load quota it must lock a *second* user row — and it
+cannot know which one until it has read the waitlist, which needs the
+offering lock it is already holding.
+
+That ordering is offering → user, and registration is user → offering.
+The cycle:
+
+``` text
+T1  student X drops offering O
+      holds  user(X)        -> offering(O)
+      wants  user(Y)                          to promote Y
+
+T2  student Y registers for offering O
+      holds  user(Y)
+      wants  offering(O)
+
+T1 waits on Y's row. T2 waits on O's row. Neither releases. DEADLOCK.
+```
+
+This is not hypothetical and it is not rare — Y being on the waitlist for
+O makes Y *more* likely than average to be touching O.
+
+### Why the obvious fixes do not work
+
+**"Lock the user first, like everywhere else."** Impossible in principle.
+Which user? Y's identity is the *output* of reading the waitlist, and
+reading the waitlist consistently requires the offering lock. There is no
+ordering of "lock Y" before "discover Y."
+
+**"Promote in a separate transaction after the drop commits."** Removes
+the cycle by removing the overlap, and it is the honest runner-up. Cost:
+a window where a seat is free and a waitlist is non-empty, in which an
+ordinary registration can take the seat ahead of everyone queued. That is
+defensible as first-come but it defeats what a waitlist is for, and a
+crash inside the window leaves the seat unclaimed with no sweeper to
+notice. Rejected, recorded rather than discarded.
+
+**"Give courses the opposite global order — offering → user everywhere."**
+Internally consistent, and safe only because no transaction spans the
+course and GPU subsystems. It would mean two lock orders in one codebase
+distinguished by which module you are in, contradicting §14's "every
+path" claim outright, and it would require reopening `register` two
+deadlines before the freeze. Rejected.
+
+### The proposal: promotion never waits for a user row
+
+**A cycle requires a circular *wait*. Remove the waiting and the ordering
+stops mattering.**
+
+Promotion takes the offering lock (already held), reads waitlist
+candidates oldest-first, and attempts each candidate's user row with
+`FOR UPDATE ... SKIP LOCKED`. If that row is not immediately available,
+the candidate is skipped and the next one is tried.
+
+``` text
+LOCK user(dropper)                        <- already held by drop
+LOCK offering                             <- already held by drop
+  decrement enrolled_count for the drop
+
+  for each waitlist entry, ORDER BY created_at, id:
+      try LOCK user(candidate) SKIP LOCKED
+      if not acquired          -> skip, try the next entry
+      if course-load quota full -> skip, try the next entry
+      otherwise                -> promote exactly one, stop
+COMMIT
+```
+
+T1 in the example above no longer waits on user(Y); it skips Y and
+promotes the next eligible entry. T2 proceeds. **No wait, no cycle, and
+the global order needs no exception written into it** — promotion simply
+stops being a path that can participate in a deadlock, which is a
+stronger statement than promotion obeying the order.
+
+**Why skipping is not a new concession.** The Deadline 7 spec already
+says *"check that student's course-load quota; if it would breach, skip
+to the next eligible entry."* FIFO is therefore already defined over
+*eligible* entries, not all entries. This proposal adds one clause to
+eligibility — "and their row is not currently locked" — rather than
+inventing a weaker guarantee.
+
+**What it costs.** Strict FIFO is not preserved when a queued student is
+concurrently doing something else. This should be stated in the README
+rather than glossed: the promise is *oldest eligible*, not *oldest*.
+Note it does not affect Benchmark 4 as specified — 2 concurrent drops
+against 3 waitlisted students who are otherwise idle, so no candidate row
+is locked and order is preserved exactly.
+
+**The quota check stays under a real lock**, which was the other half of
+item 9 and the half that matters most: an unprotected quota check is the
+precise failure Benchmark 2 exists to demonstrate, and shipping one in
+the promotion path would contradict the project's central claim.
+
+### Item 10: joining is EXPLICIT — `POST /offerings/{id}/waitlist`
+
+Recommended over auto-waitlisting on a full register, mainly for one
+reason that this project has already paid to learn once:
+
+**auto-waitlisting makes one status code mean two things.** A `201` from
+`POST /register` would sometimes mean "you have a seat" and sometimes
+"you are queued", and the caller would have to read the body to find out
+which. That is the same defect as returning `200` for an idempotent
+replay — settled at Deadline 5, where the rule was that a client
+branching on the status code must not be sent down the wrong branch.
+`409 CAPACITY_EXHAUSTED` keeps meaning exactly one thing.
+
+Secondary: it is less surface two deadlines before a freeze, and it is
+the reading `INIT_PLAN.md` §12 already specifies.
+
+Against: an extra round trip, and Workflow D in
+`ARCHITECTURE_AND_WORKFLOWS.md` reads `else → waitlist`. **Workflow D
+needs correcting if this is ratified** — the same kind of doc correction
+§13 needed at this deadline.
+
+### Item 7: `EnrollmentStatus.WAITLISTED` is never written
+
+Follows directly from item 10, as that item predicted. With explicit
+joining, a queued student has a row in `waitlist_entries` and nothing
+else. Writing an enrollment row with `status = WAITLISTED` would put the
+same fact in two tables — the failure mode this project keeps finding —
+and `held_course_enrollments` counts `ACTIVE` only, so such a row would
+be invisible to the course-load quota that is supposed to govern it.
+
+**Recommendation: never write it, and leave the enum value in place.**
+Removing a value from a Postgres enum means recreating the type and
+rewriting the column, which is a migration and a shared-file change
+buying zero behavioural difference. A comment in `models/enums.py` saying
+"never written; waitlist membership lives in `waitlist_entries`" is
+cheaper and equally clear. If Deadline 8's integration pass wants the
+enum clean, that is the moment to spend the migration — with both people
+present, since it is `models/`.
+
+### What ratifying this unblocks
+
+Items 9, 10 and 7 are the three things standing between here and
+Deadline 7. Ratified, A writes the promotion transaction and B writes the
+waitlist endpoints against a settled entry point. Item 11 remains open
+and is worth resolving in the same session, because promotion is the next
+locked read anyone writes and it is the read most likely to be bitten.

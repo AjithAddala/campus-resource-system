@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import func
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -8,7 +8,8 @@ from app.models.enums import ReservationStatus, ResourceStatus, ResourceType, Ro
 from app.models.reservation import Reservation
 from app.models.resource import Resource, Room
 from app.models.user import User
-from app.rooms.schemas import ReservationCreate, RoomCreate
+from app.quotas import service as quotas
+from app.rooms.schemas import ReservationCreate, RoomCreate, RoomUpdate
 
 
 def list_rooms(db: Session) -> list[Room]:
@@ -116,15 +117,17 @@ def reserve_room(
     because a single path taking them the other way round reintroduces the
     deadlock cycle for every path.
 
-    This transaction takes only the SECOND of those locks, and that is
-    consistent rather than an exception: room quota lands at Deadline 6,
-    when A adds the user-row lock and the held-reservations count. The
-    user lock belongs immediately BELOW this docstring and ABOVE the
-    resource lock, and there is deliberately nothing between them now, so
-    inserting it is an addition rather than a reordering.
+    **Deadline 6 inserted the first of those locks, exactly where the
+    Deadline 3 comment said it would go** -- above the resource lock, with
+    nothing moved. The room quota is now the invariant that earns it:
+    "this user holds at most N concurrent room reservations" is a fact
+    about the USER, and no resource lock can see it, because two bookings
+    of two DIFFERENT rooms contend on no common row. That is the same
+    failure shape as the cross-cluster GPU race, on a third invariant.
 
-    Taking the user lock today would be a lock protecting no invariant --
-    the project's own standard is that complexity is earned.
+      (1) LOCK the user row   -> guards the room quota
+      (2) LOCK the room row   -> guards the BLOCKED gate (FOR SHARE)
+      (3) INSERT              -> the exclusion constraint guards overlap
     ------------------------------------------------------------------
 
     Why the resource row is locked at all, when rooms have no counter:
@@ -160,6 +163,22 @@ def reserve_room(
     about which mechanism is load-bearing, not a measured throughput
     claim. Deadline 5's harness is what could measure it.)
     """
+    # --- (1) QUOTA GATE, Deadline 6 -------------------------------------
+    # Taken FIRST, per the global order, and held to COMMIT. Note this
+    # happens before the room is known to exist -- the existence check is
+    # the `resource is None` branch below, which now runs while holding a
+    # lock on the caller's own row. That costs one user-row lock for a
+    # request that 404s, and it buys the ordering: acquiring the user lock
+    # after the resource lock in even one path is what reintroduces the
+    # deadlock cycle for every path.
+    db.execute(select(User.id).where(User.id == user.id).with_for_update())
+
+    # Read AFTER the lock, always -- the same rule as the GPU gate. A
+    # count read before the lock is a count that can move before the
+    # INSERT, which is precisely the race being closed.
+    quotas.enforce_room_quota(db, user.id, user.role)
+
+    # --- (2) BLOCKED GATE -----------------------------------------------
     # Locks the `resources` row -- the base table, which is where `status`
     # lives. Querying the base class also avoids joining `rooms`, whose
     # columns this path never reads. `read=True` emits FOR SHARE.
@@ -222,23 +241,26 @@ def cancel_reservation(
 ) -> Reservation | None:
     """Release a room hold. Owner or ADMIN. Returns None if not found.
 
-    **No locks, and that is not an oversight.** Compare with
-    `gpus.service.cancel_gpu_reservation`, which takes two: that path
-    decrements `GPUCluster.allocated`, a counter shared by every user of
-    the cluster, so it must serialize. A room hold owns no counter. The
-    only state changing here is this reservation's own `status`, and the
-    exclusion constraint reads that status at INSERT time — so releasing
-    a slot simply makes the constraint stop objecting to it.
+    **Deadline 6 gave this transaction a lock it did not need before**,
+    exactly as the Deadline 3 docstring predicted. It still touches no
+    shared counter — unlike `gpus.service.cancel_gpu_reservation`, which
+    decrements `GPUCluster.allocated`. What changed is that
+    `held_room_reservations` now COUNTs ACTIVE rows for the owner, so
+    flipping this row's status *is* a write to a quantity the room quota
+    reads. Without the user lock, a cancel and a concurrent booking by the
+    same user interleave: the booking counts this row as still held,
+    refuses at the limit, and the caller is told they are at quota by a
+    hold that no longer exists.
 
-    What about two concurrent cancels of the same row? The second finds
-    `status = CANCELLED` and returns, exactly as the GPU path does — but
-    here there is nothing to double-decrement, so the check is about
-    answering consistently rather than about protecting a number.
+    The lock is on the reservation's **OWNER**, not the caller — an ADMIN
+    releasing someone else's hold must serialize against that user's
+    bookings, and locking the admin's own row would protect nothing. Same
+    rule, same reason, as the GPU cancel path.
 
-    Room quota at Deadline 6 will change this: once "how many active
-    holds does this user have" is a gate, a release becomes a change to a
-    quantity the quota reads, and this transaction will take the user
-    lock — first, per the global order.
+    Two concurrent cancels of the same row: the second finds
+    `status = CANCELLED` and returns. There is still nothing to
+    double-decrement, so that check answers consistently rather than
+    protecting a number.
     """
     reservation = db.get(Reservation, reservation_id)
 
@@ -252,6 +274,21 @@ def cancel_reservation(
     if reservation.user_id != user.id and user.role is not Role.ADMIN:
         raise NotOwner(reservation_id)
 
+    # Cheap pre-check outside the lock: an already-cancelled hold needs no
+    # lock at all. Re-checked under the lock below, because this read can
+    # go stale -- this one only avoids taking a lock needlessly.
+    if reservation.status is ReservationStatus.CANCELLED:
+        return reservation
+
+    # Deadline 6: lock the OWNER's row, so this release serializes against
+    # that user's bookings. See the docstring.
+    db.execute(
+        select(User.id).where(User.id == reservation.user_id).with_for_update()
+    )
+
+    # Re-read under the lock. A concurrent cancel of this same row could
+    # have committed between the pre-check and here.
+    db.refresh(reservation)
     if reservation.status is ReservationStatus.CANCELLED:
         return reservation
 
@@ -259,3 +296,43 @@ def cancel_reservation(
     db.commit()
     db.refresh(reservation)
     return reservation
+
+
+# ---------------------------------------------------------------------------
+# Admin resource-status writes — Deadline 6
+# ---------------------------------------------------------------------------
+
+
+def update_room(db: Session, room_id: int, payload: RoomUpdate) -> Room | None:
+    """Admin edit of a room. Returns None if `room_id` is not a room.
+
+    **This endpoint WRITES `resources.status`; Deadlines 3 and 4 built the
+    gates that READ it.** That split is the whole point of outstanding
+    item 6: blocking is admin-controlled mutable state, which is why both
+    gates read it under the row lock rather than at their boundary, and
+    why this handler can flip it without knowing anything about
+    reservations.
+
+    Blocking does **not** evict existing holds — the rule ratified at
+    Deadline 3 and asserted in `check_rooms.py`. An active reservation in
+    a room that is later blocked stays valid; only new bookings are
+    refused. So there is nothing to cascade here and no lock to take: the
+    booking path reads this column under `FOR SHARE`, so a concurrent
+    booking either sees AVAILABLE and commits before this UPDATE can
+    proceed, or waits and then sees BLOCKED. The serialization is already
+    paid for by the reader.
+    """
+    room = get_room(db, room_id)
+    if room is None:
+        return None
+
+    # `exclude_unset` so that omitting a field means "leave it alone"
+    # rather than "set it to null". PATCH is a partial update, and a
+    # Pydantic model with `None` defaults cannot tell the two apart
+    # without this.
+    for field, value in payload.model_dump(exclude_unset=True).items():
+        setattr(room, field, value)
+
+    db.commit()
+    db.refresh(room)
+    return room

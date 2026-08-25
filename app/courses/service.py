@@ -6,6 +6,7 @@ from app.models.course import Course, CourseOffering
 from app.models.enrollment import Enrollment
 from app.models.enums import EnrollmentStatus
 from app.models.user import User
+from app.quotas import service as quotas
 
 
 def list_courses(db: Session) -> list[Course]:
@@ -177,6 +178,29 @@ def register(db: Session, offering_id: int, student: User) -> Enrollment | None:
     # promotion at Deadline 7.
     if existing is not None and existing.status is EnrollmentStatus.ACTIVE:
         raise AlreadyEnrolled(offering_id)
+
+    # --- COURSE-LOAD QUOTA, Deadline 6 ----------------------------------
+    # Inside the user lock taken above -- an addition, not a reordering,
+    # exactly as the Deadline 4 write-up predicted. Nothing moved.
+    #
+    # **Gate order: after ALREADY_ENROLLED, before SCHEDULE_CONFLICT and
+    # OFFERING_FULL**, and each boundary is deliberate:
+    #
+    #   after AlreadyEnrolled  a caller who already holds this seat should
+    #                          be told that, not told they are at their
+    #                          limit -- they are asking about a seat they
+    #                          have, and the count includes it.
+    #   before ScheduleConflict / OfferingFull
+    #                          a student at their limit cannot register
+    #                          for ANY offering, so a clash or a full
+    #                          class is a detail about a request that was
+    #                          never going to succeed. This also matches
+    #                          the GPU path, where `check_gpus.py` asserts
+    #                          quota fires before capacity.
+    #
+    # A DROPPED row does not count, so re-registering after a drop is
+    # correctly seen as acquiring a seat the student does not hold.
+    quotas.enforce_course_quota(db, student.id, student.role)
 
     conflict = _conflicting_offering(db, student.id, offering)
     if conflict is not None:

@@ -9,12 +9,14 @@ from app.database.session import get_db
 from app.models.enums import Role
 from app.models.user import User
 from app.rooms import service
+from app.quotas import service as quotas
 from app.rooms.schemas import (
     ReservationCreate,
     ReservationRead,
     RoomAvailability,
     RoomCreate,
     RoomRead,
+    RoomUpdate,
 )
 
 router = APIRouter(prefix="/rooms", tags=["rooms"])
@@ -34,6 +36,34 @@ def create_room(
     room without reaching for the seed script or psql.
     """
     return service.create_room(db, payload)
+
+
+@router.patch("/{room_id}", response_model=RoomRead)
+def patch_room(
+    room_id: int,
+    payload: RoomUpdate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(Role.ADMIN)),
+) -> RoomRead:
+    """Block or unblock a room. ADMIN only. Deadline 6.
+
+    **This is the endpoint that WRITES `resources.status`.** It was in
+    Workflow E of `ARCHITECTURE_AND_WORKFLOWS.md` and in INIT_PLAN.md §12
+    from the beginning with no deadline assigned — the same gap that left
+    `GET /me`, `POST /gpus` and `GET /me/quota` ownerless. The gates that
+    READ this column shipped first, at Deadlines 3 and 4, which is the
+    right order: a flag nothing enforces is worth less than an enforced
+    flag nothing can set, and the second is one endpoint away from the
+    first.
+
+    Blocking does **not** evict existing reservations — outstanding item
+    6, ratified at Deadline 3, and asserted in `check_rooms.py`. It stops
+    new bookings only.
+    """
+    room = service.update_room(db, room_id, payload)
+    if room is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Room not found")
+    return room
 
 
 @router.get("", response_model=list[RoomRead])
@@ -124,6 +154,25 @@ def reserve_room(
     """
     try:
         reservation = service.reserve_room(db, room_id, user, payload)
+    except quotas.QuotaExceeded as exc:
+        # Deadline 6. Distinct from INTERVAL_CONFLICT because the remedy
+        # is distinct: the slot is free and the room is fine -- the caller
+        # is holding too many rooms and must release one. Same code as the
+        # GPU path emits, because it is the same invariant on a different
+        # resource, and a client should not have to learn a second name
+        # for it.
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "QUOTA_EXCEEDED",
+            f"You hold {exc.held} of {exc.limit} permitted room reservations.",
+        )
+    except quotas.QuotaNotConfigured as exc:
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "QUOTA_NOT_CONFIGURED",
+            f"No quota policy is configured for role {exc.role.value} "
+            f"and resource {exc.resource_type.value}.",
+        )
     except service.RoomBlocked:
         # Outstanding item 6, ratified at Deadline 3. Distinct from both
         # existing 409s because the remedy is distinct: try a different

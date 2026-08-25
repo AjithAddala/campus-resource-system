@@ -8,6 +8,7 @@ from app.courses.schemas import CourseOfferingRead, CourseRead, EnrollmentRead
 from app.database.session import get_db
 from app.models.enums import Role
 from app.models.user import User
+from app.quotas import service as quotas
 
 # Two routers, deliberately. Reads stay course-shaped because browsing a
 # catalogue genuinely is; write paths are offering-shaped because the
@@ -92,11 +93,16 @@ def register_for_offering(
     token. There is nothing for a caller to get wrong, and nothing to
     validate.
 
-    Three 409s, distinguishable by code because the remedies differ:
+    Four 409s, distinguishable by code because the remedies differ:
 
         ALREADY_ENROLLED     you already hold this seat  -> nothing to do
-        SCHEDULE_CONFLICT    it clashes with another      -> drop that one
-        CAPACITY_EXHAUSTED   the section is full          -> wait / another
+        QUOTA_EXCEEDED       your course load is full    -> drop any one
+        SCHEDULE_CONFLICT    it clashes with another     -> drop that one
+        CAPACITY_EXHAUSTED   the section is full         -> wait / another
+
+    The order they are checked in is the service's, and it is deliberate;
+    `service.register` explains why quota comes after ALREADY_ENROLLED
+    and before the other two.
     """
     try:
         enrollment = service.register(db, offering_id, student)
@@ -105,6 +111,26 @@ def register_for_offering(
             status.HTTP_409_CONFLICT,
             "ALREADY_ENROLLED",
             "You are already enrolled in this offering.",
+        )
+    except quotas.QuotaExceeded as exc:
+        # Deadline 6. `QUOTA_EXCEEDED` rather than a course-specific code:
+        # it is the same invariant the GPU and room paths enforce, on a
+        # third resource, and the caller's remedy is the same shape --
+        # release something you hold. `exc.resource_type` names which one.
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "QUOTA_EXCEEDED",
+            f"You hold {exc.held} of {exc.limit} permitted course enrollments.",
+        )
+    except quotas.QuotaNotConfigured as exc:
+        # Reachable in principle and not in practice: registration is
+        # STUDENT-only and (STUDENT, COURSE) is seeded. It fails closed
+        # anyway, because a missing policy row is no policy at all.
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "QUOTA_NOT_CONFIGURED",
+            f"No quota policy is configured for role {exc.role.value} "
+            f"and resource {exc.resource_type.value}.",
         )
     except service.ScheduleConflict as exc:
         raise coded_error(

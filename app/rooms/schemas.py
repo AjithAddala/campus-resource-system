@@ -15,6 +15,28 @@ class RoomRead(BaseModel):
     capacity: int
 
 
+class RoomUpdate(BaseModel):
+    """Admin PATCH body. Deadline 6.
+
+    Every field is optional and the service uses `exclude_unset`, so
+    omitting one means "leave it alone" rather than "set it to null".
+    That distinction is the difference between PATCH and PUT, and a model
+    of `X | None = None` cannot express it on its own — the service has to
+    ask which keys the caller actually sent.
+
+    `status` is the field this endpoint exists for: blocking a room for
+    maintenance. Deadlines 3 and 4 wrote the gates that READ this column
+    under a row lock; this is the only place that writes it.
+
+    Note what is absent: `capacity` and `building`. Both are editable in
+    principle and neither is in the plan's Deadline 6 column, which names
+    this endpoint as *"block a room for maintenance."* Adding them would
+    be scope creep two deadlines before a freeze.
+    """
+
+    status: ResourceStatus | None = None
+
+
 class ReservationWindow(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 

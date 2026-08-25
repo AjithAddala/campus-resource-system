@@ -57,6 +57,20 @@ class ClusterBlocked(Exception):
     """The cluster is BLOCKED. Item 6 semantics, ratified at Deadline 3."""
 
 
+class CapacityBelowAllocated(Exception):
+    """An admin tried to shrink a cluster below what is currently held.
+
+    See `update_cluster` for why this is a refusal rather than an
+    eviction, and why it contradicts one sentence of
+    `ARCHITECTURE_AND_WORKFLOWS.md` §13.
+    """
+
+    def __init__(self, requested: int, allocated: int):
+        self.requested = requested
+        self.allocated = allocated
+        super().__init__(f"cannot set gpu_count={requested} below allocated={allocated}")
+
+
 class CapacityExhausted(Exception):
     """Not enough free units on this cluster."""
 
@@ -292,6 +306,69 @@ def reserve_gpu(
     # Kept in a local so that reasoning is visible when stepping through.
     _ = held
     return reservation
+
+
+def update_cluster(db: Session, gpu_id: int, payload) -> GPUCluster | None:
+    """Admin edit of a cluster: `status` and/or `gpu_count`. None if not a cluster.
+
+    Raises `CapacityBelowAllocated`.
+
+    **Takes the cluster row FOR UPDATE**, unlike the room twin, and for
+    the reason that separates those two paths everywhere else in this
+    codebase: this one reads `allocated` and decides based on it. A
+    boundary read would let an allocation commit between the check and the
+    UPDATE, and the shrink would then land below what is held.
+
+    ------------------------------------------------------------------
+    THE CAPACITY-REDUCTION RULE CONTRADICTS `gpu_capacity_sane`.
+    ------------------------------------------------------------------
+    `ARCHITECTURE_AND_WORKFLOWS.md` §13 says: *"if an admin lowers a
+    cluster from 8 to 4 while 6 are allocated, existing reservations are
+    not retroactively evicted; the new limit applies only to future
+    allocations and `allocated` drains naturally."*
+
+    That cannot be implemented as written. `gpu_capacity_sane` is
+    `allocated >= 0 AND allocated <= gpu_count`, so setting gpu_count=4
+    with allocated=6 is rejected by Postgres — the transaction would fail
+    with an IntegrityError and surface as a 500. The document describes a
+    state the schema forbids.
+
+    **Resolved by refusing the reduction (409), not by dropping the
+    CHECK.** The constraint is what makes a locking bug in the flagship
+    transaction fail loudly instead of quietly overselling the cluster;
+    trading that for one sentence of documented convenience is a bad
+    exchange. The admin can shrink to `allocated` immediately and further
+    as holds are released, so §13's *intent* — never evict — is preserved
+    exactly. Only its literal example is unavailable.
+
+    Recorded as a decision rather than silently coded around: §13 needs
+    the correction, and it is flagged in DECISIONS.md at Deadline 6.
+    """
+    cluster = (
+        db.query(GPUCluster)
+        .filter(GPUCluster.id == gpu_id)
+        .populate_existing()
+        .with_for_update()
+        .first()
+    )
+    if cluster is None:
+        return None
+
+    fields = payload.model_dump(exclude_unset=True)
+
+    # Compared against the value just read under the lock, never against a
+    # boundary read. Only the shrink direction can conflict; growing a
+    # cluster is always safe and needs no check.
+    new_count = fields.get("gpu_count")
+    if new_count is not None and new_count < cluster.allocated:
+        raise CapacityBelowAllocated(new_count, cluster.allocated)
+
+    for field, value in fields.items():
+        setattr(cluster, field, value)
+
+    db.commit()
+    db.refresh(cluster)
+    return cluster
 
 
 def cancel_gpu_reservation(

@@ -10,11 +10,14 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-5 met (sessions 4, 7, 9, 10, 11 and 12).
-> Deadline 6 is OPEN with B's column done (session 13: Benchmarks 2 and
-> 3, both on the harness, both tables in `WORK_LOG.md`). Outstanding:
-> A's quota rollout, the admin quota and resource-status endpoints,
-> `GET /me/quota`, and the joint swap review.**
+> **Status: Deadlines 1-6 MET.** Deadline 6 closed on the joint SWAP
+> REVIEW being held, after B session 13 (Benchmarks 2 and 3) and A
+> session 14 (quota rollout, admin endpoints, `GET /me/quota`, plus A's
+> review of B's solo change to `session.py` — approved, two findings).
+>
+> Deadline 7 is blocked on outstanding items 7, 9 and 10 in
+> `DECISIONS.md`, all joint calls. Item 9 — the global lock order versus
+> waitlist promotion — is A's transaction and the urgent one.**
 
 ## 0. Scope
 
@@ -392,10 +395,15 @@ B ✅   BENCHMARK 1 (capacity): 500 submitted, 40 in flight, capacity 50
 > 500-request harness. Carried since session 5. It is a shared file and
 > needs both people.
 
-### Deadline 6 - Quota Rollout, Benchmarks 2-3, SWAP
+### Deadline 6 - Quota Rollout, Benchmarks 2-3, SWAP  ✅ MET (sessions 13, 14 + swap)
+
+> A's column landed in session 14, B's in session 13. **The deadline does
+> not close until the swap review happens** — it is the third line of
+> this column, it needs both people, and it is what Deadline 10's
+> cross-presentation is built on.
 
 ``` text
-A      apply the quota helper inside B's modules:
+A ✅   apply the quota helper inside B's modules:
          room quota  (concurrent active reservations per user)
          course-load quota (active enrollments per user)
        admin quota endpoints: GET/PUT /admin/quotas/{role}/{resource}
@@ -413,7 +421,24 @@ A      apply the quota helper inside B's modules:
          Read-only: it must NOT take the user lock. A stale number shown
          to a caller is fine; the allocation transaction is what has to
          be right.
-       fix whatever B's benchmarks break
+         ASSERTED, not assumed: check_quotas.py holds the user row FOR
+         UPDATE in another session and the endpoint still answers.
+A ✅   fix whatever B's benchmarks break
+         check_rooms.py broke in TWO ways and only the first was
+         expected. (a) Eleven assertions hit the new room cap of 2 --
+         the seed student books ~10 slots to test intervals. (b) Its
+         8-racer barrier test used ONE account, so the new user lock
+         serialized all eight and the exclusion constraint stopped being
+         contended -- the assertion would still have PASSED while no
+         longer measuring what it names. Same bug check_gpus.py had at
+         Deadline 4, arriving from the opposite direction. Fixed with
+         eight distinct racers; quota lifted for that script only.
+A ✅   NOT in this column as written: `PATCH /gpus/{id}` cannot do what
+       ARCHITECTURE_AND_WORKFLOWS.md section 13 says. `gpu_capacity_sane`
+       forbids allocated > gpu_count, so "lower 8 to 4 while 6 are held"
+       is a state Postgres rejects. Refused with 409
+       CAPACITY_BELOW_ALLOCATED and section 13 corrected; the CHECK stays,
+       because it is what makes a locking bug fail loudly.
 B ✅   BENCHMARK 2 (quota): one student, 2 concurrent 2-GPU requests on
          DIFFERENT clusters
          resource lock only -> both succeed, held = 4  MEASURED 25/25

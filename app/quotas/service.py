@@ -26,9 +26,15 @@ DECISIONS.md, "Why the counter stays out".
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.models.enums import ReservationStatus, ResourceType, Role
+from app.models.enrollment import Enrollment
+from app.models.enums import (
+    EnrollmentStatus,
+    ReservationStatus,
+    ResourceType,
+    Role,
+)
 from app.models.quota import RoleQuota
-from app.models.reservation import GPUReservation
+from app.models.reservation import GPUReservation, Reservation
 
 
 class QuotaExceeded(Exception):
@@ -143,3 +149,183 @@ def enforce_gpu_quota(db: Session, user_id: int, role: Role, requested: int) -> 
         raise QuotaExceeded(ResourceType.GPU, limit, held, requested)
 
     return held
+
+
+# ---------------------------------------------------------------------------
+# Room and course quotas — Deadline 6
+# ---------------------------------------------------------------------------
+#
+# **The unit differs per resource, and that is the only real difference
+# between the three gates below.** GPUs are held in *units*, so the GPU
+# quota SUMs `gpu_count`. A room hold and a course seat are indivisible:
+# you hold the room or you do not, so those quotas COUNT rows. Writing
+# them as a SUM of an imaginary `units` column would be a generalization
+# nothing asked for.
+#
+# Everything else is deliberately identical to the GPU gate — same
+# missing-row-fails-closed rule, same NULL-means-unlimited rule, same
+# requirement that the caller already holds the user row lock. Three
+# resources, one mechanism, and `enforce_*` reads the same in all three
+# so a reviewer can check them against each other at a glance.
+
+
+def held_room_reservations(db: Session, user_id: int) -> int:
+    """ACTIVE room holds for this user. **Caller must hold the user lock.**
+
+    A COUNT, not a SUM: one reservation is one hold.
+
+    **Deliberately not time-aware, and this is worth stating because it
+    looks like a bug.** A reservation whose `end_time` has passed but
+    whose status is still ACTIVE counts against the quota. Nothing in this
+    system expires reservations — there is no sweeper job, and
+    `ReservationStatus` has exactly two values — so ACTIVE *is* the
+    definition of held. Making the quota time-aware here would invent a
+    third state that the exclusion constraint, the cancel path and the
+    availability endpoint all know nothing about, and the four would drift
+    apart. If expiry is ever added, this query changes with it and not
+    before.
+
+    Served by `ix_reservations_user_id`. That index leads with `user_id`
+    and does not carry `status`, so Postgres filters the status after the
+    index lookup — acceptable, because a user's total reservation count is
+    small by construction (it is the thing being capped).
+    """
+    return db.execute(
+        select(func.count(Reservation.id)).where(
+            Reservation.user_id == user_id,
+            Reservation.status == ReservationStatus.ACTIVE,
+        )
+    ).scalar_one()
+
+
+def enforce_room_quota(db: Session, user_id: int, role: Role, requested: int = 1) -> int:
+    """Raise `QuotaExceeded` if one more room hold would breach the cap.
+
+    Returns the current count, so the caller can report it.
+
+    **Must be called with the user row already locked FOR UPDATE**, and
+    the reason is the same shape as the GPU argument rather than a
+    restatement of it: two concurrent bookings of two DIFFERENT rooms
+    contend on no common row. Each takes its own resource lock, each
+    reads the same count, both pass, and the user ends up over quota with
+    neither room double-booked. The exclusion constraint cannot see this
+    — it is partial on one resource's interval, and these are two
+    resources. Only the user lock serializes it.
+    """
+    limit = limit_for(db, role, ResourceType.ROOM)
+    held = held_room_reservations(db, user_id)
+
+    if limit is not None and held + requested > limit:
+        raise QuotaExceeded(ResourceType.ROOM, limit, held, requested)
+
+    return held
+
+
+def held_course_enrollments(db: Session, user_id: int) -> int:
+    """ACTIVE enrollments for this user. **Caller must hold the user lock.**
+
+    A COUNT, and it counts `EnrollmentStatus.ACTIVE` only — DROPPED rows
+    survive forever because `enrollment_unique` is unconditional (a
+    student who dropped still owns a row, which is what makes
+    re-registration an UPDATE). Counting anything but ACTIVE would make a
+    student's course load permanently ratchet upward as they dropped
+    courses, which is the opposite of what a load limit means.
+
+    `WAITLISTED` is not counted either, and that is a live question rather
+    than a settled one: outstanding item 7 asks whether that enum value is
+    ever used, since waitlist entries live in their own table. If item 7
+    resolves toward writing WAITLISTED enrollment rows, this query is one
+    of the places that has to be revisited — a seat you are queuing for
+    is not a seat you hold.
+
+    Served by `enrollment_unique (student_id, course_offering_id)`, whose
+    leading column is `student_id`.
+    """
+    return db.execute(
+        select(func.count(Enrollment.id)).where(
+            Enrollment.student_id == user_id,
+            Enrollment.status == EnrollmentStatus.ACTIVE,
+        )
+    ).scalar_one()
+
+
+def enforce_course_quota(
+    db: Session, user_id: int, role: Role, requested: int = 1
+) -> int:
+    """Raise `QuotaExceeded` if one more enrollment would breach the cap.
+
+    **Must be called with the user row already locked FOR UPDATE.** That
+    lock is already held by the time this runs: `courses.service.register`
+    took it at Deadline 4 for the schedule-overlap check, which is a fact
+    about the student for exactly the same reason this is. So Deadline 6
+    adds a gate inside a lock that already exists — an addition, not a
+    reordering, which is what the Deadline 4 write-up predicted.
+    """
+    limit = limit_for(db, role, ResourceType.COURSE)
+    held = held_course_enrollments(db, user_id)
+
+    if limit is not None and held + requested > limit:
+        raise QuotaExceeded(ResourceType.COURSE, limit, held, requested)
+
+    return held
+
+
+# ---------------------------------------------------------------------------
+# The read-only view behind GET /me/quota — Deadline 6
+# ---------------------------------------------------------------------------
+
+
+def usage_snapshot(db: Session, user_id: int, role: Role) -> list[dict]:
+    """Limits and current usage for all three resource types.
+
+    **Takes NO lock, deliberately, and this is the one place in the module
+    where that is a decision rather than a rule.** Every other reader here
+    is inside a transaction that already holds the user row. This one is
+    an HTTP GET: a caller asking "what am I allowed?" is shown a number
+    that may be stale by the time they act on it, and that is fine —
+    the allocation transaction is what has to be right, and it re-reads
+    everything under the lock. Locking the user row to render a dashboard
+    would put a read endpoint in contention with the flagship write path,
+    which is a real cost paid for an illusion of freshness.
+
+    **Missing policy is reported, not raised.** `limit_for` fails closed
+    with `QuotaNotConfigured`, which is correct inside an allocation — no
+    policy means no permission. It is wrong here. A caller asking what
+    their limits are should not get an error because one (role, resource)
+    pair is unseeded; `(FACULTY, COURSE)` is deliberately absent, so a
+    faculty member calling this endpoint would otherwise get a 409 for
+    asking a reasonable question. Each row carries `configured` instead,
+    and the unconfigured one reports its usage with a null limit.
+    """
+    counters = {
+        ResourceType.GPU: held_gpu_units,
+        ResourceType.ROOM: held_room_reservations,
+        ResourceType.COURSE: held_course_enrollments,
+    }
+
+    rows = []
+    for resource_type, count_held in counters.items():
+        try:
+            limit = limit_for(db, role, resource_type)
+            configured = True
+        except QuotaNotConfigured:
+            limit = None
+            configured = False
+
+        rows.append(
+            {
+                "resource_type": resource_type,
+                "limit": limit,
+                "held": count_held(db, user_id),
+                # Two different meanings of `limit = None` travel together
+                # in this response, and a client cannot tell them apart
+                # from the number alone -- which is the same trap
+                # `QuotaNotConfigured` exists to prevent inside the
+                # transaction. `unlimited` is true only when a policy row
+                # exists AND says NULL.
+                "unlimited": configured and limit is None,
+                "configured": configured,
+            }
+        )
+
+    return rows

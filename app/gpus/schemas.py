@@ -48,6 +48,29 @@ class GPUClusterCreate(BaseModel):
     gpu_count: int = Field(ge=1)
 
 
+class GPUClusterUpdate(BaseModel):
+    """Admin PATCH body. Deadline 6.
+
+    Partial update: the service uses `exclude_unset`, so an omitted field
+    is left alone rather than nulled.
+
+    `allocated` is deliberately NOT a field, for the same reason it is
+    absent from `GPUClusterCreate` — it is derived state owned by the
+    allocation transaction. An admin who could set it directly could
+    make `allocated` disagree with `SUM(active reservations)`, which is
+    the invariant `check_gpus.py` asserts after every phase.
+
+    Shrinking `gpu_count` below `allocated` is refused with
+    `409 CAPACITY_BELOW_ALLOCATED` rather than evicting holds — see
+    `gpus.service.update_cluster`, which explains why the schema's
+    `gpu_capacity_sane` CHECK makes §13's stated behaviour impossible.
+    """
+
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    status: ResourceStatus | None = None
+    gpu_count: int | None = Field(default=None, ge=1)
+
+
 class GPUReservationCreate(BaseModel):
     """A GPU hold: a unit count, and nothing else.
 
