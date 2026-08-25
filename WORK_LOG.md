@@ -2706,3 +2706,127 @@ including the waitlist that was item 5 on it.
 
 **Deadlines 1-8 MET. Deadline 9 is the entire remaining risk, and there
 is still no README.**
+
+---
+
+## Session 20 — 2026-08-25 — JOINT (the BOTH column)
+
+**Advances:** Deadline 9 (Docs & Clean-Room Test) — the BOTH column. The
+two README columns were already written in the working tree when this
+session opened, by a session that was never logged; this session ran the
+clean-room test against them and corrected what it falsified.
+
+**Plan:** run the deadline's own instruction literally — fresh tree,
+fresh volumes, `docker compose up --build`, migrate, seed, all four
+benchmarks — and treat any gap between the README and what the commands
+actually print as a defect in the README, not a rounding error.
+
+**Shipped**
+
+- **The clean-room run, end to end, and it passed.** Fresh image, fresh
+  volume, five migrations to head `1ca8b85b7626`, seed, nine gates,
+  harness suite, four benchmarks — no step needed a fix to get through.
+- **README numbers corrected against the run** (details under
+  *Verification run*). Three of its claims were not reproducible by the
+  commands printed beside them.
+
+**Verification run**
+
+``` text
+docker compose up -d --build      fresh image; volume cleanroom_pgdata created
+alembic upgrade head              5 revisions -> 1ca8b85b7626 (head)
+scripts/seed.py                   exit 0; 3 users, 2 clusters, 2 rooms,
+                                  1 offering, 8 quota rows
+9 gate scripts                    ALL exit 0 -- jwt, auth, rbac, rooms,
+                                  gpus, courses, idempotency, quotas,
+                                  waitlist
+pytest tests/ -v                  6 passed in 1.47s, ZERO skipped
+                                  (plugins: asyncio-0.25.0, mode=STRICT)
+
+benchmark 1 FIXED    0/5 oversold, 0/5 counter, exactly 50 every trial,
+                     peak DB concurrency 39 of 40 in flight
+benchmark 2 FIXED    0/25 over-quota, held {2: 25}
+benchmark 3          no key {8: 15}, with key {1: 15}, 1 key row,
+                     {201: 120}, divergent bodies 0/15
+benchmark 4 FIXED    2v3 {2: 15} / {(2,2): 15};  8v3 {3: 15} / {(3,3): 15}
+                     column 3: drop returned in 0.10s against a 5s hold
+
+benchmark 1 BROKEN   5/5 oversold, 5/5 counter, 500 of 500 seated EVERY
+                     trial, enrolled_count 14-21
+benchmark 2 BROKEN   25/25 over-quota, held {4: 25}
+benchmark 4 BROKEN   2v3 {2: 15} / {(2,2): 15} -- PASSES, as documented
+                     8v3 {3: 15} / {(7,3): 15}, counter disagrees 15/15
+```
+
+**The pytest line is the one that mattered.** Session 19 found the six
+harness tests had been silently *skipping* in the long-lived container
+because `pytest-asyncio` was in `requirements.txt` but not in the image.
+A fresh build was the predicted fix and it is now measured: `6 passed`,
+`plugins: asyncio-0.25.0`, strict mode. Every benchmark number above rests
+on a harness that has now been proven to overlap its requests.
+
+**What the clean-room run falsified — three README numbers**
+
+1. **Benchmark 4's 8-dropper rows said 10 trials. The default is 15.**
+   `TRIALS = 15` at `benchmark_4_waitlist.py:130`, and the README prints
+   the command with no arguments — so a stranger gets `{3: 15}` and
+   `{(7,3): 15}`, not the `10`s recorded. Same shape, wrong denominator.
+   Re-measured at the default and corrected.
+2. **Benchmark 1's broken column said `3 / 3` and `377 - 500` of 50.**
+   That was the Deadline 5 measurement at 3 trials; the default is 5. Re-
+   run at the documented command, the broken build is **worse** than what
+   we had written down: **5/5 oversold, all 500 students seated in a
+   50-seat section in every trial**, with `enrolled_count` recording
+   14-21 of them. We had been under-claiming our own broken build.
+3. **Column 3's timing range said 0.02s-0.09s.** The clean-room fixed run
+   returned in 0.10s, just outside a range stated as fact. Widened, and
+   the phrase "well under a tenth of a second" replaced with what the
+   number actually supports.
+
+None of these is a code defect. All three are the same failure: a number
+recorded from a run with flags, then printed beside a command without
+them. That is precisely what a clean-room test is for, and it is why the
+checkpoint is *"a stranger could reproduce your numbers"* rather than
+*"the numbers are right."*
+
+**Cost incurred**
+
+- Docker Desktop was not running at session start; the daemon had to be
+  brought up before anything could be checked. Worth noting only because
+  it means the previous session wrote a README full of numbers with no
+  running stack to check them against.
+
+**Deadline 9 status: MET — with one qualification recorded below.**
+A's column (architecture, three serialization points, lock ordering,
+canonical transaction) and B's column (workflows, role matrix, four
+benchmark tables) were in place; the BOTH column ran clean and the README
+now matches what the commands print.
+
+> **The qualification: this was a fresh *tree*, not a fresh *clone*.**
+> The working tree is uncommitted — `README.md`, `scripts/__init__.py`
+> and `scripts/_db.py` are still untracked. The clean room was built from
+> the exact file set a clone would receive after committing
+> (`git ls-files` plus `git ls-files --others --exclude-standard`, 87
+> files), so the *content* is verified. What is not yet verified is the
+> `git clone` itself, and until the commit lands a real stranger cloning
+> this repo gets no README at all and nine gate scripts that fail on
+> `from scripts._db import SessionLocal`. **Commit, then re-run the
+> quickstart once from an actual clone.** That is a ten-minute
+> confirmation of a run that has already passed, not a re-test.
+
+**Open / carried forward**
+
+1. **Commit the working tree, then the clone-level re-run above.** This
+   is the only thing standing between "verified content" and "verified
+   repository".
+2. **B still has not countersigned the Deadline 8 numbers**, and now the
+   Deadline 9 numbers as well. Both were produced solo. The artifacts are
+   checkable independently of who ran them, which is why neither deadline
+   is held open — but this project's record on unreviewed solo work is
+   `session.py`, and that sat for three sessions.
+3. **Item 11 remains open and is the oldest item in the project**,
+   unchanged since session 15's falsifiable prediction. It is A's.
+4. `POST /courses` / `POST /offerings` still belong to no deadline, and
+   the README now states their absence as a known limit rather than
+   leaving it to be discovered.
+5. Deadline 10 is cross-presentation and demo. Nothing blocks it.

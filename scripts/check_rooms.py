@@ -40,7 +40,7 @@ from sqlalchemy.exc import OperationalError
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.security import hash_password  # noqa: E402
-from app.database.session import SessionLocal  # noqa: E402
+from scripts._db import SessionLocal  # noqa: E402
 from app.models import (  # noqa: E402
     GPUCluster,
     Reservation,

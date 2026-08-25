@@ -3888,3 +3888,60 @@ bugs surfaced by the benchmarks          one, found in review at Deadline
                                          test that fails on the old build
 re-run all four, record final numbers    done, above, both builds
 ```
+
+## The clean-room test found nothing wrong with the code, and three things wrong with the README
+
+Deadline 9's BOTH column ran clean on the first attempt: fresh image,
+fresh volume, five migrations, seed, nine gates green, `6 passed` from the
+harness suite, four benchmarks reproducing. No code was changed to get
+through it.
+
+What it did break was the **documentation**, in one specific and
+repeatable way. Three numbers in the README had been measured from runs
+with arguments — `--trials 3`, `--trials 10` — and then printed beside a
+command with no arguments. The benchmarks' defaults are 5, 25, 15 and 15.
+So every one of those numbers was true when taken and false as published:
+a stranger running the printed command gets a different denominator.
+
+``` text
+claim as published                    what the printed command produces
+----------------------------------------------------------------------
+B4, 8v3, {3: 10} / {(7,3): 10}        {3: 15} / {(7,3): 15}
+B1 broken, 3/3 oversold, 377-500      5/5 oversold, 500 of 500 every trial
+column 3, 0.02s-0.09s                 0.10s on the clean-room fixed run
+```
+
+**The Benchmark 1 correction runs the wrong way, which is the
+interesting part.** We had recorded "up to 500 of 500" from two of three
+trials. Run at the documented default, the unlocked build seated **all
+500 students in all five trials**, and `enrolled_count` recorded 14 to 21
+of them. We had been *under-claiming our own broken build* — the honest
+number is more damning than the one we had written down. A documentation
+error that flatters the fixed build would have been embarrassing; one
+that flatters the *broken* build is just sloppy, and it cost us the
+sharpest version of our own result.
+
+**The rule this yields, and it is cheap to follow:** a number goes in the
+README only from a run of the exact command the README prints. If a
+number needs a flag, the flag goes in the README next to it. `.env`
+switches count as flags — Benchmarks 1, 2 and 4's broken columns are
+selected that way, and the README documents the switch precisely because
+of this.
+
+**Why this is worth a page rather than a line.** The checkpoint for
+Deadline 9 is not "the numbers are right" — ours were, every one of them,
+as measurements. It is *"a stranger could clone the repo and reproduce
+your numbers from the README alone."* Those are different claims, and the
+gap between them is invisible from inside a machine where the stack has
+been running for nineteen sessions. It took a run with nothing cached,
+nothing already migrated, and no arguments remembered to see it.
+
+The same run settled the `pytest-asyncio` question session 19 raised.
+Six harness tests had been silently skipping in the long-lived container
+because the package was in `requirements.txt` but not in the image. The
+predicted fix was "a fresh build"; the clean room is a fresh build, and it
+reports `6 passed`, `plugins: asyncio-0.25.0`, strict mode. That
+prediction is now measured rather than assumed — which matters, because
+every benchmark number in the README rests on that harness genuinely
+overlapping its requests.
+

@@ -10,8 +10,8 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-8 MET. Deadline 9 is the entire remaining risk,
-> and there is still no README.**
+> **Status: Deadlines 1-9 MET. Only Deadline 10 (cross-presentation and
+> demo) remains.**
 >
 > Deadline 7's three design questions — outstanding items 7, 9 and 10,
 > all joint calls — were settled on both sides in writing (A session 14,
@@ -29,13 +29,26 @@
 > cut — the §0.1 cut order was never invoked and full scope shipped**,
 > including the waitlist that was item 5 on it.
 >
-> Two qualifications carried into Deadline 9: the Deadline 8 BOTH column
-> was executed **solo by A** and B has not countersigned the numbers; and
-> `pytest-asyncio` is in `requirements.txt` but was missing from the
-> long-lived container, so the six harness tests had been **silently
-> skipping** until session 19 caught it. A fresh build fixes it, which is
-> what the clean-room test does — but it is the exact failure mode
-> `pytest.ini` was configured to prevent.
+> Deadline 9 closed in session 20. The clean-room run passed end to end
+> on the first attempt — fresh image, fresh volume, five migrations to
+> head, seed, nine gates green, four benchmarks reproducing — and it
+> resolved the `pytest-asyncio` question session 19 raised: the six
+> harness tests that had been **silently skipping** in the long-lived
+> container report `6 passed` on a fresh build. **No code was changed to
+> get through the clean room.** What it did break was the README: three
+> numbers had been measured with `--trials` arguments and published
+> beside commands without them, so the denominators did not match what a
+> stranger would get. All three re-measured at the documented commands —
+> and Benchmark 1's broken column came back *worse* than recorded (5/5
+> oversold, all 500 seated in a 50-seat section, every trial). See
+> `DECISIONS.md`.
+>
+> **Two qualifications still open.** The clean room was built from a
+> fresh *tree* — the exact 87-file set a clone receives after commit —
+> not a fresh *clone*, because the work is still uncommitted. Committing
+> and re-running the quickstart from a real clone is the last
+> confirmation. And the Deadline 8 **and** Deadline 9 BOTH columns were
+> both executed **solo by A**; B has countersigned neither.
 
 ## 0. Scope
 

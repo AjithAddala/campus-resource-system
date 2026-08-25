@@ -34,7 +34,7 @@ import jwt
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.config import get_settings  # noqa: E402
-from app.database.session import SessionLocal  # noqa: E402
+from scripts._db import SessionLocal  # noqa: E402
 from app.models import GPUCluster, Role, Room, User  # noqa: E402
 
 BASE = "http://localhost:8000/api/v1"
