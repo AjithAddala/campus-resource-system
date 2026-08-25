@@ -1,12 +1,14 @@
 import logging
 
 from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
+from app.courses.schemas import DAY_CODES, CourseCreate, CourseOfferingCreate
 from app.models.course import Course, CourseOffering
 from app.models.enrollment import Enrollment, WaitlistEntry
-from app.models.enums import EnrollmentStatus
+from app.models.enums import EnrollmentStatus, Role
 from app.models.user import User
 from app.quotas import service as quotas
 
@@ -35,6 +37,131 @@ def list_offerings(db: Session, course_id: int) -> list[CourseOffering]:
 
 def get_offering(db: Session, offering_id: int) -> CourseOffering | None:
     return db.get(CourseOffering, offering_id)
+
+
+# ---------------------------------------------------------------------------
+# Catalogue writes — after the close, filling the one gap the project named
+# ---------------------------------------------------------------------------
+
+
+class CourseCodeTaken(Exception):
+    """`courses.code` is unique and this one is spoken for."""
+
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(f"course code {code} already exists")
+
+
+class CourseNotFound(Exception):
+    """`course_id` names no catalogue row."""
+
+
+class InstructorNotFound(Exception):
+    """`instructor_id` names no user."""
+
+
+class InstructorNotFaculty(Exception):
+    """The named user exists and is not FACULTY."""
+
+    def __init__(self, role: Role):
+        self.role = role
+        super().__init__(f"user is {role.value}, not FACULTY")
+
+
+def create_course(db: Session, payload: CourseCreate) -> Course:
+    """Add a catalogue entry. Raises `CourseCodeTaken` on a duplicate code.
+
+    **The duplicate is caught, not pre-checked**, for the reason Deadline 2
+    settled on duplicate registration: two simultaneous creates can both
+    pass a "does this code exist?" read and only one can insert, so a
+    pre-check turns a 409 into a 500 exactly when two admins race. The
+    unique index is the guarantee; this is the translation.
+
+    The constraint name is read from psycopg's diagnostics rather than
+    matched against message text, the same discrimination
+    `rooms/service.py::_is_overlap_violation` makes -- mapping every
+    IntegrityError to "code taken" would report the next unrelated
+    constraint failure as a duplicate.
+
+    **The name is `ix_courses_code`, not `courses_code_key`.** The model
+    declares `unique=True, index=True`, and that pair makes SQLAlchemy
+    emit a unique INDEX rather than a unique CONSTRAINT -- so Postgres
+    reports the index's name and the constraint-shaped guess matches
+    nothing. Verified against `pg_indexes`, and asserted by
+    `check_catalog.py`: had it been left wrong, the duplicate would have
+    surfaced as an uncaught IntegrityError and a 500.
+    """
+    course = Course(code=payload.code, name=payload.name)
+    db.add(course)
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        diag = getattr(getattr(exc, "orig", None), "diag", None)
+        if getattr(diag, "constraint_name", None) == "ix_courses_code":
+            raise CourseCodeTaken(payload.code) from exc
+        raise
+    db.refresh(course)
+    return course
+
+
+def create_offering(db: Session, payload: CourseOfferingCreate) -> CourseOffering:
+    """Open one section of an existing course.
+
+    Raises `CourseNotFound`, `InstructorNotFound` or `InstructorNotFaculty`.
+
+    Both foreign keys are resolved explicitly rather than left to the FK
+    constraint, because the constraint cannot tell the two of them apart:
+    one `ForeignKeyViolation` for `course_id` and `instructor_id` alike,
+    and the caller needs to know which id was wrong. The FK still stands
+    behind this -- a row deleted between the read and the insert fails at
+    the database, which is the correct place for a race this endpoint has
+    no reason to serialize.
+
+    `enrolled_count` is set to 0 explicitly. It is the counter that
+    `register` locks and mutates, and the only moment in its life when it
+    is safe to write outside that transaction is before the row exists.
+
+    **No instructor double-booking check, and that is a decision.** Two
+    sections meeting at the same hour with the same instructor is a real
+    integrity problem, and `_days_overlap`/`_times_overlap` are right here
+    -- but checking it correctly means locking the instructor's row for
+    the duration, and checking it *incorrectly* means an unlocked boundary
+    read of exactly the kind §7 and Workflow B spend pages refusing. A
+    gate that two concurrent admins can walk straight through would read
+    as a guarantee while being none. Left out, stated in the README.
+    """
+    if get_course(db, payload.course_id) is None:
+        raise CourseNotFound(f"no course with id {payload.course_id}")
+
+    instructor = db.get(User, payload.instructor_id)
+    if instructor is None:
+        raise InstructorNotFound(f"no user with id {payload.instructor_id}")
+    if instructor.role is not Role.FACULTY:
+        # The column is named `instructor_id`, and nothing else in the
+        # system would ever catch a STUDENT in it: no gate reads the
+        # instructor's role, so the bad row would sit in the catalogue
+        # until a human noticed. (FACULTY only, not FACULTY-or-ADMIN --
+        # an admin who also teaches holds a FACULTY account, and widening
+        # the check to spare them one row would make the column mean
+        # "someone", which is not what it is called.)
+        raise InstructorNotFaculty(instructor.role)
+
+    offering = CourseOffering(
+        course_id=payload.course_id,
+        instructor_id=payload.instructor_id,
+        semester=payload.semester,
+        year=payload.year,
+        start_time=payload.start_time,
+        end_time=payload.end_time,
+        days=payload.days,
+        capacity=payload.capacity,
+        enrolled_count=0,
+    )
+    db.add(offering)
+    db.commit()
+    db.refresh(offering)
+    return offering
 
 
 # ---------------------------------------------------------------------------
@@ -70,16 +197,13 @@ class NotEnrolled(Exception):
     """Drop was called by a student with no enrollment row at all."""
 
 
-# Single-character day codes. R is Thursday, U is Sunday.
-#
-# **Multi-character tokens like "Tu"/"Th" are deliberately not supported**,
-# and the reason is a bug rather than laziness: overlap is computed by
-# intersecting the sets of characters, and `set("Tu") & set("Th")` is
-# `{"T"}` -- so a Tuesday class would be reported as conflicting with a
-# Thursday one. One character per day makes the intersection exact. The
-# seed uses "MWF"; if an offering-creation endpoint ever lands, this is
-# the vocabulary it must validate against.
-DAY_CODES = frozenset("MTWRFSU")
+# `DAY_CODES` moved to `schemas.py` when `POST /offerings` landed and
+# became the thing that validates against it -- the move that comment
+# asked for. Re-exported here because `_days_overlap` is the reason the
+# vocabulary is single-character, and a reader arriving at the
+# intersection below should not have to go looking for the rule it relies
+# on. Imported, never redefined.
+__all__ = ["DAY_CODES"]
 
 
 def _days_overlap(a: str, b: str) -> bool:

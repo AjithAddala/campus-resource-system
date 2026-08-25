@@ -86,7 +86,7 @@ they are infrastructure and shouldn't track an API version: `/health` and
 
 ## Verifying it yourself
 
-Nine gate scripts, each exiting non-zero on the first failure:
+Ten gate scripts, each exiting non-zero on the first failure:
 
 ```bash
 docker compose exec app python scripts/check_jwt.py
@@ -98,6 +98,7 @@ docker compose exec app python scripts/check_courses.py
 docker compose exec app python scripts/check_idempotency.py
 docker compose exec app python scripts/check_quotas.py
 docker compose exec app python scripts/check_waitlist.py
+docker compose exec app python scripts/check_catalog.py
 ```
 
 Each leaves the database at its post-seed state. The harness itself is
@@ -108,13 +109,19 @@ prove nothing. It must report **6 passed**; if it reports 6 *skipped*,
 `pytest-asyncio` is missing from the image and the suite is proving
 nothing — rebuild rather than believe it.
 
-Everything on this page — the quickstart, the nine gates, the harness
-suite, and both columns of all four benchmark tables — was run end to end
+Everything on this page — the quickstart, the gates, the harness suite,
+and both columns of all four benchmark tables — was run end to end
 against fresh volumes, and then **re-run from a real `git clone` at
 Deadline 10** with nothing cached, nothing pre-migrated and no arguments
 remembered. Nineteen of the twenty published numbers reproduced exactly;
 the twentieth is flagged where it appears, in Benchmark 1's broken
 column. See `CROSS_PRESENTATION.md` §6.2 for that run.
+
+`check_catalog.py` is the tenth and is **newer than that clone** — it
+covers `POST /courses` and `POST /offerings`, which belonged to no
+deadline and were added after the plan closed. All ten gates, the harness
+suite and all four benchmarks were re-run together afterwards. See
+"The catalogue endpoints" below.
 
 ---
 
@@ -314,6 +321,7 @@ pool and not a lock.
 | Join / leave a course waitlist | ✓ | ✗ | ✗ |
 | View a course waitlist | ✓ | ✓ | ✓ |
 | Create a resource | ✗ | ✗ | ✓ |
+| Create a course or an offering | ✗ | ✗ | ✓ |
 | Modify resource availability/status | ✗ | ✗ | ✓ |
 | Configure per-role quotas | ✗ | ✗ | ✓ |
 | Cancel ANY user's reservation | ✗ | ✗ | ✓ |
@@ -799,6 +807,74 @@ Three things that are easy to get wrong here and cost us time:
 
 ---
 
+## The catalogue endpoints — the one gap, closed after the plan
+
+For ten deadlines there was no way to create a course over HTTP. `courses`
+and `course_offerings` rows came from `seed.py` and from the gate scripts,
+which wrote them directly through a `Session`. This was not a design
+decision and was never presented as one: the endpoints **belonged to no
+deadline**, so nobody built them, and the omission was recorded as a known
+limit here and named as *"a gap, not a decision"* in
+`CROSS_PRESENTATION.md` §3 Q4. Two endpoints close it.
+
+```bash
+POST /api/v1/courses     [ADMIN]  -> 201 CourseRead
+POST /api/v1/offerings   [ADMIN]  -> 201 CourseOfferingRead
+```
+
+**They allocate nothing, and that is what makes them small.** Neither
+takes a row lock, because neither touches a counter: `enrolled_count` is
+written to 0 before the row exists, which is the one moment in its life
+when writing it outside `register`'s transaction is safe. The three
+serialization points above are untouched, and no benchmark's numbers
+depend on this code.
+
+What they *do* carry is the boundary the seed script never had to have:
+
+| Failure | Response |
+|---|---|
+| not ADMIN | `403`, before the handler body — asserted by row count |
+| duplicate course code (incl. case-only) | `409 COURSE_CODE_TAKEN` |
+| unknown `course_id` / `instructor_id` | `404`, naming which one |
+| instructor is not FACULTY | `409 INSTRUCTOR_NOT_FACULTY` |
+| unpadded time, unknown day code, `capacity <= 0`, `start >= end` | `422` |
+
+Two of those are load-bearing rather than cosmetic, and both are
+invariants the rest of the system had been *assuming* because only the
+seed could create rows:
+
+- **Times must be zero-padded `"HH:MM"`.** `_times_overlap` compares them
+  **lexicographically**, so a single `"9:00"` in the table would sort
+  after `"10:30"` and silently invert schedule-conflict detection for
+  every student holding that section.
+- **Day codes are single characters** from `MTWRFSU`. `_days_overlap` is
+  a set intersection, so `set("Tu") & set("Th") == {"T"}` — accepting
+  `"Tu"`/`"Th"` would report a Tuesday class as clashing with a Thursday
+  one. The vocabulary now lives in `schemas.py`, where it is validated,
+  and `service.py` imports it rather than keeping a second copy.
+
+`COURSE_CODE_TAKEN` is a **caught `IntegrityError` on `ix_courses_code`,
+not a pre-read** — the Deadline 2 lesson from duplicate registration,
+applied without having to relearn it. Measured, not asserted from
+principle: **eight barrier-released admins posting one code produce
+exactly one `201`, seven `409`, and zero `5xx`.** A pre-check passes the
+sequential tests and fails that line.
+
+`check_catalog.py` is the tenth gate — 51 assertions, including that race,
+every validation rejection above, and an end-to-end pass proving a section
+created entirely over HTTP registers, increments its counter under the
+offering lock, and exhausts at `capacity` exactly as a seeded one does.
+
+**This was added after Deadline 8's feature freeze and after the plan
+closed.** The freeze is why it is two endpoints and not five: no
+`PATCH /courses/{id}`, no `DELETE`, no offering edit. Editing an offering
+means editing `capacity`, and `PATCH /gpus/{id}` already established at
+Deadline 6 what that costs — `CAPACITY_BELOW_ALLOCATED`, and a CHECK
+constraint that refuses the state. That is a transaction, not a form, and
+it is not what this gap was.
+
+---
+
 ## Known limits, stated rather than hidden
 
 - **Idempotency covers the GPU path only.** Course registration gets
@@ -820,8 +896,16 @@ Three things that are easy to get wrong here and cost us time:
   they are returned. They exist to show a human what is there, never to
   decide an allocation — the transaction re-reads everything under the
   lock and is what has to be right.
-- **There is no `POST /courses` or `POST /offerings`.** Offerings are
-  created by the seed script and by the gate scripts directly.
+- **Nothing stops an instructor being double-booked.** `POST /offerings`
+  will open two sections that meet at the same hour with the same
+  instructor. The check is one call to the same `_days_overlap` /
+  `_times_overlap` pair the student path uses — but doing it *correctly*
+  means holding the instructor's row for the duration, and doing it
+  incorrectly means an unlocked boundary read of exactly the kind this
+  page spends its length refusing. A gate two concurrent admins can walk
+  straight through would read as a guarantee while being none, so it is
+  absent and said so. (Students are protected: `SCHEDULE_CONFLICT` is
+  checked under the student's own row lock at registration.)
 - **One unresolved observation, carried openly to the end.** On the GPU
   path, a two-session probe shows a `FOR UPDATE` read returning stale
   attributes without `populate_existing()` — and the 12-racer capacity
@@ -859,12 +943,12 @@ app/
 ├── idempotency/   claim / record_response
 ├── gpus/          THE flagship transaction
 ├── rooms/         interval reservations (GiST exclusion constraint)
-├── courses/       registration, drop, waitlist, promotion
+├── courses/       catalogue writes, registration, drop, waitlist, promotion
 ├── models/        SQLAlchemy ORM
 └── database/      session (pool sizing), base
 
 alembic/versions/  5 revisions, head 1ca8b85b7626
-scripts/           seed.py + 9 gate scripts
+scripts/           seed.py + 10 gate scripts
 tests/concurrency/ harness.py, its own tests, and the 4 benchmarks
 ```
 

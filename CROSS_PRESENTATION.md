@@ -805,6 +805,28 @@ mean two things.**
 > **B's third is not a refusal at all**, and saying so is the answer to
 > this question that an interviewer is actually testing for.
 
+> **ADDENDUM, 25 Aug 2026 — B's third is now closed.** `POST /courses`
+> and `POST /offerings` exist, ADMIN-gated, with `check_catalog.py` as
+> the tenth gate. The answer above is **left exactly as it was given**,
+> because the question asked what we deliberately did not build and the
+> honest answer on the day was "this one wasn't deliberate." Editing it
+> now to read as though we had planned the endpoints all along would be
+> the tidying-up the paragraph itself refuses.
+>
+> Two things worth carrying into the interview version of this answer:
+>
+> 1. **The gap had been hiding two assumptions.** Zero-padded times and
+>    single-character day codes were invariants `_times_overlap` and
+>    `_days_overlap` depend on and that *nothing enforced* — the seed
+>    happened to write them correctly. The first caller who could create
+>    a row was also the first thing that had to state them. A gap in the
+>    API was concealing a gap in the validation.
+> 2. **It is still two endpoints, not five**, and the reason is Deadline
+>    8. Editing an offering means editing `capacity`, which
+>    `PATCH /gpus/{id}` already showed to be a transaction with its own
+>    `CAPACITY_BELOW_ALLOCATED` refusal — not a form. Closing a gap is
+>    not licence to reopen the freeze.
+
 ---
 
 ## 4. Demo rehearsal — five minutes, ending on Benchmark 2

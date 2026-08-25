@@ -301,6 +301,8 @@ testing proves the user-row lock is a bottleneck.
 409  QUOTA_NOT_CONFIGURED   no policy row for (role, resource) -- fails closed
 409  IDEMPOTENCY_IN_PROGRESS  claim committed, response not yet recorded
 409  CAPACITY_BELOW_ALLOCATED admin shrink below units currently held
+409  COURSE_CODE_TAKEN      that course code is already in the catalogue
+409  INSTRUCTOR_NOT_FACULTY an offering must be taught by a FACULTY account
 422  malformed request body
 422  IDEMPOTENCY_KEY_REUSED same key, different request
 201  idempotent replay      (the ORIGINAL response, the ORIGINAL status)
@@ -381,6 +383,33 @@ service layer is the whole guarantee.
 401 and 403 stay **uncoded**, with FastAPI's plain string `detail`: there
 is one remedy for a 401 (get a token) and one for a 403 (stop), so a code
 would carry nothing the status line does not.
+
+**The catalogue endpoints add the last two**, after the plan closed —
+`POST /courses` and `POST /offerings` had belonged to no deadline and did
+not exist. Both follow the rule this section already states:
+
+``` text
+409  COURSE_CODE_TAKEN       that code is in the catalogue -> pick another
+409  INSTRUCTOR_NOT_FACULTY  the id resolves, the role is wrong
+```
+
+`COURSE_CODE_TAKEN` is a **caught** `IntegrityError` on
+`ix_courses_code`, never a pre-read — the same reasoning that made
+`EMAIL_ALREADY_REGISTERED` a caught error at Deadline 2. Two admins
+posting one code can both pass a "does this code exist?" check and only
+one can insert, so a pre-check converts a clean `409` into a `500`
+precisely when it is contended. Asserted rather than argued:
+`check_catalog.py` fires eight barrier-released creates at one code and
+requires exactly one `201`, seven `409`, and zero `5xx`.
+
+The **404/409 split on `POST /offerings` is the same distinction** drawn
+above. An unknown `course_id` or `instructor_id` is a plain, uncoded
+`404`: the id names nothing and there is one remedy. A user who exists
+and is a STUDENT is a coded `409`: the request is well-formed, the id
+resolves, and the refusal is policy — which is exactly the case a code
+exists to make branchable. Note also that both ids are resolved
+explicitly before the insert rather than left to the foreign keys, since
+one `ForeignKeyViolation` cannot say *which* of the two was wrong.
 
 ------------------------------------------------------------------------
 

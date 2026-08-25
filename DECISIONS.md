@@ -4113,3 +4113,142 @@ the strongest material we have.
 
 A throughput number would be the opposite: we never optimised for it, so
 it invites a question whose honest answer is "nothing".
+
+---
+
+# After the close — the catalogue endpoints (25 Aug 2026)
+
+The plan closed with all ten deadlines met and three things shipping open.
+One of them was a **gap rather than a decision**: `POST /courses` and
+`POST /offerings` did not exist, belonged to no deadline, and had never
+been assigned. This entry is what closing it cost and what it turned up.
+
+## Decision: closing a gap is not licence to reopen the freeze
+
+Two endpoints, both ADMIN, both `201`. Explicitly **not** built: no
+`PATCH /courses/{id}`, no `DELETE`, no offering edit. Editing an offering
+means editing `capacity`, and Deadline 6 already established what that
+costs on the GPU side — `gpu_capacity_sane` forbids `allocated >
+gpu_count`, so "lower it while seats are held" is a state Postgres
+rejects and `PATCH /gpus/{id}` answers `409
+CAPACITY_BELOW_ALLOCATED`. The offering analogue is
+`offering_enrollment_sane` and it behaves identically. That is a locking
+transaction with a refusal of its own, not a form, and it is not the gap
+that was recorded.
+
+## The gap was concealing two invariants nothing enforced
+
+This is the finding, and it is the same shape as the four that came
+before it: what broke was not what we expected to break.
+
+The endpoints were supposed to be plumbing — a `Session.add` behind an
+ADMIN gate. What made them non-trivial is that **for ten deadlines the
+seed script was the only writer, and it happened to write correctly**, so
+two invariants the schedule logic depends on had never been stated
+anywhere they could be checked:
+
+``` text
+_times_overlap   compares "HH:MM" LEXICOGRAPHICALLY
+                 -> one unpadded "9:00" sorts after "10:30" and INVERTS
+                    conflict detection for every student in that section
+_days_overlap    is a SET INTERSECTION over characters
+                 -> set("Tu") & set("Th") == {"T"}, so a Tuesday class
+                    reports a phantom clash with a Thursday one
+```
+
+Both were documented in comments — `service.py` said outright *"if an
+offering-creation endpoint ever lands, this is the vocabulary it must
+validate against"* — and a comment is not a constraint. Neither the
+database nor any test would have caught `"9:00"`; it is a valid
+`String(5)`, and the resulting corruption is silent, student-visible and
+would look exactly like a locking bug.
+
+**A gap in the API was hiding a gap in the validation**, and only the
+first one was written down.
+
+`DAY_CODES` moved to `schemas.py` as part of this, where the validating
+happens, with `service.py` importing it. One definition — the `_db.py`
+rule about two definitions of one budget applies verbatim, and the drift
+here would surface as a phantom schedule conflict rather than as an
+import error.
+
+## Decision: the duplicate code is caught, never pre-read
+
+`COURSE_CODE_TAKEN` is a caught `IntegrityError`, and the reasoning is
+Deadline 2's on duplicate registration, reused rather than rediscovered:
+two admins can both pass a "does this code exist?" read and only one can
+insert, so a pre-check turns a clean `409` into a `500` **exactly when it
+is contended**. Asserted rather than argued — eight barrier-released
+creates at one code:
+
+``` text
+statuses          : [201, 409, 409, 409, 409, 409, 409, 409]
+rows in courses   : 1
+5xx               : 0
+```
+
+**One thing this cost, and it is worth recording because the guess was
+wrong in a way that fails loudly only under contention.** The constraint
+name was first written as `courses_code_key`, the name Postgres gives a
+unique *constraint*. The model declares `unique=True, index=True`, and
+that pair makes SQLAlchemy emit a unique **INDEX** — so the real name is
+`ix_courses_code` and the guess matched nothing. The failure mode is the
+point: sequential use is unaffected, and the first genuine duplicate
+would have come back as an uncaught `IntegrityError` and a `500`. Checked
+against `pg_indexes` rather than assumed, and the 8-way race is now the
+regression test for it.
+
+Codes are matched from psycopg's `diag`, never from message text — the
+same discrimination `_is_overlap_violation` makes for the room
+constraint.
+
+## Decision: 404 for a missing id, coded 409 for a wrong role
+
+`POST /offerings` resolves `course_id` and `instructor_id` explicitly
+before inserting, rather than letting the foreign keys do it: **one
+`ForeignKeyViolation` cannot say which of the two ids was wrong**, and
+that is the only thing the caller needs to know.
+
+The split follows §7's existing rule exactly. An id that names nothing is
+a plain `404` — one remedy, nothing to branch on. A user who exists and
+is a STUDENT is `409 INSTRUCTOR_NOT_FACULTY` — well-formed request,
+resolving id, refused on policy, which is the case a machine-readable
+code exists for. FACULTY only, not FACULTY-or-ADMIN: an admin who teaches
+holds a FACULTY account, and widening the check to save them a row would
+make `instructor_id` mean "someone".
+
+## What was deliberately left undone: the instructor double-booking check
+
+Two sections at the same hour with the same instructor are creatable.
+`_days_overlap` and `_times_overlap` are right there and the check is
+four lines — but a correct one holds the instructor's row `FOR UPDATE`
+for the duration, and an incorrect one is an **unlocked boundary read**,
+the precise anti-pattern this project spends four benchmarks refusing. A
+gate two concurrent admins walk straight through reads as a guarantee
+while being none, which is worse than its absence.
+
+Stated in the README as a known limit. Students remain protected — a
+student's own clash is `SCHEDULE_CONFLICT`, checked under that student's
+row lock, because a schedule clash is a fact about the person.
+
+## Verification, and what it did not change
+
+``` text
+error-code audit (AST)   17 distinct codes, undocumented: NONE
+                         (15 before; the two new ones are in §7)
+10 gate scripts          ALL exit 0   (check_catalog.py is 51 assertions)
+pytest tests/            6 passed
+alembic check            no drift, head 1ca8b85b7626 -- NO MIGRATION,
+                         both tables shipped at Deadline 1
+benchmark 1 capacity     oversold 0/5, exactly 50/trial
+benchmark 2 quota        over-quota 0/25, held {2: 25}
+benchmark 3 exactly-once no key {8: 15}, key {1: 15}, divergent 0/15
+benchmark 4 waitlist     3 promotions/trial, counter reconciles 15/15
+```
+
+**No benchmark number moved, and none should have.** These endpoints take
+no lock, touch no counter under contention, and write `enrolled_count = 0`
+at the one moment in that column's life when writing it outside
+`register`'s transaction is safe. The three serialization points are
+untouched. That the four tables reproduce unchanged is the evidence that
+this addition is as small as it claims to be.

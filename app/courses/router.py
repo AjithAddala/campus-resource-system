@@ -5,6 +5,8 @@ from app.core.dependencies import get_current_user, require_role
 from app.core.errors import coded_error
 from app.courses import service
 from app.courses.schemas import (
+    CourseCreate,
+    CourseOfferingCreate,
     CourseOfferingRead,
     CourseRead,
     EnrollmentRead,
@@ -23,6 +25,37 @@ from app.quotas import service as quotas
 # router below, not to the first.
 router = APIRouter(prefix="/courses", tags=["courses"])
 offerings_router = APIRouter(prefix="/offerings", tags=["offerings"])
+
+
+@router.post("", response_model=CourseRead, status_code=status.HTTP_201_CREATED)
+def create_course(
+    payload: CourseCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(Role.ADMIN)),
+) -> CourseRead:
+    """Add a catalogue entry. ADMIN only.
+
+    The twin of `POST /gpus` and `POST /rooms`, and the reason it was
+    missing is recorded rather than smoothed over: it belonged to no
+    deadline, so nobody built it, and the seed script plus the gate
+    scripts wrote `courses` rows directly for ten deadlines. It was listed
+    as a known limit in the README and named as *a gap, not a decision* in
+    `CROSS_PRESENTATION.md` §3 Q4. This closes it.
+
+    Note which router this is on. Reads and now creates are
+    course-shaped; every WRITE THAT TOUCHES A SEAT stays offering-shaped,
+    because the offering row is the one holding `enrolled_count` and
+    therefore the one that gets locked. Creating a course allocates
+    nothing and locks nothing -- which is exactly why it can live here.
+    """
+    try:
+        return service.create_course(db, payload)
+    except service.CourseCodeTaken as exc:
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "COURSE_CODE_TAKEN",
+            f"A course with code {exc.code} already exists.",
+        )
 
 
 @router.get("", response_model=list[CourseRead])
@@ -57,6 +90,43 @@ def list_course_offerings(
     if service.get_course(db, course_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
     return service.list_offerings(db, course_id)
+
+
+@offerings_router.post(
+    "", response_model=CourseOfferingRead, status_code=status.HTTP_201_CREATED
+)
+def create_offering(
+    payload: CourseOfferingCreate,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_role(Role.ADMIN)),
+) -> CourseOfferingRead:
+    """Open a section of an existing course. ADMIN only.
+
+    Three failures, three shapes, and the split is the one §7 already
+    draws. A bad `course_id` or `instructor_id` is a **404**: the id names
+    nothing, there is one remedy, and a code would carry nothing the
+    status line does not. A user who exists but is a STUDENT is a
+    **coded 409** -- the request is well-formed and the id resolves, the
+    caller is being refused on policy, and `INSTRUCTOR_NOT_FACULTY` tells
+    them which policy without parsing prose.
+
+    Everything shape-shaped -- padded times, known day codes, positive
+    capacity, start before end -- is a 422 from `CourseOfferingCreate`
+    before this function runs.
+    """
+    try:
+        return service.create_offering(db, payload)
+    except service.CourseNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
+    except service.InstructorNotFound:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Instructor not found")
+    except service.InstructorNotFaculty as exc:
+        raise coded_error(
+            status.HTTP_409_CONFLICT,
+            "INSTRUCTOR_NOT_FACULTY",
+            f"User {payload.instructor_id} has role {exc.role.value}; "
+            "an offering must be taught by a FACULTY account.",
+        )
 
 
 @offerings_router.get("/{offering_id}", response_model=CourseOfferingRead)

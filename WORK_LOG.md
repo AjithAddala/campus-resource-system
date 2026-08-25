@@ -2983,3 +2983,84 @@ them to, so they ship**
    `tests/`, `scripts/` or `alembic/`, so no benchmark or gate result is
    affected; the code that produced every number above is the code that
    is committed. **Commit, and the record is closed.**
+
+---
+
+## Session 22 — after the close: the catalogue endpoints (25 Aug 2026)
+
+**Not a deadline.** The plan closed at session 21 with all ten met. This
+session exists because a review of the repository against its own
+documents found that of everything shipping open, exactly one item was a
+**gap rather than a decision**, and it was cheap to close.
+
+**What the review actually checked, before anything was written**
+
+``` text
+all 10 deadline claims        re-read against the code, not taken on trust
+9 gate scripts                re-run, ALL exit 0
+pytest tests/                 6 passed
+alembic check                 no drift, head 1ca8b85b7626
+all 4 benchmarks, fixed build re-run, every published number reproduced
+documented endpoints vs routes  extracted from all three docs and diffed
+                                against app.routes
+```
+
+That last line is what found it. Every path named in `README.md`,
+`ARCHITECTURE_AND_WORKFLOWS.md` and `CROSS_PRESENTATION.md` was mounted —
+**except `POST /courses` and `POST /offerings`**, which appear in those
+documents only as the known limit saying they do not exist.
+
+**Shipped**
+
+``` text
+POST /api/v1/courses      [ADMIN]  409 COURSE_CODE_TAKEN on duplicate
+POST /api/v1/offerings    [ADMIN]  404 / 409 INSTRUCTOR_NOT_FACULTY / 422
+scripts/check_catalog.py           tenth gate, 51 assertions
+DAY_CODES                          moved to schemas.py, service imports it
+```
+
+No migration — `courses` and `course_offerings` shipped at Deadline 1 and
+neither gained a column. `alembic check` confirms no drift.
+
+**Cost incurred, and it is the entry worth keeping**
+
+- **The endpoints were supposed to be plumbing and were not.** Ten
+  deadlines of `seed.py` being the only writer had left two invariants
+  unstated anywhere enforceable: zero-padded `"HH:MM"` (compared
+  lexicographically) and single-character day codes (intersected as a
+  set). A comment in `service.py` had predicted this exact moment and a
+  comment is not a constraint. **The API gap was concealing a validation
+  gap, and only the API one was written down.**
+- **`courses_code_key` was the wrong constraint name** and cost a
+  correction. `unique=True, index=True` emits a unique INDEX, so it is
+  `ix_courses_code`. Sequential use would never have shown it; the first
+  contended duplicate would have returned a `500`. Found by checking
+  `pg_indexes` instead of trusting the guess, and the 8-way race in
+  `check_catalog.py` is now the regression for it.
+- The freeze held where it mattered: two endpoints, no `PATCH`, no
+  `DELETE`. Editing an offering is editing `capacity`, which Deadline 6
+  already proved is a transaction with its own refusal.
+
+**Re-verified after the change — everything, not just the new file**
+
+``` text
+10 gate scripts   ALL exit 0
+pytest tests/     6 passed
+error-code audit  17 codes (AST), undocumented: NONE
+benchmark 1       oversold 0/5, exactly 50 every trial
+benchmark 2       over-quota 0/25, held {2: 25}
+benchmark 3       no key {8: 15}, key {1: 15}, divergent bodies 0/15
+benchmark 4       3 promotions/trial, counter reconciles 15/15, FIFO 0/15
+```
+
+**No benchmark number moved.** These endpoints take no lock and touch no
+contended counter, so the four tables reproducing unchanged is the
+evidence that the addition is as small as it claims.
+
+**Status: all ten deadlines remain MET. Two of the three items that
+shipped open still ship open** — item 11 (unresolved, A's) and the
+answers ratified after the code was built against them. The third,
+`POST /courses` / `POST /offerings`, is closed. The Q4 answer in
+`CROSS_PRESENTATION.md` §3 is **left as it was given**, with an addendum
+underneath: it was asked what we deliberately did not build, and on the
+day the honest answer was that this one was not deliberate.
