@@ -163,25 +163,10 @@ def reserve_room(
     about which mechanism is load-bearing, not a measured throughput
     claim. Deadline 5's harness is what could measure it.)
     """
-    # --- (1) QUOTA GATE, Deadline 6 -------------------------------------
-    # Taken FIRST, per the global order, and held to COMMIT. Note this
-    # happens before the room is known to exist -- the existence check is
-    # the `resource is None` branch below, which now runs while holding a
-    # lock on the caller's own row. That costs one user-row lock for a
-    # request that 404s, and it buys the ordering: acquiring the user lock
-    # after the resource lock in even one path is what reintroduces the
-    # deadlock cycle for every path.
     db.execute(select(User.id).where(User.id == user.id).with_for_update())
 
-    # Read AFTER the lock, always -- the same rule as the GPU gate. A
-    # count read before the lock is a count that can move before the
-    # INSERT, which is precisely the race being closed.
     quotas.enforce_room_quota(db, user.id, user.role)
 
-    # --- (2) BLOCKED GATE -----------------------------------------------
-    # Locks the `resources` row -- the base table, which is where `status`
-    # lives. Querying the base class also avoids joining `rooms`, whose
-    # columns this path never reads. `read=True` emits FOR SHARE.
     resource = (
         db.query(Resource)
         .filter(Resource.id == room_id)
@@ -189,25 +174,9 @@ def reserve_room(
         .first()
     )
 
-    # A 404, not a 403 or a 422. `reservations.resource_id` points at
-    # `resources`, so nothing at the DATABASE level stops a "room" booking
-    # naming a GPU cluster -- the discriminator check that read paths get
-    # free from polymorphic loading has to be made by hand on write paths.
-    # Both "no such id" and "that id is a GPU cluster" answer the same way:
-    # there is no such room.
     if resource is None or resource.resource_type is not ResourceType.ROOM:
         return None
 
-    # Outstanding item 6, ratified at Deadline 3: BLOCKED stops NEW
-    # allocations and does not evict existing ones -- the same rule as the
-    # capacity reduction in ARCHITECTURE_AND_WORKFLOWS.md section 13. The
-    # remedy differs from both 409s that already exist (try a different
-    # resource; do not wait, do not release anything you hold), so it
-    # carries its own code.
-    #
-    # The database enforces none of this: the GiST constraint is partial on
-    # the RESERVATION's status, not the resource's. This gate is the whole
-    # guarantee, which is why it reads the row it just locked.
     if resource.status is ResourceStatus.BLOCKED:
         raise RoomBlocked(room_id)
 
@@ -223,10 +192,6 @@ def reserve_room(
     try:
         db.commit()
     except IntegrityError as exc:
-        # Rollback FIRST: after an IntegrityError the session is in a
-        # failed state and any further statement raises
-        # PendingRollbackError, which would surface as a 500 and bury the
-        # 409 it was meant to produce. Same trap as duplicate registration.
         db.rollback()
         if _is_overlap_violation(exc):
             raise RoomIntervalConflict(room_id) from exc
@@ -264,30 +229,19 @@ def cancel_reservation(
     """
     reservation = db.get(Reservation, reservation_id)
 
-    # Item 8, ratified at Deadline 4: the route mirrors the POST, so the
-    # room id in the path must actually name this reservation's room.
-    # Without this check the path segment is decorative and
-    # /rooms/4/reservations/5 would cancel a hold on room 3.
     if reservation is None or reservation.resource_id != room_id:
         return None
 
     if reservation.user_id != user.id and user.role is not Role.ADMIN:
         raise NotOwner(reservation_id)
 
-    # Cheap pre-check outside the lock: an already-cancelled hold needs no
-    # lock at all. Re-checked under the lock below, because this read can
-    # go stale -- this one only avoids taking a lock needlessly.
     if reservation.status is ReservationStatus.CANCELLED:
         return reservation
 
-    # Deadline 6: lock the OWNER's row, so this release serializes against
-    # that user's bookings. See the docstring.
     db.execute(
         select(User.id).where(User.id == reservation.user_id).with_for_update()
     )
 
-    # Re-read under the lock. A concurrent cancel of this same row could
-    # have committed between the pre-check and here.
     db.refresh(reservation)
     if reservation.status is ReservationStatus.CANCELLED:
         return reservation
@@ -296,11 +250,6 @@ def cancel_reservation(
     db.commit()
     db.refresh(reservation)
     return reservation
-
-
-# ---------------------------------------------------------------------------
-# Admin resource-status writes — Deadline 6
-# ---------------------------------------------------------------------------
 
 
 def update_room(db: Session, room_id: int, payload: RoomUpdate) -> Room | None:
@@ -326,10 +275,6 @@ def update_room(db: Session, room_id: int, payload: RoomUpdate) -> Room | None:
     if room is None:
         return None
 
-    # `exclude_unset` so that omitting a field means "leave it alone"
-    # rather than "set it to null". PATCH is a partial update, and a
-    # Pydantic model with `None` defaults cannot tell the two apart
-    # without this.
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(room, field, value)
 

@@ -142,31 +142,10 @@ def enforce_gpu_quota(db: Session, user_id: int, role: Role, requested: int) -> 
     limit = limit_for(db, role, ResourceType.GPU)
     held = held_gpu_units(db, user_id)
 
-    # None means unlimited (ADMIN). Note this is checked BEFORE the
-    # comparison rather than defaulting to a large number: a sentinel like
-    # 999999 would make "unlimited" a number that could be exceeded.
     if limit is not None and held + requested > limit:
         raise QuotaExceeded(ResourceType.GPU, limit, held, requested)
 
     return held
-
-
-# ---------------------------------------------------------------------------
-# Room and course quotas — Deadline 6
-# ---------------------------------------------------------------------------
-#
-# **The unit differs per resource, and that is the only real difference
-# between the three gates below.** GPUs are held in *units*, so the GPU
-# quota SUMs `gpu_count`. A room hold and a course seat are indivisible:
-# you hold the room or you do not, so those quotas COUNT rows. Writing
-# them as a SUM of an imaginary `units` column would be a generalization
-# nothing asked for.
-#
-# Everything else is deliberately identical to the GPU gate — same
-# missing-row-fails-closed rule, same NULL-means-unlimited rule, same
-# requirement that the caller already holds the user row lock. Three
-# resources, one mechanism, and `enforce_*` reads the same in all three
-# so a reviewer can check them against each other at a glance.
 
 
 def held_room_reservations(db: Session, user_id: int) -> int:
@@ -270,11 +249,6 @@ def enforce_course_quota(
     return held
 
 
-# ---------------------------------------------------------------------------
-# The read-only view behind GET /me/quota — Deadline 6
-# ---------------------------------------------------------------------------
-
-
 def usage_snapshot(db: Session, user_id: int, role: Role) -> list[dict]:
     """Limits and current usage for all three resource types.
 
@@ -317,12 +291,6 @@ def usage_snapshot(db: Session, user_id: int, role: Role) -> list[dict]:
                 "resource_type": resource_type,
                 "limit": limit,
                 "held": count_held(db, user_id),
-                # Two different meanings of `limit = None` travel together
-                # in this response, and a client cannot tell them apart
-                # from the number alone -- which is the same trap
-                # `QuotaNotConfigured` exists to prevent inside the
-                # transaction. `unlimited` is true only when a policy row
-                # exists AND says NULL.
                 "unlimited": configured and limit is None,
                 "configured": configured,
             }

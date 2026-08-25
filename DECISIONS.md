@@ -1,5 +1,15 @@
 # Decisions
 
+> **Note on references.** This log was written alongside four process
+> documents — `WORK_LOG.md`, `EXECUTION_PLAN.md`, `INIT_PLAN.md` and
+> `CROSS_PRESENTATION.md` — that are no longer part of the repository.
+> Entries below still cite them where the reasoning of the day depended
+> on them. Those citations are left as written rather than scrubbed: the
+> decisions are the record, and editing them to hide what they were
+> reasoning against would be the one thing this file exists not to do.
+> Everything load-bearing is either here, in `README.md`, or in
+> `ARCHITECTURE_AND_WORKFLOWS.md`.
+
 Format: what we tried, what we measured, what we chose — written as it
 happens. This is the interview cheat-sheet; "we used pessimistic locking"
 is a claim anyone can make, but *"we considered X, hit Y, so we chose Z"*

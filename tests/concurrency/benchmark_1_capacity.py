@@ -68,34 +68,13 @@ from tests.concurrency.harness import (  # noqa: E402
     tool_session_factory,
 )
 
-# NOT the application's SessionLocal. That engine is sized for the
-# server (40 + 10), and a benchmark importing it opens a second pool of
-# the same size against a Postgres that allows 100 connections total --
-# which starves the server and surfaces as `QueuePool timed out` in the
-# SERVER's log. Measured: 387 of 500 requests returned 500 that way.
 SessionLocal = tool_session_factory()
 
-# Long runs with block-buffered stdout show nothing until they end,
-# which makes a hung benchmark indistinguishable from a slow one.
 print = functools.partial(print, flush=True)  # noqa: A001
 
 STUDENTS = 500
 SEATS = 50
 TRIALS = 5
-# Requests allowed inside the server at once. Not a tuning knob: a
-# connection is held for the whole request (see harness.fire_async), so
-# in-flight requests ARE connections, and the pool is 40 + 10 = 50.
-# **40 is derived from that budget** -- it is the largest round number
-# leaving margin under 50 for the server's own bookkeeping.
-#
-# Two facts, stated separately because they happen to be the same number
-# and A read them as one at the Deadline 6 swap review: uvicorn's anyio
-# worker pool is ALSO 40. That is agreement, not derivation. If the
-# thread pool were the binding constraint, the argument in
-# `harness.fire_async` -- that the ceiling is requests in flight rather
-# than worker threads -- would be the thing that is wrong. It is not:
-# raise the thread pool and this number does not move, because the
-# connections run out first.
 IN_FLIGHT = 40
 
 made_users: list[int] = []
@@ -265,11 +244,6 @@ def run(students: int, seats: int, trials: int, in_flight: int) -> int:
                 "lat": latency(results),
             }
         )
-        # The FULL tally, not three buckets. An earlier version reported
-        # only 201 / 409-CAPACITY_EXHAUSTED / 5xx and a run came back
-        # `201=0 409=0 err=0` for 500 requests -- every response had
-        # fallen into a bucket that did not exist. A benchmark that can
-        # silently drop 500 responses is not an instrument.
         accounted = created + full + errors
         print(
             f"  trial {trial}: enrolled_count={counter:<4} active_rows={active:<4} "

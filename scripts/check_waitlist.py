@@ -46,8 +46,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import inspect, select, text  # noqa: E402
@@ -161,10 +159,6 @@ def waitlist_endpoints_exist() -> bool:
     return any("waitlist" in path for path in spec.get("paths", {}))
 
 
-# ===========================================================================
-# PART 1 — the ground the promotion transaction stands on
-# ===========================================================================
-
 print("=" * 70)
 print("PART 1  facts promotion will rest on -- these must pass TODAY")
 print("=" * 70)
@@ -180,12 +174,6 @@ finally:
 
 check("waitlist_entries table exists", bool(columns), str(sorted(columns)))
 
-# No stored position. `c86676652ca2` dropped it, and DECISIONS.md records
-# why: renumbering after a promotion (`SET position = position - 1`)
-# transiently collides, because Postgres checks unique constraints per
-# row during an UPDATE. Dropping the column deleted the problem instead
-# of constraining it -- so a `position` column reappearing is a
-# regression, not a feature.
 check(
     "there is NO stored position column",
     "position" not in columns,
@@ -203,21 +191,11 @@ check(
     str(sorted(indexes)),
 )
 
-# --- the created_at trap, proven rather than quoted ---------------------
-#
-# THE assertion in Part 1. `func.now()` is TRANSACTION START TIME in
-# Postgres, so rows inserted in one transaction share a created_at
-# exactly. If that is true, `ORDER BY created_at` alone cannot express
-# FIFO and the `id` tiebreak is the whole guarantee.
 offering_id = make_offering(capacity=1)
 trap_students = [make_student()[0] for _ in range(3)]
 
 db = SessionLocal()
 try:
-    # All three in ONE transaction, deliberately -- this is the case the
-    # seed script was warned about at Deadline 2 and the case promotion
-    # will actually meet, because B's join endpoint commits per request
-    # but a benchmark seeding a queue may not.
     for uid in trap_students:
         db.add(WaitlistEntry(student_id=uid, course_offering_id=offering_id))
     db.commit()
@@ -252,7 +230,6 @@ try:
 finally:
     db.close()
 
-# --- position is a display value, computed at read time -----------------
 db = SessionLocal()
 try:
     ranked = db.execute(
@@ -271,13 +248,6 @@ try:
 finally:
     db.close()
 
-# --- the unconditional-unique trap that promotion will hit --------------
-#
-# `enrollment_unique` has no `WHERE status = 'ACTIVE'` clause, so a
-# student who dropped STILL OWNS a row. Promotion must therefore UPDATE,
-# not INSERT -- the same trap course registration hit at Deadline 4, and
-# the docstring in courses/service.py says promotion is the next place it
-# bites. Proven here so promotion is written knowing it.
 solo_id, solo_token = make_student()
 solo_offering = make_offering(capacity=1, start="14:00", end="15:00", days="T")
 
@@ -306,11 +276,6 @@ try:
 finally:
     db.close()
 
-# --- registering for a full offering does NOT auto-waitlist (today) -----
-#
-# This is outstanding item 10 observed rather than decided. Recorded so
-# that whichever way item 10 is ratified, the change is visible here
-# instead of silently altering what POST /register means.
 full_offering = make_offering(capacity=1, start="16:00", end="17:00", days="W")
 _, first_token = make_student()
 _, second_token = make_student()
@@ -343,10 +308,6 @@ finally:
     db.close()
 
 
-# ===========================================================================
-# PART 2 — the promotion assertions
-# ===========================================================================
-
 print()
 print("=" * 70)
 print("PART 2  promotion -- Deadline 7's checkpoint")
@@ -363,18 +324,11 @@ if not waitlist_endpoints_exist():
     skip("promoted student's enrollment is an UPDATE of the DROPPED row", why)
     skip("GET waitlist reports position from ROW_NUMBER(), never stored", why)
 else:
-    # ---------------------------------------------------------------
-    # B's endpoints exist (Deadline 7, session 16). Everything B owns is
-    # asserted for real from here; the promotion assertions are A's and
-    # are handled at the bottom of this block.
-    # ---------------------------------------------------------------
     full = make_offering(capacity=1)
     holder_id, holder_token = make_student()
     first_id, first_token = make_student()
     second_id, second_token = make_student()
 
-    # Fill the single seat, so the offering is genuinely full rather than
-    # merely small. Every join below depends on this having worked.
     r = httpx.post(f"{BASE}/offerings/{full}/register", headers=bearer(holder_token))
     check("setup: the seat is taken", r.status_code == 201, str(r.status_code))
 
@@ -418,7 +372,6 @@ else:
         f"{r.status_code} {r.json()}",
     )
 
-    # Item 10's other half: a queue for an available seat is not a queue.
     roomy = make_offering(capacity=5, days="TR", start="14:00", end="15:00")
     r = httpx.post(f"{BASE}/offerings/{roomy}/waitlist", headers=bearer(first_token))
     check(
@@ -449,12 +402,6 @@ else:
         str(r.status_code),
     )
 
-    # ---- Part 2's eighth assertion, and it is B's ------------------
-    # Position is ROW_NUMBER() at read time and nothing is stored. The
-    # proof is that the SECOND student's position changes from 2 to 1
-    # when the first leaves, while their row is untouched -- same id,
-    # same created_at. A stored position would have required an UPDATE
-    # that nothing here performs.
     r = httpx.delete(f"{BASE}/offerings/{full}/waitlist", headers=bearer(first_token))
     check(
         "leave -> 200 reporting the position that was held",
@@ -478,8 +425,6 @@ else:
         else str(rows),
     )
     if moved_up:
-        # It was listed as pending against the routes not existing; it is
-        # now measured, so it stops being pending.
         pending[:] = [
             p
             for p in pending
@@ -493,10 +438,6 @@ else:
         f"{r.status_code} {r.json()}",
     )
 
-    # ---- the seven promotion assertions: A's column ----------------
-    # Probed behaviourally rather than assumed: fill the seat back up,
-    # leave one student queued, drop the seat, and see whether the entry
-    # was consumed.
     httpx.post(f"{BASE}/offerings/{full}/waitlist", headers=bearer(first_token))
     httpx.delete(f"{BASE}/offerings/{full}/drop", headers=bearer(holder_token))
     db = SessionLocal()
@@ -516,9 +457,6 @@ else:
         "Deadline 7. B's endpoints are complete and asserted above."
     )
     if not promotion_exists:
-        # ONE failure, not seven. The deadline is half-built and the gate
-        # is supposed to say so -- but it should say it once, precisely,
-        # rather than reporting seven separate broken things.
         check(
             "promotion runs when a seat is dropped (A's column)",
             False,
@@ -532,11 +470,6 @@ else:
         skip("promotion DELETES the waitlist row, renumbering nothing", why)
         skip("promoted student's enrollment is an UPDATE of the DROPPED row", why)
     else:
-        # ---------------------------------------------------------------
-        # Promotion exists. The seven assertions A wrote as skips, plus an
-        # eighth that B's response to item 9 made a condition of ratifying
-        # it: SKIP LOCKED must be observable, or it ships unmeasured.
-        # ---------------------------------------------------------------
 
         def enrollment_rows(student_id: int, offering_id: int) -> list:
             d = SessionLocal()
@@ -582,12 +515,6 @@ else:
             finally:
                 d.close()
 
-        # ---- FIFO, the DELETE, and the UPDATE-not-INSERT trap ----------
-        # One offering, capacity 1. The promoted student is deliberately
-        # one who ALREADY DROPPED this offering, so they still own a
-        # DROPPED enrollment row -- `enrollment_unique` is unconditional.
-        # Promotion must UPDATE it. An INSERT would raise IntegrityError
-        # from inside the transaction instead.
         off = make_offering(capacity=1)
         returner_id, returner_token = make_student()
         keeper_id, keeper_token = make_student()
@@ -640,11 +567,6 @@ else:
             f"enrolled_count={counter} active_rows={active}",
         )
 
-        # ---- the quota gate, and the skip it causes --------------------
-        # (STUDENT, COURSE) is lowered to 1 for this stretch and restored
-        # to the SEEDED CONSTANT afterwards -- never to "whatever was
-        # found at startup", which is the self-inflicted loop session 14
-        # recorded when a crashed run made a corrupted value look seeded.
         SEEDED_COURSE_QUOTA = 6
         db = SessionLocal()
         try:
@@ -663,7 +585,6 @@ else:
             free_id, free_token = make_student()
             holder2_id, holder2_token = make_student()
 
-            # `busy` spends their single permitted enrollment elsewhere.
             r = httpx.post(
                 f"{BASE}/offerings/{other}/register", headers=bearer(busy_token)
             )
@@ -674,8 +595,6 @@ else:
                 f"{BASE}/offerings/{quota_off}/register", headers=bearer(holder2_token)
             )
 
-            # Both queue. `busy` is FIRST, so FIFO alone would promote a
-            # student who cannot legally take the seat.
             r = httpx.post(
                 f"{BASE}/offerings/{quota_off}/waitlist", headers=bearer(busy_token)
             )
@@ -713,7 +632,6 @@ else:
                 json={"max_units": SEEDED_COURSE_QUOTA},
             )
 
-        # ---- 2 concurrent drops, 3 queued ------------------------------
         race_off = make_offering(capacity=2, days="F", start="16:00", end="17:00")
         h1_id, h1_token = make_student()
         h2_id, h2_token = make_student()
@@ -729,9 +647,6 @@ else:
         for tok in queue_tokens:
             httpx.post(f"{BASE}/offerings/{race_off}/waitlist", headers=bearer(tok))
 
-        # Threads rather than the asyncio harness: this is a gate, and it
-        # asserts. Benchmark 4 is the same race on the harness, measured
-        # over trials against a build with the offering lock removed.
         gate = threading.Barrier(2)
 
         def drop_racer(token: str) -> None:
@@ -771,14 +686,6 @@ else:
             f"enrolled_count={counter} active={active}, FIFO order preserved",
         )
 
-        # ---- item 9's actual claim, and nothing above tests it ---------
-        # B's condition on ratifying item 9 (session 15). The two columns
-        # above never lock a candidate's row, so SKIP LOCKED never fires
-        # and the mechanism ships unmeasured. Here the first candidate's
-        # user row is deliberately HELD by another session.
-        #
-        # Deterministic on purpose: holding a lock is not a race, so this
-        # needs one run rather than twenty-five.
         skip_off = make_offering(capacity=1, days="M", start="20:00", end="21:00")
         held_id, held_token = make_student()
         next_id, next_token = make_student()
@@ -833,27 +740,6 @@ else:
         )
         holder_thread.join(timeout=HOLD_SECONDS + 2)
 
-        # ---- REGRESSION: a seat and a queue place are exclusive --------
-        #
-        # Found while reviewing the promotion transaction, reproduced end
-        # to end, and it lost a seat silently:
-        #
-        #   X queues for a full offering. A drop frees the seat but
-        #   promotion SKIPS X -- here by schedule clash, and the choice of
-        #   skip reason matters. X clears the clash and registers for the
-        #   free seat DIRECTLY. `register` did not clear the queue entry,
-        #   so X held a seat AND a place. The next drop promoted X again:
-        #   enrolled_count 2 against 1 ACTIVE row, a seat the counter
-        #   called taken and no student held.
-        #
-        # **Why the skip reason matters, and why this test uses a clash.**
-        # The first attempt to reproduce it used a QUOTA skip and came
-        # back clean -- the candidate was at their cap only *because* the
-        # seat they already held counted toward it, so the quota gate
-        # refused the second promotion by accident. A clash-based skip
-        # leaves the student far below their cap and nothing shields it.
-        # A regression test that reproduced it the first way would pass
-        # against the broken build, which is this project's oldest lesson.
         reg_off = make_offering(capacity=1, start="09:00", end="10:00", days="M")
         reg_clash = make_offering(capacity=5, start="09:00", end="10:00", days="M")
         rx_id, rx_tok = make_student()
@@ -881,7 +767,6 @@ else:
             f"register={r.status_code}, {still_queued} queue entries left",
         )
 
-        # Drive the second promotion that used to double-count.
         db = SessionLocal()
         try:
             o = db.get(CourseOffering, reg_off)
@@ -909,10 +794,6 @@ else:
             "-- Deadline 8's reconciliation query, run early",
         )
 
-
-# ===========================================================================
-# cleanup
-# ===========================================================================
 
 print()
 db = SessionLocal()

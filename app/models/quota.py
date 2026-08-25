@@ -20,4 +20,4 @@ class RoleQuota(Base):
     resource_type: Mapped[ResourceType] = mapped_column(
         Enum(ResourceType, name="resource_type_enum"), nullable=False
     )
-    max_units: Mapped[int | None] = mapped_column(Integer, nullable=True)  # NULL = unlimited
+    max_units: Mapped[int | None] = mapped_column(Integer, nullable=True)

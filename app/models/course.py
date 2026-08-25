@@ -33,9 +33,9 @@ class CourseOffering(Base):
     )
     semester: Mapped[str] = mapped_column(String(20), nullable=False)
     year: Mapped[int] = mapped_column(Integer, nullable=False)
-    start_time: Mapped[str] = mapped_column(String(5), nullable=False)   # "HH:MM"
-    end_time: Mapped[str] = mapped_column(String(5), nullable=False)     # "HH:MM"
-    days: Mapped[str] = mapped_column(String(20), nullable=False)        # e.g. "MWF"
+    start_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    end_time: Mapped[str] = mapped_column(String(5), nullable=False)
+    days: Mapped[str] = mapped_column(String(20), nullable=False)
     capacity: Mapped[int] = mapped_column(Integer, nullable=False)
     enrolled_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 

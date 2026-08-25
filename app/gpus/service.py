@@ -10,11 +10,6 @@ from app.models.resource import GPUCluster
 from app.models.user import User
 from app.quotas import service as quotas
 
-# The `endpoint` column on a claim, and half of what distinguishes one
-# request from another. A stable logical name rather than the URL path:
-# the path carries the cluster id, which belongs in the fingerprint (it
-# is part of *which* request this is), while this names the operation.
-# Matches the canonical transaction in ARCHITECTURE_AND_WORKFLOWS.md §6.
 RESERVE_ENDPOINT = "gpu.reserve"
 
 
@@ -145,42 +140,9 @@ def reserve_gpu(
     """
     settings = get_settings()
 
-    # --- (0) DOES THE TARGET EXIST, AND IS IT A CLUSTER? ----------------
-    # Read WITHOUT a lock, before either gate, and the distinction that
-    # makes it safe is **immutable versus mutable state**:
-    #
-    #   existence and resource_type  a row never changes from GPU to ROOM,
-    #                                and nothing deletes resources. Safe to
-    #                                read at the boundary.
-    #   status                       admin-mutable at any moment. MUST be
-    #                                read under the lock, and is, below.
-    #
-    # Without this, a caller who is already at quota gets 409 for naming a
-    # room or a cluster that does not exist -- the quota gate fires first
-    # and nobody ever checks the target. Found by running the broken
-    # build: the assertion said 404 and the server said QUOTA_EXCEEDED.
-    #
-    # The `cluster is None` check after the lock stays as a backstop; this
-    # one is about answering the caller correctly, that one is about not
-    # writing against a row that vanished.
     if get_cluster(db, gpu_id) is None:
         return None
 
-    # --- (1) EXACTLY-ONCE -----------------------------------------------
-    # Above BOTH locks, so a retry that is going to be replayed never
-    # queues behind a real allocation. Raises `KeyReplayed` to abandon the
-    # rest of this function -- the caller has already been served once and
-    # nothing below should run a second time.
-    #
-    # Note what is NOT here: no lock. The serialization point is the
-    # `UNIQUE(key, user_id)` index, which works before the row exists.
-    # There is nothing to lock until somebody creates it, and "somebody
-    # creates it" is exactly the window a concurrent retry lands in.
-    #
-    # The fingerprint covers `gpu_id` as well as the body. The same
-    # `{"gpu_count": 2}` posted to two different clusters is two different
-    # requests, and hashing the body alone would let a key claimed for one
-    # cluster replay a response naming the other.
     if idempotency_key is not None:
         idempotency.claim(
             db,
@@ -192,53 +154,11 @@ def reserve_gpu(
             ),
         )
 
-    # --- (2) QUOTA GATE -------------------------------------------------
-    # Taken on the caller's own row and held to COMMIT. It serializes THIS
-    # user's allocations against each other and against nobody else's --
-    # two different students never contend here.
-    #
-    # `select(User.id)` rather than the whole row: the lock is the point,
-    # and the columns are not read. Postgres locks the row either way.
     if not settings.BENCHMARK_UNSAFE_NO_USER_LOCK:
         db.execute(select(User.id).where(User.id == user.id).with_for_update())
 
-    # Read AFTER the lock, always. Reading held units before taking it
-    # would make the lock decorative -- the value could change between the
-    # read and the write, which is precisely the race being closed.
     held = quotas.enforce_gpu_quota(db, user.id, user.role, payload.gpu_count)
 
-    # --- (3) CAPACITY GATE ----------------------------------------------
-    # FOR UPDATE, not FOR SHARE. Unlike the room path, this transaction
-    # WRITES the row it locks (`allocated`), so it needs exclusive access;
-    # rooms have no counter, which is why that gate could take a share
-    # lock and leave the exclusion constraint to decide overlap.
-    #
-    # Joined-table inheritance means this locks the `resources` row too,
-    # which is what the status gate needs: both gates read one locked row,
-    # so the second costs nothing extra.
-    # `.populate_existing()` is LOAD-BEARING. Step (0) above called
-    # `get_cluster`, which put this row in the Session's identity map, and
-    # by default a SELECT returning an already-mapped row hands back the
-    # EXISTING object WITHOUT refreshing its attributes -- so `FOR UPDATE`
-    # would take the lock and the capacity gate would then read
-    # `allocated` from BEFORE the lock.
-    #
-    # Found in the course path, where 20 concurrent registrations for 5
-    # seats ALL returned 201 and the counter landed on 3 -- lost updates,
-    # every transaction incrementing the same stale number.
-    #
-    # **Honest note on this path specifically.** A two-session probe shows
-    # the same staleness here: A reads allocated=0, B commits 7, A's
-    # `FOR UPDATE` still reports 0. But the capacity race does NOT
-    # reproduce it -- removing this call and running the 12-racer race
-    # four times gave a correct 8/8 every time, with `allocated` matching
-    # SUM(active) exactly. So the latent read is stale and the request
-    # flow somehow does not hit it, and I could not establish why.
-    #
-    # It stays because the staleness is demonstrable, the cost is one
-    # keyword, and "we could not make it fail today" is not a reason to
-    # rely on a read the probe says is wrong. Recorded as an open item
-    # rather than written up as a fix for a bug we proved was here.
     cluster = (
         db.query(GPUCluster)
         .filter(GPUCluster.id == gpu_id)
@@ -247,27 +167,15 @@ def reserve_gpu(
         .first()
     )
 
-    # None for an id that is not a GPU cluster -- a room, or nothing at
-    # all. Same convention as `get_cluster`; the router makes it a 404.
     if cluster is None:
         return None
 
-    # Item 6, ratified at Deadline 3: BLOCKED stops NEW allocations and
-    # does not evict existing ones. Checked against the row just locked,
-    # never at the boundary -- `status` is mutable, so an admin could flip
-    # it between a boundary read and this write.
     if cluster.status is ResourceStatus.BLOCKED:
         raise ClusterBlocked(gpu_id)
 
     if cluster.allocated + payload.gpu_count > cluster.gpu_count:
         raise CapacityExhausted(cluster.gpu_count, cluster.allocated, payload.gpu_count)
 
-    # --- (4) WRITE ------------------------------------------------------
-    # The counter and the reservation row are derived from each other and
-    # are written in the SAME transaction, always. `gpu_capacity_sane` is
-    # the backstop, not the mechanism: the lock is what makes this
-    # correct, the CHECK is what makes a locking bug fail loudly instead
-    # of quietly overselling the cluster.
     cluster.allocated += payload.gpu_count
     reservation = GPUReservation(
         gpu_cluster_id=cluster.id,
@@ -277,18 +185,6 @@ def reserve_gpu(
     )
     db.add(reservation)
 
-    # Record the response INTO THE SAME TRANSACTION, before the commit
-    # below. This is the load-bearing line of the whole exactly-once
-    # story, and the failure modes of splitting it are asymmetric but both
-    # fatal: commit the allocation without the key and a retry allocates
-    # again; commit the key without the allocation and a retry replays a
-    # success for work that never happened.
-    #
-    # `flush()` first, because the response body needs the id the database
-    # assigns and the `created_at` its default computes. Flushing emits the
-    # INSERT inside this transaction without ending it -- the row is
-    # invisible to everyone else until the commit two lines down, which is
-    # exactly the property being relied on.
     if idempotency_key is not None:
         db.flush()
         idempotency.record_response(
@@ -302,8 +198,6 @@ def reserve_gpu(
     db.commit()
     db.refresh(reservation)
 
-    # Read under the lock, and it is what the quota decision was made on.
-    # Kept in a local so that reasoning is visible when stepping through.
     _ = held
     return reservation
 
@@ -356,9 +250,6 @@ def update_cluster(db: Session, gpu_id: int, payload) -> GPUCluster | None:
 
     fields = payload.model_dump(exclude_unset=True)
 
-    # Compared against the value just read under the lock, never against a
-    # boundary read. Only the shrink direction can conflict; growing a
-    # cluster is always safe and needs no check.
     new_count = fields.get("gpu_count")
     if new_count is not None and new_count < cluster.allocated:
         raise CapacityBelowAllocated(new_count, cluster.allocated)
@@ -397,25 +288,15 @@ def cancel_gpu_reservation(
     """
     reservation = db.get(GPUReservation, reservation_id)
 
-    # The reservation must belong to the cluster named in the path. Item
-    # 8, ratified at Deadline 4: the cancel route mirrors the POST route,
-    # so `/gpus/1/reservations/5` and `/rooms/3/reservations/5` name
-    # different rows in different tables and neither is ambiguous. This
-    # check is what makes the resource id in the path load-bearing rather
-    # than decorative.
     if reservation is None or reservation.gpu_cluster_id != gpu_id:
         return None
 
     if reservation.user_id != user.id and user.role is not Role.ADMIN:
         raise NotOwner(reservation_id)
 
-    # Cheap pre-check outside the locks: an already-cancelled hold needs
-    # no locks at all. It is re-checked under the lock below, because this
-    # read can go stale -- this one only avoids taking locks needlessly.
     if reservation.status is ReservationStatus.CANCELLED:
         return reservation
 
-    # Same order as allocation: user row, then cluster row.
     db.execute(select(User.id).where(User.id == reservation.user_id).with_for_update())
     cluster = (
         db.query(GPUCluster)
@@ -425,11 +306,6 @@ def cancel_gpu_reservation(
         .first()
     )
 
-    # Re-read under the lock. Between the pre-check above and this line a
-    # concurrent cancel of the same row could have committed; without this
-    # the counter would be decremented twice for one hold, and
-    # `gpu_capacity_sane` would eventually reject a perfectly valid
-    # allocation somewhere else entirely.
     db.refresh(reservation)
     if reservation.status is ReservationStatus.CANCELLED:
         return reservation

@@ -20,7 +20,7 @@ class IdempotencyKey(Base):
     key: Mapped[str] = mapped_column(String(255), nullable=False)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)
     endpoint: Mapped[str] = mapped_column(String(255), nullable=False)
-    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)  # detects key reuse w/ different body
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     response_body: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status_code: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(

@@ -110,10 +110,6 @@ class ReservationCreate(BaseModel):
 
     @model_validator(mode="after")
     def _ordered(self) -> "ReservationCreate":
-        # 422 here rather than a domain 409: an inverted or empty window is
-        # a malformed request, not a booking that lost a race. Postgres
-        # would also reject tstzrange(start, end) with start > end, but as
-        # a 500 out of the driver.
         if self.start_time >= self.end_time:
             raise ValueError("start_time must be before end_time")
         return self

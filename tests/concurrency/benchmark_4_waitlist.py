@@ -128,11 +128,7 @@ print = functools.partial(print, flush=True)  # noqa: A001
 
 BASE = "http://localhost:8000/api/v1"
 TRIALS = 15
-# The scenario EXECUTION_PLAN.md specifies. It does not separate the two
-# builds -- see the module docstring.
 PLAN_DROPPERS = 2
-# The one that does. Enough concurrent droppers to make the lost update
-# on `enrolled_count` land reliably.
 SEPARATING_DROPPERS = 8
 QUEUED = 3
 
@@ -359,17 +355,10 @@ def run(trials: int, droppers: int, queued: int) -> tuple[int, int, int]:
                 counters_seen.get((after["counter"], after["active"]), 0) + 1
             )
 
-            # One promotion per freed seat, all distinct -- bounded by how
-            # many students are queued. With more droppers than queued
-            # students the correct answer is the queue length, not the
-            # number of drops.
             if n != min(droppers, queued):
                 bad_promotions += 1
-            # enrolled_count is derived state; if it disagrees with the
-            # rows, a seat was invented or lost.
             if after["counter"] != after["active"]:
                 reconcile_failures += 1
-            # FIFO: the oldest `droppers` entries are the ones consumed.
             if after["promoted"] != queue_ids[:n] or after["queued"] != queue_ids[n:]:
                 order_failures += 1
 
@@ -384,10 +373,6 @@ def run(trials: int, droppers: int, queued: int) -> tuple[int, int, int]:
         print(f"  peak DB concurrency    : {peak_db} (submitted {droppers} per trial)")
         print("  " + "-" * 68)
     finally:
-        # NOT cleaned here. `column_three` runs after the last scenario and
-        # makes rows of its own, so the single cleanup lives in `main` --
-        # cleaning per scenario left that column's users and offering
-        # behind, and the next gate to run reported them as leaked.
         pass
 
     return bad_promotions, reconcile_failures, order_failures
@@ -488,9 +473,6 @@ def main() -> int:
         results = [run(args.trials, d, q) for d, q in scenarios]
         skip_ok, skip_detail = column_three()
     finally:
-        # One cleanup, after everything that makes rows -- scenarios and
-        # column 3 alike. In a `finally` so a crash mid-run does not leave
-        # accounts behind for the next gate to trip over.
         cleanup()
 
     bad = sum(r[0] for r in results)

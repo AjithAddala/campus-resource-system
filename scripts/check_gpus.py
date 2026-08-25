@@ -30,8 +30,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.config import get_settings  # noqa: E402
@@ -182,11 +180,9 @@ finally:
 
 reset_state()
 
-# --- the boundary -------------------------------------------------------
 r = httpx.post(f"{BASE}/gpus/{c1}/reservations", json={"gpu_count": 1})
 check("no token -> 401", r.status_code == 401, str(r.status_code))
 
-# --- CAPACITY: keyed on the resource ------------------------------------
 r = reserve(student, c1, 2)
 check("student reserves 2 units -> 201", r.status_code == 201, str(r.status_code))
 first_hold = r.json() if r.status_code == 201 else {}
@@ -203,9 +199,6 @@ check(
     str(body),
 )
 
-# --- QUOTA: keyed on the user -------------------------------------------
-# THE CHECKPOINT. Note this passes with no user lock at all -- sequential
-# requests do not race. It proves the arithmetic, not the locking.
 r = reserve(student, c1, 1)
 check(
     "THE CHECKPOINT: 3rd unit -> 409 QUOTA_EXCEEDED",
@@ -213,8 +206,6 @@ check(
     f"{r.status_code} {code_of(r)}",
 )
 
-# The cross-cluster case, sequentially. A DIFFERENT cluster row, so the
-# cluster lock never contends -- only the quota gate can refuse this.
 r = reserve(student, c2, 2)
 check(
     "2 more on a DIFFERENT cluster -> 409 QUOTA_EXCEEDED",
@@ -223,7 +214,6 @@ check(
 )
 check("nothing allocated on the second cluster", cluster_state(c2)[0] == 0, str(cluster_state(c2)))
 
-# Quota is per role, not global: FACULTY is 10 and ADMIN is unlimited.
 r = reserve(faculty, c1, 4)
 check("faculty (quota 10) reserves 4 -> 201", r.status_code == 201, str(r.status_code))
 
@@ -236,10 +226,6 @@ check(
 allocated, total = cluster_state(c1)
 check("cluster is now exactly full", allocated == total, f"{allocated}/{total}")
 
-# --- CAPACITY refusal, and it must not be QUOTA_EXCEEDED ----------------
-# Distinct codes because the remedies differ: wait / try another cluster,
-# versus release something you hold. The admin is unlimited, so a quota
-# code here would be flatly wrong.
 r = reserve(admin, c1, 1)
 check(
     "full cluster -> 409 CAPACITY_EXHAUSTED (not QUOTA_EXCEEDED)",
@@ -248,11 +234,6 @@ check(
 )
 check("refusal left the counter alone", cluster_state(c1)[0] == total, str(cluster_state(c1)))
 
-# --- the gates in the right order ---------------------------------------
-# A STUDENT at quota, asking a FULL cluster, must hear about the quota:
-# the user lock and its gate come first, so the request never reaches the
-# capacity check. If this ever says CAPACITY_EXHAUSTED, the gates have
-# been reordered and the lock order with them.
 r = reserve(student, c1, 1)
 check(
     "over-quota caller on a full cluster hears QUOTA first",
@@ -260,7 +241,6 @@ check(
     f"{r.status_code} {code_of(r)}",
 )
 
-# --- reconciliation: the counter and the rows agree ---------------------
 db = SessionLocal()
 try:
     summed = sum(
@@ -278,7 +258,6 @@ check(
     f"sum={summed} allocated={cluster_state(c1)[0]}",
 )
 
-# --- validation and routing ---------------------------------------------
 r = reserve(student, c1, 0)
 check("gpu_count = 0 -> 422", r.status_code == 422, str(r.status_code))
 r = reserve(student, c1, -2)
@@ -288,7 +267,6 @@ check("reserving a ROOM through /gpus -> 404", r.status_code == 404, str(r.statu
 r = reserve(student, 999999, 1)
 check("nonexistent cluster -> 404", r.status_code == 404, str(r.status_code))
 
-# --- BLOCKED, item 6 ratified at Deadline 3 -----------------------------
 reset_state()
 db = SessionLocal()
 try:
@@ -307,15 +285,11 @@ r = reserve(admin, c2, 1)
 check("admin is refused on a blocked cluster too", r.status_code == 409, str(r.status_code))
 reset_state()
 
-# --- CANCEL: owner-or-admin, and naturally idempotent -------------------
 r = reserve(student, c1, 2)
 hold = r.json()
 check("student holds 2 again after reset", r.status_code == 201, str(r.status_code))
 check("held units = 2", held_by("student@iitk.ac.in") == 2, str(held_by("student@iitk.ac.in")))
 
-# Item 8, ratified this deadline: the resource id in the path is
-# load-bearing. The same reservation id under the WRONG cluster must 404,
-# or the path segment is decorative and the ambiguity is back.
 r = httpx.delete(f"{BASE}/gpus/{c2}/reservations/{hold['id']}", headers=bearer(student))
 check("cancel under the wrong cluster id -> 404", r.status_code == 404, str(r.status_code))
 
@@ -329,15 +303,10 @@ check("status is CANCELLED", r.json().get("status") == "CANCELLED", str(r.json()
 check("counter decremented", cluster_state(c1)[0] == 0, str(cluster_state(c1)))
 check("held units back to 0", held_by("student@iitk.ac.in") == 0, str(held_by("student@iitk.ac.in")))
 
-# Cancelling twice is a no-op, NOT a double decrement. This is the direct
-# payoff of recomputing held units by SUM instead of keeping a counter:
-# with a counter, this line would corrupt it and only show up later, as a
-# valid allocation somewhere else being wrongly refused.
 r = httpx.delete(f"{BASE}/gpus/{c1}/reservations/{hold['id']}", headers=bearer(student))
 check("cancelling twice -> 200, same row", r.status_code == 200, str(r.status_code))
 check("counter NOT double-decremented", cluster_state(c1)[0] == 0, str(cluster_state(c1)))
 
-# Releasing frees the quota again -- the point of hold-until-release.
 r = reserve(student, c1, 2)
 check("student may allocate again after releasing", r.status_code == 201, str(r.status_code))
 
@@ -347,33 +316,8 @@ r = httpx.delete(
 check("ADMIN may cancel another user's hold -> 200", r.status_code == 200, str(r.status_code))
 check("counter decremented by the admin cancel", cluster_state(c1)[0] == 0, str(cluster_state(c1)))
 
-# =======================================================================
-# CONCURRENCY. Everything above this line passes against a transaction
-# with no locks whatsoever.
-# =======================================================================
 reset_state()
 
-# --- BENCHMARK 2 (quota): the argument this project is built on --------
-# ONE student, quota 2, two SIMULTANEOUS 2-unit requests at DIFFERENT
-# clusters. The cluster rows never contend -- different rows -- so the
-# capacity gate is satisfied twice over and both requests are correct as
-# far as any resource is concerned.
-#
-#   without the user lock: both read held=0, both pass, held becomes 4
-#   with it:               one waits, re-reads held=2, is refused
-#
-# The lock was never missing. It was the WRONG LOCK for that invariant.
-# ONE trial is not an instrument. The first run of this benchmark against
-# the UNLOCKED build reported held = 2 -- i.e. it passed, against the very
-# build it exists to indict. The corruption window between "SUM held
-# units" and COMMIT is well under a millisecond, and two HTTP requests
-# released on a barrier do not reliably land inside it.
-#
-# That is this project's own lesson arriving from a new direction: a test
-# that passes against the broken implementation is not a test. The fix is
-# to make it a measurement rather than a single assertion -- run the race
-# many times and count how often the invariant broke. `corrupt` is then a
-# number that separates the two builds instead of a coin flip.
 TRIALS = 25
 corrupt = 0
 held_seen: collections.Counter = collections.Counter()
@@ -421,21 +365,6 @@ check(
     str(dict(succeeded_seen)),
 )
 
-# --- capacity under concurrency ----------------------------------------
-# The other invariant, and the one the cluster lock DOES protect.
-#
-# **Every racer is a DIFFERENT user, and that is the whole point.** The
-# first version of this race used one ADMIN account for all 12 requests,
-# so the USER row lock serialized them and the cluster gate was never
-# actually contended -- it passed against a build whose capacity gate
-# read a stale `allocated`. The identical bug in the course path was
-# caught only because that race used distinct students. Capacity is keyed
-# on the RESOURCE, so the racers must differ in everything except the
-# resource.
-#
-# `allocated` must land exactly on the limit, never past it.
-# `gpu_capacity_sane` would reject an overshoot as a 500, so a clean run
-# here is also evidence that no request had to be saved by the CHECK.
 reset_state()
 RACERS = 12
 cap_tokens = make_students(RACERS)
@@ -446,8 +375,6 @@ _lock2 = threading.Lock()
 
 def _capacity_race(token: str) -> None:
     _barrier2.wait()
-    # 1 unit each, so a STUDENT's quota of 2 never refuses anyone: the
-    # only gate that may say no here is capacity.
     resp = reserve(token, c1, 1)
     with _lock2:
         _cap_results.append(resp.status_code)
@@ -496,7 +423,6 @@ check(
     f"sum={summed} allocated={allocated}",
 )
 
-# --- cleanup ------------------------------------------------------------
 reset_state()
 db = SessionLocal()
 try:

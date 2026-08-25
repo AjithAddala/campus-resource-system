@@ -29,13 +29,6 @@ from app.database.session import get_db
 from app.models.enums import Role
 from app.models.user import User
 
-# `tokenUrl` is what wires the Authorize button in /docs to POST
-# /api/v1/auth/login. It is the payoff for login being form-encoded
-# (OAuth2 password flow) rather than JSON — the demo at Deadline 10 is
-# clicking Authorize once, not pasting a header into every request.
-#
-# No leading slash: Swagger resolves it relative to the docs page, so the
-# button keeps working if the app is ever mounted under a sub-path.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"{API_PREFIX.lstrip('/')}/auth/login")
 
 
@@ -77,11 +70,6 @@ def get_current_user(
     except jwt.InvalidTokenError:
         raise _unauthorized("Could not validate credentials")
 
-    # `sub` is a STRING in the token and an integer in the database. The
-    # str() happens in create_access_token, the int() happens here, and
-    # both halves exist because PyJWT >= 2.10 enforces a string subject
-    # on decode rather than encode — an int would issue a valid-looking
-    # token that 401s on every later request. See DECISIONS.md.
     try:
         user_id = int(claims["sub"])
     except (KeyError, TypeError, ValueError):
@@ -89,9 +77,6 @@ def get_current_user(
 
     user = db.get(User, user_id)
     if user is None:
-        # A correctly signed token for a user that no longer exists. Rare,
-        # but this is the one place it can be caught, and returning None
-        # here would push a NoneType error into every handler downstream.
         raise _unauthorized("Could not validate credentials")
 
     return user
@@ -126,9 +111,6 @@ def require_role(*allowed: Role) -> Callable[..., User]:
     """
     def _checker(user: User = Depends(get_current_user)) -> User:
         if user.role not in allowed:
-            # Uncoded, same reasoning as the 401: one meaning, one remedy.
-            # The message deliberately does not name the required role —
-            # that is policy information, and the caller cannot act on it.
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
         return user
 

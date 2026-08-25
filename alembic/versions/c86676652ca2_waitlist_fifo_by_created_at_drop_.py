@@ -11,7 +11,6 @@ from alembic import op
 import sqlalchemy as sa
 
 
-# revision identifiers, used by Alembic.
 revision: str = 'c86676652ca2'
 down_revision: Union[str, None] = '268c10da1da4'
 branch_labels: Union[str, Sequence[str], None] = None
@@ -19,15 +18,12 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # FIFO order comes from created_at now, so the stored position is dead
-    # weight — and the renumbering it required was the corruption risk.
     op.drop_column("waitlist_entries", "position")
 
     op.create_unique_constraint(
         "waitlist_unique", "waitlist_entries", ["student_id", "course_offering_id"]
     )
 
-    # Serves: WHERE course_offering_id = ? ORDER BY created_at, id LIMIT 1
     op.create_index(
         "ix_waitlist_entries_offering_created",
         "waitlist_entries",
@@ -42,7 +38,6 @@ def downgrade() -> None:
     )
     op.drop_constraint("waitlist_unique", "waitlist_entries", type_="unique")
 
-    # Rebuild position from the FIFO order it replaced — 1-based per offering.
     op.add_column(
         "waitlist_entries", sa.Column("position", sa.Integer(), nullable=True)
     )

@@ -45,9 +45,6 @@ async def test_requests_actually_overlap():
     assert all(r.status == 200 for r in results), tally(results)
 
     serial_ms = sum(r.elapsed_ms for r in results)
-    # Half is a very loose bound: real overlap on 25 requests is far
-    # better than 2x. Loose on purpose, so this fails on "serialized" and
-    # not on "the laptop was busy".
     assert wall_ms < serial_ms / 2, (
         f"wall {wall_ms:.0f}ms vs serial {serial_ms:.0f}ms — "
         f"requests do not appear to overlap. {latency(results)}"
@@ -69,8 +66,6 @@ async def test_barrier_waits_for_the_slowest_starter():
     results = await fire_async(calls, base_url=ROOT)
     stats = latency(results)
     assert stats["min_ms"] > 0
-    # Everyone was released together, so nobody finishes in a small
-    # fraction of the median.
     assert stats["min_ms"] > stats["median_ms"] / 20, stats
 
 
@@ -87,11 +82,9 @@ async def test_results_are_in_submission_order():
 @pytest.mark.asyncio
 async def test_error_codes_are_extracted():
     """A coded 409/401 must arrive as `code`, not as prose to be parsed."""
-    calls = [Call("GET", "/api/v1/gpus")]  # no token
+    calls = [Call("GET", "/api/v1/gpus")]
     results = await fire_async(calls, base_url=ROOT)
     assert results[0].status == 401
-    # 401 is uncoded by design (one remedy), so `code` is None -- this
-    # asserts the extractor does not invent one.
     assert results[0].code is None
 
 
@@ -104,11 +97,9 @@ async def test_bodies_are_captured_and_survive_a_non_json_response():
     decode must arrive as None rather than raising, or one 204 or one
     proxy error page takes down a 500-request trial.
     """
-    calls = [Call("GET", "/health"), Call("GET", "/api/v1/gpus")]  # ok, then 401
+    calls = [Call("GET", "/health"), Call("GET", "/api/v1/gpus")]
     results = await fire_async(calls, base_url=ROOT)
     assert results[0].body == {"status": "ok"}
-    # The 401 body is JSON too; what is asserted here is that `body` is
-    # populated on failures, not only on the happy path.
     assert results[1].status == 401 and results[1].body is not None
 
     unreachable = await fire_async(

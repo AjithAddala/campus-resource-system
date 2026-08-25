@@ -94,9 +94,6 @@ def get_room_availability(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> RoomAvailability:
-    # Rejected here rather than in the service: an inverted or empty
-    # window is a malformed request, not a domain outcome. Postgres would
-    # also raise on tstzrange(start, end) with start > end, but as a 500.
     if start >= end:
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, "start must be before end"
@@ -155,12 +152,6 @@ def reserve_room(
     try:
         reservation = service.reserve_room(db, room_id, user, payload)
     except quotas.QuotaExceeded as exc:
-        # Deadline 6. Distinct from INTERVAL_CONFLICT because the remedy
-        # is distinct: the slot is free and the room is fine -- the caller
-        # is holding too many rooms and must release one. Same code as the
-        # GPU path emits, because it is the same invariant on a different
-        # resource, and a client should not have to learn a second name
-        # for it.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "QUOTA_EXCEEDED",
@@ -174,10 +165,6 @@ def reserve_room(
             f"and resource {exc.resource_type.value}.",
         )
     except service.RoomBlocked:
-        # Outstanding item 6, ratified at Deadline 3. Distinct from both
-        # existing 409s because the remedy is distinct: try a different
-        # room. Do not wait for capacity, and do not release something you
-        # already hold.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "RESOURCE_BLOCKED",

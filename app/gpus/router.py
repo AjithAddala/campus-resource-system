@@ -119,10 +119,6 @@ def get_gpu_availability(
     cluster = service.get_cluster(db, gpu_id)
     if cluster is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "GPU cluster not found")
-    # `free` is computed from the row as read, with no lock. `status` is
-    # reported alongside rather than folded into `free`: whether BLOCKED
-    # means "zero free" is outstanding item 6, still unratified, and a
-    # read endpoint is the wrong place to invent the answer.
     return GPUAvailability(
         gpu_id=cluster.id,
         name=cluster.name,
@@ -178,13 +174,6 @@ def reserve_gpu(
     try:
         reservation = service.reserve_gpu(db, gpu_id, user, payload, idempotency_key)
     except idempotency.KeyReplayed as replay:
-        # **The stored status, not 200.** A replay is supposed to be
-        # indistinguishable from the original call, and a caller that
-        # branches on 201 would take a different path on the retry -- which
-        # is precisely the bug idempotency exists to remove. Returning a
-        # JSONResponse directly also bypasses `response_model`, so the body
-        # goes back exactly as it was stored rather than being
-        # re-serialized from a row that may have changed since.
         return JSONResponse(status_code=replay.status_code, content=replay.body)
     except idempotency.KeyReuse:
         raise coded_error(
@@ -194,9 +183,6 @@ def reserve_gpu(
             "Use a fresh key for a different request.",
         )
     except idempotency.KeyInFlight:
-        # Should be unreachable: a concurrent retry either blocks on the
-        # unique index or sees a fully populated row. Answered as a 409
-        # rather than allowed to become a 500 three layers away.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "IDEMPOTENCY_IN_PROGRESS",
@@ -211,11 +197,6 @@ def reserve_gpu(
             f"requested {exc.requested}.",
         )
     except quotas.QuotaNotConfigured as exc:
-        # Fails closed. No policy row for this (role, resource) pair means
-        # no policy at all -- unlike max_units = NULL, which is a policy
-        # that says unlimited. Treating a missing row as unlimited would
-        # let one un-seeded row silently switch the quota system off, and
-        # every test would still pass.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "QUOTA_NOT_CONFIGURED",
@@ -269,10 +250,6 @@ def cancel_gpu_reservation(
     try:
         reservation = service.cancel_gpu_reservation(db, gpu_id, reservation_id, user)
     except service.NotOwner:
-        # 403, not 404. The row exists and the caller is authenticated;
-        # they simply may not touch it. Hiding it behind a 404 would be
-        # defensible for a resource whose existence is secret, and a
-        # reservation id is not.
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Forbidden")
 
     if reservation is None:

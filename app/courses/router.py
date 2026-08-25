@@ -17,12 +17,6 @@ from app.models.enums import Role
 from app.models.user import User
 from app.quotas import service as quotas
 
-# Two routers, deliberately. Reads stay course-shaped because browsing a
-# catalogue genuinely is; write paths are offering-shaped because the
-# offering is the row holding enrolled_count and therefore the row that
-# gets locked. See DECISIONS.md, "Course write paths are keyed on the
-# offering". Deadline 4 adds POST /offerings/{id}/register to the second
-# router below, not to the first.
 router = APIRouter(prefix="/courses", tags=["courses"])
 offerings_router = APIRouter(prefix="/offerings", tags=["offerings"])
 
@@ -84,9 +78,6 @@ def list_course_offerings(
     db: Session = Depends(get_db),
     _: User = Depends(get_current_user),
 ) -> list[CourseOfferingRead]:
-    # 404 on the parent rather than returning [] for a course that does
-    # not exist — an empty list means "no sections this semester", which
-    # is a different answer.
     if service.get_course(db, course_id) is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Course not found")
     return service.list_offerings(db, course_id)
@@ -188,19 +179,12 @@ def register_for_offering(
             "You are already enrolled in this offering.",
         )
     except quotas.QuotaExceeded as exc:
-        # Deadline 6. `QUOTA_EXCEEDED` rather than a course-specific code:
-        # it is the same invariant the GPU and room paths enforce, on a
-        # third resource, and the caller's remedy is the same shape --
-        # release something you hold. `exc.resource_type` names which one.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "QUOTA_EXCEEDED",
             f"You hold {exc.held} of {exc.limit} permitted course enrollments.",
         )
     except quotas.QuotaNotConfigured as exc:
-        # Reachable in principle and not in practice: registration is
-        # STUDENT-only and (STUDENT, COURSE) is seeded. It fails closed
-        # anyway, because a missing policy row is no policy at all.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "QUOTA_NOT_CONFIGURED",
@@ -257,21 +241,6 @@ def drop_offering(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Offering not found")
 
     return enrollment
-
-
-# ---------------------------------------------------------------------------
-# Waitlist — Deadline 7, B's column
-# ---------------------------------------------------------------------------
-#
-# Three routes on ONE path, `/offerings/{id}/waitlist`, distinguished by
-# method: POST to join, DELETE to leave, GET to read the queue. The path
-# is offering-shaped for the same reason `register` is -- the offering is
-# the row that gets locked, and a course has many offerings, so
-# `/courses/{id}/waitlist` would name no single queue.
-#
-# Item 10, ratified: joining is EXPLICIT. There is deliberately no
-# fall-through from a full `POST /register`, which keeps
-# `409 CAPACITY_EXHAUSTED` meaning exactly one thing.
 
 
 def _as_read(entry, position: int) -> WaitlistEntryRead:
@@ -382,9 +351,6 @@ def leave_waitlist(
     if entries is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Offering not found")
 
-    # Read BEFORE the delete, because afterwards there is no position to
-    # report. Unlocked and therefore advisory -- consistent with every
-    # other position this API hands out.
     held = next((p for e, p in entries if e.student_id == student.id), 0)
 
     try:

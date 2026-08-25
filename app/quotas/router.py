@@ -111,10 +111,6 @@ def put_quota(
         )
         db.add(row)
     else:
-        # `max_units` is explicitly assigned rather than `exclude_unset`-ed,
-        # because null is a MEANING here (unlimited) and not an absence.
-        # A PUT that omitted it would be asking for unlimited, which is
-        # what the default expresses.
         row.max_units = payload.max_units
 
     db.commit()

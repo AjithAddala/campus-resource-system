@@ -25,8 +25,6 @@ import argparse
 import sys
 from pathlib import Path
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from argon2 import PasswordHasher  # noqa: E402
@@ -45,8 +43,6 @@ from app.models import (  # noqa: E402
     User,
 )
 
-# One password for all three seeded accounts. Fine here and nowhere else:
-# this database is thrown away and rebuilt on every benchmark run.
 SEED_PASSWORD = "campus123"
 
 
@@ -69,11 +65,6 @@ def is_empty(db) -> bool:
 def seed(db) -> None:
     ph = PasswordHasher()
 
-    # --- users, one per role ------------------------------------------
-    # Hashed here rather than through core/security.py, which does not
-    # exist yet: argon2 encodes its parameters into the hash string, so
-    # PasswordHasher().verify() accepts these regardless of the settings
-    # A later chooses. This does not block on A's Deadline 2 column.
     student = User(
         name="Seed Student",
         email="student@iitk.ac.in",
@@ -93,30 +84,18 @@ def seed(db) -> None:
         role=Role.ADMIN,
     )
     db.add_all([student, faculty, admin])
-    # Needed before the offering: instructor_id is NOT NULL and there is
-    # no relationship configured, so the id has to exist to be assigned.
     db.flush()
 
-    # --- resources ----------------------------------------------------
-    # Room and GPUCluster are joined-table inheritance: constructing one
-    # writes BOTH the `resources` row and the subclass row, and sets
-    # resource_type from polymorphic_identity. Never hand-write
-    # `resources` here.
     cluster_a = GPUCluster(name="GPU Cluster A", gpu_count=8, allocated=0)
     cluster_b = GPUCluster(name="GPU Cluster B", gpu_count=4, allocated=0)
     room_101 = Room(name="LHC-101", building="Lecture Hall Complex", capacity=60)
     room_202 = Room(name="RM-202", building="Faculty Building", capacity=30)
     db.add_all([cluster_a, cluster_b, room_101, room_202])
 
-    # --- catalogue + section ------------------------------------------
     course = Course(code="CS641", name="Modern Cryptography")
     db.add(course)
     db.flush()
 
-    # capacity and instructor_id belong to the OFFERING, not the course
-    # (revision 268c10da1da4). Times are zero-padded "HH:MM" strings —
-    # "9:00" would break lexicographic comparison in the Deadline 4
-    # schedule-overlap check.
     offering = CourseOffering(
         course_id=course.id,
         instructor_id=faculty.id,
@@ -130,12 +109,6 @@ def seed(db) -> None:
     )
     db.add(offering)
 
-    # --- quota policy -------------------------------------------------
-    # NULL means unlimited, which is why ADMIN is None and not a large
-    # number. (FACULTY, COURSE) is deliberately ABSENT rather than set:
-    # course registration is STUDENT-only, so the pair is unreachable
-    # behind the 403. That makes "no row" and "row with max_units = NULL"
-    # two different things, and the quota helper must not conflate them.
     quotas = [
         (Role.STUDENT, ResourceType.GPU, 2),
         (Role.FACULTY, ResourceType.GPU, 10),

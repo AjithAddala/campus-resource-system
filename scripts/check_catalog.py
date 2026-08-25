@@ -33,8 +33,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from scripts._db import SessionLocal  # noqa: E402
@@ -144,10 +142,6 @@ faculty = login("faculty@iitk.ac.in")
 admin = login("admin@iitk.ac.in")
 faculty_id, student_id, admin_id = seeded_ids()
 
-# --- AUTHORIZATION ------------------------------------------------------
-# Same gate as POST /gpus and POST /rooms. Deadline 3's finding applies
-# unchanged: the 403 must fire before the handler body, so a refused
-# request must leave no row behind. The row counts below are that claim.
 db = SessionLocal()
 try:
     courses_before = db.query(Course).count()
@@ -185,7 +179,6 @@ try:
 finally:
     db.close()
 
-# --- COURSE CREATION ----------------------------------------------------
 print()
 code = new_code()
 r = post_course(admin, code=code, name="Distributed Systems")
@@ -197,9 +190,6 @@ check(
     httpx.get(f"{BASE}/courses/{course_id}", headers=bearer(student)).status_code == 200,
 )
 
-# Case folding is a correctness matter, not tidiness: `ix_courses_code` is
-# case-sensitive, so without normalisation "cs641" and "CS641" both insert
-# and the catalogue holds one course twice.
 r = post_course(admin, code=code.lower(), name="Same Course, Lower Case")
 check(
     "duplicate code differing only in case -> 409 COURSE_CODE_TAKEN",
@@ -222,10 +212,6 @@ check("code shorter than 2 chars -> 422", r.status_code == 422, str(r.status_cod
 r = post_course(admin, code=new_code(), name="   ")
 check("blank name -> 422", r.status_code == 422, str(r.status_code))
 
-# --- UNIQUENESS UNDER A RACE -------------------------------------------
-# The duplicate is a CAUGHT IntegrityError, not a pre-read, so two admins
-# racing on one code must produce exactly one 201 and one 409 -- never a
-# 500. A pre-check passes this suite sequentially and fails right here.
 print()
 raced = new_code()
 race_results: list[int] = []
@@ -273,10 +259,6 @@ try:
 finally:
     db.close()
 
-# --- OFFERING VALIDATION ------------------------------------------------
-# Every 422 below protects a comparison that is correct ONLY for the
-# canonical form. Unpadded "9:00" sorts after "10:30" lexicographically;
-# "Tu"/"Th" intersect on "T" and report a phantom clash.
 print()
 r = post_offering(admin, course_id=course_id, instructor_id=faculty_id)
 check("POST /offerings as ADMIN -> 201", r.status_code == 201, str(r.status_code))
@@ -319,9 +301,6 @@ check(
     str(r.json().get("semester")),
 )
 
-# --- REFERENCES ---------------------------------------------------------
-# One ForeignKeyViolation cannot say WHICH id was wrong, which is why both
-# are resolved before the insert.
 print()
 r = post_offering(admin, course_id=99_999_999, instructor_id=faculty_id)
 check("unknown course_id -> 404", r.status_code == 404, str(r.status_code))
@@ -364,10 +343,6 @@ try:
 finally:
     db.close()
 
-# --- END TO END ---------------------------------------------------------
-# The point of the whole exercise: a section created entirely over HTTP
-# behaves like a seeded one. Deadline 4's transaction is unchanged and
-# does not know where its row came from.
 print()
 fresh = make_student()
 r = httpx.post(
@@ -396,9 +371,6 @@ check(
     f"{len(r.json())} offerings listed",
 )
 
-# A one-seat section created over HTTP still exhausts, which is the CHECK
-# constraint and the offering lock doing their job on a row this endpoint
-# made rather than the seed.
 r = post_offering(
     admin, course_id=course_id, instructor_id=faculty_id, capacity=1,
     start_time="14:00", end_time="15:00", days="T",
@@ -414,7 +386,6 @@ check(
     f"{r2.status_code} {code_of(r2)}",
 )
 
-# --- cleanup ------------------------------------------------------------
 print()
 db = SessionLocal()
 try:

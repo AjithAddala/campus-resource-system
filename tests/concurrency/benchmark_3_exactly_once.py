@@ -234,8 +234,6 @@ def cleanup() -> None:
             GPUReservation.user_id.in_(made_users)
         ).delete(synchronize_session=False)
         db.flush()
-        # Joined-table inheritance: delete the mapped object so the ORM
-        # removes the `resources` row as well as the `gpu_clusters` one.
         for cluster in db.query(GPUCluster).filter(GPUCluster.id.in_(made_clusters)):
             db.delete(cluster)
         db.query(User).filter(User.id.in_(made_users)).delete(synchronize_session=False)
@@ -330,7 +328,6 @@ def run(trials: int, retries: int) -> int:
     print(f"  trials     : {trials}")
     print()
 
-    # Two accounts per trial: one for each column. See make_faculty.
     accounts = make_faculty(trials * 2)
     cluster_id = make_cluster(max(retries * 2, 8))
 
@@ -356,13 +353,6 @@ def run(trials: int, retries: int) -> int:
 
         unkeyed_rows[a["rows"]] += 1
         keyed_rows[b["rows"]] += 1
-        # SUMMED per status, not built as a dict comprehension keyed on
-        # status: two different codes can share one status -- 409 is
-        # QUOTA_EXCEEDED, CAPACITY_EXHAUSTED and IDEMPOTENCY_IN_PROGRESS --
-        # and `{status: n for (status, code), n in ...}` keeps whichever
-        # came last, silently undercounting the rest. That is the same
-        # class of bug as benchmark 1's vanished response buckets, in the
-        # line that exists to report them.
         for (status, _), n in a["counts"].items():
             unkeyed_status[status] += n
         for (status, _), n in b["counts"].items():
@@ -370,9 +360,6 @@ def run(trials: int, retries: int) -> int:
         keyed_key_rows[b["keys"]] += 1
         errors_total += a["errors"] + b["errors"]
         peak_db = max(peak_db, a["peak_db"], b["peak_db"])
-        # >1 means two retries were told different things about the same
-        # request. 0 means nothing was created at all, which is not
-        # "identical" either -- both are failures of the keyed column.
         if b["distinct_bodies"] != 1:
             divergent_bodies += 1
 
@@ -382,11 +369,6 @@ def run(trials: int, retries: int) -> int:
             f"bodies={b['distinct_bodies']} key_rows={b['keys']:<2} "
             f"peak_db={max(a['peak_db'], b['peak_db']):<3} median={b['median_ms']}ms"
         )
-        # Anything outside 201 and 5xx is printed in full rather than
-        # bucketed. Benchmark 1 once reported `201=0 409=0 err=0` for 500
-        # requests because every response had landed in a bucket that did
-        # not exist; a benchmark that can silently drop responses is not an
-        # instrument.
         for label, col in (("no key", a), ("key", b)):
             other = {
                 k: v
@@ -413,14 +395,13 @@ def run(trials: int, retries: int) -> int:
     print(f"  peak DB concurrency    : {peak_db} (submitted {retries} per column)")
     print("  " + "-" * 68)
 
-    # The keyed column's promise, and the contrast that gives it meaning.
     keyed_ok = (
         set(keyed_rows) == {1}
         and set(keyed_key_rows) == {1}
         and divergent_bodies == 0
         and 500 not in keyed_status
-        and 422 not in keyed_status  # IDEMPOTENCY_KEY_REUSED: bodies are identical
-        and 409 not in keyed_status  # IDEMPOTENCY_IN_PROGRESS should be unreachable
+        and 422 not in keyed_status
+        and 409 not in keyed_status
     )
     contrast_ok = set(unkeyed_rows) == {retries}
 

@@ -130,7 +130,7 @@ GPUCluster      id → Resource.id, gpu_count, allocated
 -- The original design also had Resource.location, Room.room_number, and
 -- GPUCluster.gpu_type. RESOLVED: dropped from the design, not added to the
 -- models. They are labels, carry no invariant, and nothing in the system
--- reads them. INIT_PLAN.md §11 has been corrected to match.
+-- reads them.
 
 Course          id, code, name
 CourseOffering  id, course_id → Course, instructor_id → User,

@@ -115,7 +115,7 @@ against fresh volumes, and then **re-run from a real `git clone` at
 Deadline 10** with nothing cached, nothing pre-migrated and no arguments
 remembered. Nineteen of the twenty published numbers reproduced exactly;
 the twentieth is flagged where it appears, in Benchmark 1's broken
-column. See `CROSS_PRESENTATION.md` §6.2 for that run.
+column.
 
 `check_catalog.py` is the tenth and is **newer than that clone** — it
 covers `POST /courses` and `POST /offerings`, which belonged to no
@@ -814,8 +814,8 @@ and `course_offerings` rows came from `seed.py` and from the gate scripts,
 which wrote them directly through a `Session`. This was not a design
 decision and was never presented as one: the endpoints **belonged to no
 deadline**, so nobody built them, and the omission was recorded as a known
-limit here and named as *"a gap, not a decision"* in
-`CROSS_PRESENTATION.md` §3 Q4. Two endpoints close it.
+limit here and named as *"a gap, not a decision"* rather than dressed up
+as one. Two endpoints close it.
 
 ```bash
 POST /api/v1/courses     [ADMIN]  -> 201 CourseRead
@@ -917,7 +917,7 @@ it is not what this gap was.
   merely happens to hold — is not a position we can defend. In `register`
   the same line is a measured fix (20 concurrent registrations for 5
   seats, counter landing on 3); here it is a precaution, and the
-  difference is stated rather than blurred. `CROSS_PRESENTATION.md` §6.3.
+  difference is stated rather than blurred.
 
 ### Designed, not implemented
 
@@ -965,11 +965,6 @@ which is what makes the guarantees atomic.
 |---|---|
 | `DECISIONS.md` | what we tried, what we measured, what we chose — including every reversal |
 | `ARCHITECTURE_AND_WORKFLOWS.md` | the system as built, in detail |
-| `CROSS_PRESENTATION.md` | each of us defending the other's modules, and being corrected — plus the fresh-clone verification and what ships open |
-| `EXECUTION_PLAN.md` | the ten deadlines and what "met" required |
-| `WORK_LOG.md` | when work actually happened, and what it cost |
-| `INIT_PLAN.md` | the original proposal, synced to the schema at head |
 
 **Precedence when they disagree:** the models and migrations are the
-truth; then `DECISIONS.md`; then `ARCHITECTURE_AND_WORKFLOWS.md`; then
-`WORK_LOG.md` and `EXECUTION_PLAN.md`; then `INIT_PLAN.md`.
+truth; then `DECISIONS.md`; then `ARCHITECTURE_AND_WORKFLOWS.md`.

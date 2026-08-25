@@ -35,8 +35,6 @@ import httpx
 from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.security import hash_password  # noqa: E402
@@ -77,8 +75,6 @@ def bearer(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-# A window far enough out that it cannot collide with anything a previous
-# run left behind, and unique per run.
 DAY = dt.datetime(2031, 3, 3, tzinfo=dt.timezone.utc) + dt.timedelta(
     days=uuid.uuid4().int % 500
 )
@@ -127,8 +123,6 @@ def make_students(n: int) -> list[str]:
     db = SessionLocal()
     emails = []
     try:
-        # Seeded password, so this script's existing single-argument
-        # `login()` works on these accounts unchanged.
         hashed = hash_password(SEED_PASSWORD)
         for _ in range(n):
             email = f"room-{uuid.uuid4().hex[:12]}@iitk.ac.in"
@@ -145,7 +139,7 @@ def make_students(n: int) -> list[str]:
     return [login(e) for e in emails]
 
 
-SEEDED_STUDENT_ROOM_LIMIT = 2  # scripts/seed.py
+SEEDED_STUDENT_ROOM_LIMIT = 2
 
 db = SessionLocal()
 try:
@@ -154,25 +148,6 @@ try:
     gpu_id = db.query(GPUCluster).order_by(GPUCluster.id).first().id
     reservations_before = db.query(Reservation).count()
 
-    # **Room quota lifted for the duration of this gate, and restored in
-    # cleanup.** Deadline 6 capped STUDENT room holds at 2. This script
-    # tests intervals, the BLOCKED gate and the exclusion constraint --
-    # none of which is about quota -- and it books roughly ten slots on
-    # one account to do it. Without this, eleven assertions fail with
-    # QUOTA_EXCEEDED where an interval result was expected: the right
-    # status code for entirely the wrong reason, which is the failure mode
-    # this project keeps catching in its own tests.
-    #
-    # Lifted rather than worked around by spreading bookings across users:
-    # several assertions below are specifically about ONE caller booking
-    # adjacent and overlapping slots, and rewriting them to use different
-    # callers would quietly change what they prove. The quota is tested
-    # in `check_quotas.py`, which is where it belongs.
-    # Restored to the SEEDED CONSTANT, not to whatever was found here. A
-    # run that crashes between this line and cleanup leaves the quota
-    # unlimited; capturing the current value would then record `None` as
-    # "the seeded limit" and the next run would restore the corruption.
-    # Learned by doing exactly that.
     _student_room_quota = (
         db.query(RoleQuota)
         .filter(
@@ -181,23 +156,19 @@ try:
         )
         .one()
     )
-    _student_room_quota.max_units = None  # unlimited, for this script only
+    _student_room_quota.max_units = None
     db.commit()
 finally:
     db.close()
 
 created_ids: list[int] = []
 
-# --- the boundary is still the boundary ---------------------------------
 r = httpx.post(
     f"{BASE}/rooms/{room_id}/reservations",
     json={"start_time": at(10), "end_time": at(12)},
 )
 check("no token -> 401", r.status_code == 401, str(r.status_code))
 
-# --- the happy path -----------------------------------------------------
-# Any authenticated role may reserve a room, so a STUDENT token is the
-# right one here. If this ever needs an admin, the role matrix has moved.
 r = book(student, room_id, 10, 12)
 check("student books [10,12) -> 201", r.status_code == 201, str(r.status_code))
 first = r.json() if r.status_code == 201 else {}
@@ -206,7 +177,6 @@ if first.get("id"):
 check("hold is ACTIVE", first.get("status") == "ACTIVE", str(first.get("status")))
 check("hold names the caller", bool(first.get("user_id")), str(first.get("user_id")))
 
-# --- THE CHECKPOINT: overlap is refused ---------------------------------
 r = book(student, room_id, 11, 13)
 check(
     "THE CHECKPOINT: overlapping [11,13) -> 409",
@@ -219,9 +189,6 @@ check(
     str(code_of(r)),
 )
 
-# Containment in both directions, and an identical window. All three are
-# overlaps; a naive `start >= booked_end or end <= booked_start` written
-# with one comparison inverted passes the case above and fails these.
 for label, (s_, e_) in {
     "inner [10:30,11:30)": (10, 11),
     "enclosing [9,13)": (9, 13),
@@ -230,9 +197,6 @@ for label, (s_, e_) in {
     r = book(student, room_id, s_, e_)
     check(f"overlap {label} -> 409", r.status_code == 409, str(r.status_code))
 
-# --- adjacency must SUCCEED --------------------------------------------
-# The whole reason the range is '[)' rather than '[]'. With inclusive
-# bounds, back-to-back bookings would be impossible and this returns 409.
 r = book(student, room_id, 12, 14)
 check("adjacent [12,14) -> 201", r.status_code == 201, str(r.status_code))
 if r.status_code == 201:
@@ -243,7 +207,6 @@ check("adjacent-before [8,10) -> 201", r.status_code == 201, str(r.status_code))
 if r.status_code == 201:
     created_ids.append(r.json()["id"])
 
-# --- the constraint is per room, not global -----------------------------
 r = book(student, other_room_id, 10, 12)
 check(
     "same slot, different room -> 201",
@@ -253,21 +216,6 @@ check(
 if r.status_code == 201:
     created_ids.append(r.json()["id"])
 
-# --- CONCURRENCY: the only case the constraint is actually needed for ---
-# Everything above passes against a plain "is this slot free?" SELECT
-# followed by an INSERT -- which is exactly the implementation this
-# project rejects, and which would be indistinguishable from a correct one
-# until two requests arrived together. N identical bookings released on a
-# barrier: exactly one may commit, and the assertion that matters is the
-# ROW COUNT, not the status codes, because status codes are what the
-# server said.
-#
-# **Every racer is a DIFFERENT student, as of Deadline 6.** They shared
-# the seed account until `reserve_room` took the user-row lock for the
-# room quota; from that moment one account would have serialized all
-# eight on the user row and fed them to the constraint one at a time. The
-# assertion would still have passed and would have stopped measuring the
-# thing it names. See `make_students`.
 RACERS = 8
 _racer_tokens = make_students(RACERS)
 _barrier = threading.Barrier(RACERS)
@@ -316,10 +264,6 @@ finally:
     db.close()
 check("exactly one row landed in the database", len(landed) == 1, f"{len(landed)} rows")
 
-# --- a cancelled hold must not block its old slot -----------------------
-# The constraint is partial on status = 'ACTIVE'. If that WHERE clause
-# were ever dropped, releasing a room would leave the slot permanently
-# unbookable -- and nothing else in this file would notice.
 db = SessionLocal()
 try:
     row = db.get(Reservation, created_ids[0])
@@ -337,12 +281,6 @@ check(
 if r.status_code == 201:
     created_ids.append(r.json()["id"])
 
-# --- what the DATABASE does not enforce: the resource_type check --------
-# `reservations.resource_id` is a foreign key to `resources`, and a GPU
-# cluster IS a resource -- so the FK accepts this row happily. Only the
-# service layer stands between a "room booking" and a GPU cluster. Read
-# paths get this free from the polymorphic discriminator; write paths do
-# not, which is precisely why it is asserted.
 r = book(student, gpu_id, 10, 12)
 check(
     "booking a GPU cluster through /rooms -> 404",
@@ -359,11 +297,6 @@ finally:
     db.close()
 check("no reservation row against the GPU cluster", stray == 0, f"{stray} rows")
 
-# --- what the DATABASE does not enforce: the BLOCKED gate ---------------
-# Outstanding item 6, ratified at Deadline 3. The GiST constraint is
-# partial on the RESERVATION's status, not the RESOURCE's, so the database
-# is entirely indifferent to this. The gate is the whole guarantee.
-# Flipped directly in the database because PATCH /rooms/{id} is Deadline 6.
 db = SessionLocal()
 try:
     room = db.get(Room, other_room_id)
@@ -376,9 +309,6 @@ r = book(student, other_room_id, 30, 32)
 check("booking a BLOCKED room -> 409", r.status_code == 409, str(r.status_code))
 check("409 carries RESOURCE_BLOCKED", code_of(r) == "RESOURCE_BLOCKED", str(code_of(r)))
 
-# Ratified semantics: blocking stops NEW allocations and does NOT evict
-# existing ones -- the same rule as the capacity reduction in
-# ARCHITECTURE_AND_WORKFLOWS.md section 13.
 db = SessionLocal()
 try:
     survivors = (
@@ -397,9 +327,6 @@ check(
     f"{survivors} active holds",
 )
 
-# An ADMIN is refused too. BLOCKED is a fact about the resource, not a
-# permission -- if this ever returns 201 for an admin, the gate has been
-# confused with authorization.
 r = book(admin, other_room_id, 30, 32)
 check("admin is refused on a BLOCKED room too", r.status_code == 409, str(r.status_code))
 
@@ -411,7 +338,6 @@ try:
 finally:
     db.close()
 
-# --- validation ---------------------------------------------------------
 r = book(student, room_id, 12, 12)
 check("empty window (start == end) -> 422", r.status_code == 422, str(r.status_code))
 r = book(student, room_id, 14, 12)
@@ -421,10 +347,6 @@ r = httpx.post(
 )
 check("missing body fields -> 422", r.status_code == 422, str(r.status_code))
 
-# A naive datetime is interpreted as UTC rather than rejected or left to
-# the session TimeZone. Booked at 40:00 UTC-equivalent, then re-booked
-# with an explicit +00:00 -- the second must conflict, which is only true
-# if the first was stored as UTC.
 naive = (DAY + dt.timedelta(hours=40)).replace(tzinfo=None).isoformat()
 naive_end = (DAY + dt.timedelta(hours=42)).replace(tzinfo=None).isoformat()
 r = httpx.post(
@@ -442,9 +364,6 @@ check(
     str(r.status_code),
 )
 
-# --- the read endpoint agrees with the constraint -----------------------
-# `GET /availability` reporting a slot free that the constraint then
-# rejects would look like a concurrency bug and be neither.
 r = httpx.get(
     f"{BASE}/rooms/{room_id}/availability",
     params={"start": at(20), "end": at(22)},
@@ -466,17 +385,6 @@ check(
     str(r.json().get("available") if r.status_code == 200 else r.status_code),
 )
 
-# --- the SHARE lock does what the gate needs, and no more ---------------
-# Two claims, and the gate is only sound if BOTH hold:
-#   1. an admin's write to the resource row CANNOT land between the status
-#      check and the INSERT -- otherwise the booking lands on a room that
-#      is blocked by the time it commits;
-#   2. another booker is NOT blocked -- otherwise the application lock,
-#      not the exclusion constraint, is what decides a concurrent slot
-#      race, and the design claim in reserve_room's docstring is false.
-# FOR UPDATE would satisfy (1) and break (2). Asserted here by holding the
-# lock in one session and racing a second one with a short lock_timeout,
-# because "it should block" and "it does block" are different statements.
 locker = SessionLocal()
 prober = SessionLocal()
 try:
@@ -515,15 +423,12 @@ finally:
     locker.close()
     prober.close()
 
-# --- cleanup ------------------------------------------------------------
 db = SessionLocal()
 try:
     db.query(Reservation).filter(Reservation.id.in_(set(created_ids))).delete(
         synchronize_session=False
     )
 
-    # The racers' holds are not in `created_ids` -- only one of the eight
-    # committed and the script never learns which. Delete by owner.
     if made_users:
         db.query(Reservation).filter(
             Reservation.user_id.in_(made_users)
@@ -532,8 +437,6 @@ try:
             synchronize_session=False
         )
 
-    # Restore the room quota this script lifted. A gate that leaves policy
-    # changed is a gate that breaks the next one.
     db.query(RoleQuota).filter(
         RoleQuota.role == Role.STUDENT,
         RoleQuota.resource_type == ResourceType.ROOM,

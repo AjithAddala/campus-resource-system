@@ -11,9 +11,6 @@ class Enrollment(Base):
     __tablename__ = "enrollments"
     __table_args__ = (
         UniqueConstraint("student_id", "course_offering_id", name="enrollment_unique"),
-        # enrollment_unique leads with student_id, so it serves the
-        # course-load quota but NOT offering-keyed reads: the class roster
-        # and the enrolled_count reconciliation query.
         Index("ix_enrollments_offering_status", "course_offering_id", "status"),
     )
 
@@ -38,8 +35,6 @@ class WaitlistEntry(Base):
     __tablename__ = "waitlist_entries"
     __table_args__ = (
         UniqueConstraint("student_id", "course_offering_id", name="waitlist_unique"),
-        # Serves the promotion query: WHERE course_offering_id = ?
-        # ORDER BY created_at, id LIMIT 1 — run while holding the offering lock.
         Index(
             "ix_waitlist_entries_offering_created",
             "course_offering_id",

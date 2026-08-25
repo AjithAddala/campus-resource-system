@@ -18,14 +18,11 @@ from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
 
-# revision identifiers, used by Alembic.
 revision: str = '1ca8b85b7626'
 down_revision: Union[str, None] = 'c86676652ca2'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
-# Every created_at that was created without an explicit type, so resolved
-# to `timestamp without time zone`.
 NAIVE_TIMESTAMP_TABLES = (
     "enrollments",
     "gpu_reservations",
@@ -47,7 +44,6 @@ def upgrade() -> None:
             postgresql_using="created_at AT TIME ZONE 'UTC'",
         )
 
-    # users had no created_at at all.
     op.add_column(
         "users",
         sa.Column(
@@ -58,26 +54,21 @@ def upgrade() -> None:
         ),
     )
 
-    # A catalogue with two CS101 rows is not a catalogue. Same name, so the
-    # index is replaced in place rather than added alongside.
     op.drop_index("ix_courses_code", table_name="courses")
     op.create_index(op.f("ix_courses_code"), "courses", ["code"], unique=True)
 
-    # The quota SUM, held under the user lock.
     op.create_index(
         "ix_gpu_reservations_user_status",
         "gpu_reservations",
         ["user_id", "status"],
         unique=False,
     )
-    # Offering-keyed reads: class roster, enrolled_count reconciliation.
     op.create_index(
         "ix_enrollments_offering_status",
         "enrollments",
         ["course_offering_id", "status"],
         unique=False,
     )
-    # "my reservations" — the GiST exclusion index covers resource+time.
     op.create_index(
         "ix_reservations_user_id", "reservations", ["user_id"], unique=False
     )

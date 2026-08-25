@@ -138,17 +138,9 @@ async def _one(
     barrier: asyncio.Barrier,
     gate: asyncio.Semaphore | None = None,
 ) -> Result:
-    # Every coroutine waits here until the last one is ready, so the
-    # requests leave together rather than trickling out as the event loop
-    # creates tasks. Without it the first request can be finished before
-    # the last is constructed, and a "concurrent" benchmark quietly
-    # becomes a sequential one.
     await barrier.wait()
     started = time.perf_counter()
     try:
-        # `gate` caps how many requests are IN FLIGHT, which is a real
-        # ceiling of this architecture and not a property of the test.
-        # See `fire_async` for why it exists.
         if gate is not None:
             async with gate:
                 response = await client.request(

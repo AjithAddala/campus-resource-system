@@ -20,14 +20,6 @@ from app.core.config import get_settings
 
 _hasher = PasswordHasher()
 
-# Public, because `auth/service.py` verifies against it. Used when the
-# email does not exist, so that a login attempt on an unknown address
-# costs the same ~50ms as one on a real address. Without it, "no such
-# user" returns immediately while "wrong password" pays for a full argon2
-# verify, and the difference is measurable over a few requests — which
-# turns the login endpoint into an oracle for which emails are
-# registered. The 401 body is identical either way; this makes the
-# timing identical too.
 DUMMY_PASSWORD_HASH = _hasher.hash("not-a-real-password")
 
 

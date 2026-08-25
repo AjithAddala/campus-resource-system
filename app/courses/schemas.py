@@ -12,34 +12,10 @@ from pydantic import (
 
 from app.models.enums import EnrollmentStatus
 
-# Single-character day codes. R is Thursday, U is Sunday.
-#
-# **Multi-character tokens like "Tu"/"Th" are deliberately not supported**,
-# and the reason is a bug rather than laziness: overlap is computed by
-# intersecting the sets of characters, and `set("Tu") & set("Th")` is
-# `{"T"}` -- so a Tuesday class would be reported as conflicting with a
-# Thursday one. One character per day makes the intersection exact.
-#
-# Lived in `service.py` next to `_days_overlap` until the catalogue
-# endpoints landed, whose arrival that comment had anticipated: *"if an
-# offering-creation endpoint ever lands, this is the vocabulary it must
-# validate against."* It now sits where the validating happens and
-# `service.py` imports it, which is the same direction `rooms` already
-# runs. One definition, because two would drift and the drift would
-# surface as a phantom schedule conflict rather than as an import error.
 DAY_CODES = frozenset("MTWRFSU")
 
-# Zero-padded 24-hour "HH:MM". The padding is not cosmetic: `_times_overlap`
-# compares these strings LEXICOGRAPHICALLY, so "9:00" would sort after
-# "10:30" and silently invert every schedule comparison in the system.
-# Rejecting the unpadded form at the boundary is what lets that comparison
-# stay a string comparison.
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
-# Course codes are compared for uniqueness by the database, which is
-# case-SENSITIVE -- so "cs641" and "CS641" would both insert and the
-# catalogue would hold two rows for one course while `courses.code`'s
-# unique index saw no problem at all.
 COURSE_CODE_RE = re.compile(r"^[A-Z0-9][A-Z0-9 .-]*$")
 
 
@@ -122,8 +98,6 @@ class CourseOfferingCreate(BaseModel):
                 "(R = Thursday, U = Sunday)"
             )
         if len(set(v)) != len(v):
-            # "MM" is not twice as many Mondays, it is a typo -- and the
-            # set intersection in `_days_overlap` cannot tell you which.
             raise ValueError("day codes must not repeat")
         return v
 
@@ -155,7 +129,7 @@ class CourseOfferingRead(BaseModel):
     instructor_id: int
     semester: str
     year: int
-    start_time: str  # "HH:MM", zero-padded
+    start_time: str
     end_time: str
     days: str
     capacity: int

@@ -9,10 +9,6 @@ from app.core.errors import coded_error
 from app.core.security import create_access_token
 from app.database.session import get_db
 
-# Public routes, both of them — they are how a caller obtains the token
-# every other route requires, so neither takes get_current_user. They are
-# also the only two endpoints that will still be reachable without a
-# token after the Deadline 3 swap.
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -35,8 +31,6 @@ def register(
     try:
         return service.register(db, payload)
     except EmailAlreadyRegistered:
-        # 409, not 500 and not a pre-flight check. The database rejected
-        # the insert; this turns that into the caller's answer.
         raise coded_error(
             status.HTTP_409_CONFLICT,
             "EMAIL_ALREADY_REGISTERED",
@@ -66,9 +60,6 @@ def login(
     user = service.authenticate(db, form.username, form.password)
 
     if user is None:
-        # One response for "no such email" and for "wrong password". The
-        # WWW-Authenticate header is what makes this a spec-conforming
-        # 401 rather than a 401-shaped 403.
         raise HTTPException(
             status.HTTP_401_UNAUTHORIZED,
             "Incorrect email or password",

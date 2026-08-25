@@ -27,8 +27,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.security import hash_password  # noqa: E402
@@ -165,22 +163,17 @@ student = login("student@iitk.ac.in")
 faculty = login("faculty@iitk.ac.in")
 admin = login("admin@iitk.ac.in")
 
-# MWF 09:00-10:30, roomy.
 main_id = make_offering(50, "MWF", "09:00", "10:30")
 
-# --- the boundary -------------------------------------------------------
 r = httpx.post(f"{BASE}/offerings/{main_id}/register")
 check("no token -> 401", r.status_code == 401, str(r.status_code))
 
-# STUDENT-only, and that is why (FACULTY, COURSE) has no quota row: the
-# pair is unreachable behind this 403.
 r = register(faculty, main_id)
 check("faculty -> 403 on register", r.status_code == 403, str(r.status_code))
 r = register(admin, main_id)
 check("admin -> 403 on register", r.status_code == 403, str(r.status_code))
 check("the 403s enrolled nobody", offering_state(main_id)[0] == 0, str(offering_state(main_id)))
 
-# --- the happy path -----------------------------------------------------
 r = register(student, main_id)
 check("student registers -> 201", r.status_code == 201, str(r.status_code))
 enrollment = r.json() if r.status_code == 201 else {}
@@ -195,7 +188,6 @@ check(
     str(r.json()["seats_available"]),
 )
 
-# --- IDENTITY: duplicate, and the dropped-row trap ----------------------
 r = register(student, main_id)
 check(
     "duplicate registration -> 409 ALREADY_ENROLLED",
@@ -209,19 +201,10 @@ check("drop -> 200", r.status_code == 200, str(r.status_code))
 check("status is DROPPED", r.json().get("status") == "DROPPED", str(r.json().get("status")))
 check("counter decremented", offering_state(main_id)[0] == 0, str(offering_state(main_id)))
 
-# Idempotent, like GPU cancel: the decrement happens only on the
-# ACTIVE -> DROPPED transition, so a repeat is a no-op rather than a
-# second decrement that would drive enrolled_count negative and trip
-# `offering_enrollment_sane` as a 500.
 r = drop(student, main_id)
 check("drop twice -> 200, same row", r.status_code == 200, str(r.status_code))
 check("counter NOT double-decremented", offering_state(main_id)[0] == 0, str(offering_state(main_id)))
 
-# THE TRAP. `enrollment_unique` has no `WHERE status = 'ACTIVE'`, so the
-# dropped student STILL OWNS A ROW. Re-registering must UPDATE it. An
-# implementation that INSERTs here raises IntegrityError from inside the
-# transaction -- a 500 that looks like a mysterious bug rather than the
-# design consequence it is. The proof is the enrollment id: same row.
 r = register(student, main_id)
 check("re-registration after a drop -> 201", r.status_code == 201, str(r.status_code))
 check(
@@ -241,8 +224,6 @@ finally:
 check("still exactly one enrollment row for this student", rows == 1, f"{rows} rows")
 check("counter back to 1", offering_state(main_id)[0] == 1, str(offering_state(main_id)))
 
-# --- SCHEDULE: keyed on the student -------------------------------------
-# Overlapping: MWF 10:00-11:00 against the held MWF 09:00-10:30.
 clash_id = make_offering(50, "MWF", "10:00", "11:00")
 r = register(student, clash_id)
 check(
@@ -252,27 +233,14 @@ check(
 )
 check("the conflict enrolled nobody", offering_state(clash_id)[0] == 0, str(offering_state(clash_id)))
 
-# Adjacent must SUCCEED: 10:30-12:00 starts exactly when the held one
-# ends. Same half-open reasoning as the room exclusion constraint.
 adjacent_id = make_offering(50, "MWF", "10:30", "12:00")
 r = register(student, adjacent_id)
 check("adjacent times -> 201", r.status_code == 201, str(r.status_code))
 
-# Same clock, different days -> no conflict.
 other_days_id = make_offering(50, "TR", "09:00", "10:30")
 r = register(student, other_days_id)
 check("same time, different days -> 201", r.status_code == 201, str(r.status_code))
 
-# A dropped enrollment must stop conflicting, or a student could never
-# swap one section for another.
-#
-# BOTH held offerings have to go, and the first run of this script got
-# that wrong: it dropped only `main` (MWF 09:00-10:30) and expected the
-# clashing 10:00-11:00 to become registrable -- but `adjacent` is MWF
-# 10:30-12:00, which overlaps 10:00-11:00 between 10:30 and 11:00. The
-# 409 was correct and the assertion was wrong. Recorded rather than
-# quietly fixed, because a test that has to be talked out of a true
-# failure is worth more attention than one that passes.
 drop(student, main_id)
 drop(student, adjacent_id)
 r = register(student, clash_id)
@@ -285,7 +253,6 @@ check(
 for oid in (clash_id, other_days_id):
     drop(student, oid)
 
-# --- CAPACITY: keyed on the offering ------------------------------------
 tiny_id = make_offering(1, "S", "08:00", "09:00")
 tokens = make_students(2)
 r = register(tokens[0], tiny_id)
@@ -298,7 +265,6 @@ check(
 )
 check("counter still 1", offering_state(tiny_id)[0] == 1, str(offering_state(tiny_id)))
 
-# --- routing and misuse -------------------------------------------------
 r = register(student, 999999)
 check("nonexistent offering -> 404", r.status_code == 404, str(r.status_code))
 r = drop(student, 999999)
@@ -310,19 +276,7 @@ check(
     f"{r.status_code} {code_of(r)}",
 )
 
-# =======================================================================
-# CONCURRENCY. Everything above passes with no locks at all.
-# =======================================================================
 
-# --- BENCHMARK 1 (capacity), in miniature -------------------------------
-# N students, K seats, all released together. `enrolled_count` is read
-# and written inside the offering lock, so exactly K may commit. Without
-# that lock, several requests read the same count and the section
-# oversells -- and `offering_enrollment_sane` would then reject the
-# overshoot as a 500 rather than letting it through silently.
-#
-# Deadline 5 scales this to 500 requests on 50 seats with an asyncio
-# harness; this is the same assertion at a size a thread pool can drive.
 SEATS = 5
 RACERS = 20
 race_id = make_offering(SEATS, "U", "07:00", "08:00")
@@ -356,25 +310,12 @@ check(f"exactly {SEATS} registrations succeeded", tally.get(201, 0) == SEATS, st
 check("enrolled_count never exceeded capacity", enrolled <= capacity, f"{enrolled}/{capacity}")
 check("no 500s under contention", 500 not in tally, str(tally))
 
-# The Deadline 8 reconciliation query, run early: derived state must agree
-# with the rows it is derived from. Any path that updated one without the
-# other shows up here and nowhere else.
 check(
     "reconciliation: enrolled_count == COUNT(active enrollments)",
     enrolled == active_count(race_id),
     f"counter={enrolled} rows={active_count(race_id)}",
 )
 
-# --- schedule conflict under concurrency --------------------------------
-# The reason registration takes the USER lock at Deadline 4 rather than
-# waiting for the course-load quota at Deadline 6. Two clashing offerings
-# share no offering row, so the offering lock cannot see the conflict --
-# exactly the cross-cluster GPU quota race, on a different invariant.
-#
-# Run as trials, because a single race is a coin flip and can pass
-# against a build with no user lock at all. (Benchmark 2 taught this the
-# hard way: its first single-shot run reported a clean result against the
-# deliberately broken build.)
 TRIALS = 15
 double_booked = 0
 clash_a = make_offering(50, "MWF", "13:00", "14:00")
@@ -415,7 +356,6 @@ check(
     f"{double_booked} students hold two clashing offerings",
 )
 
-# --- cleanup ------------------------------------------------------------
 db = SessionLocal()
 try:
     db.query(Enrollment).filter(

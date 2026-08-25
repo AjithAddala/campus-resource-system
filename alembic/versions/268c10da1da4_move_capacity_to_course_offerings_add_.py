@@ -11,7 +11,6 @@ from alembic import op
 import sqlalchemy as sa
 
 
-# revision identifiers, used by Alembic.
 revision: str = '268c10da1da4'
 down_revision: Union[str, None] = 'e0fbfe421403'
 branch_labels: Union[str, Sequence[str], None] = None
@@ -19,8 +18,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # capacity: courses -> course_offerings. Added nullable, backfilled from
-    # the parent course, then tightened — so this is safe on a populated DB.
     op.add_column(
         "course_offerings", sa.Column("capacity", sa.Integer(), nullable=True)
     )
@@ -32,8 +29,6 @@ def upgrade() -> None:
     op.alter_column("course_offerings", "capacity", nullable=False)
     op.drop_column("courses", "capacity")
 
-    # instructor_id has no backfill value, so NOT NULL only holds because
-    # course_offerings is empty at this revision (verified: 0 rows).
     op.add_column(
         "course_offerings", sa.Column("instructor_id", sa.Integer(), nullable=False)
     )
@@ -51,8 +46,6 @@ def upgrade() -> None:
         unique=False,
     )
 
-    # The counter locked by course registration. server_default so existing
-    # rows get 0; the model's default=0 covers new inserts.
     op.add_column(
         "course_offerings",
         sa.Column(
@@ -88,8 +81,6 @@ def downgrade() -> None:
     )
     op.drop_column("course_offerings", "instructor_id")
 
-    # Move capacity back. MAX over the course's offerings, since several
-    # offerings collapse into one course row.
     op.add_column("courses", sa.Column("capacity", sa.Integer(), nullable=True))
     op.execute(
         "UPDATE courses c "

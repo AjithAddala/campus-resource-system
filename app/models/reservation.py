@@ -14,8 +14,6 @@ class Reservation(Base):
     """
     __tablename__ = "reservations"
     __table_args__ = (
-        # "my reservations". Lookups by (resource_id, time) are already
-        # served by the GiST exclusion index, which is partial to ACTIVE.
         Index("ix_reservations_user_id", "user_id"),
     )
 
@@ -42,9 +40,6 @@ class GPUReservation(Base):
     """
     __tablename__ = "gpu_reservations"
     __table_args__ = (
-        # THE quota index. This SUM runs inside the hottest transaction
-        # while holding the user lock, so a seq scan here is lock time
-        # every other request from that user waits on.
         Index("ix_gpu_reservations_user_status", "user_id", "status"),
     )
 

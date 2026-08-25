@@ -34,8 +34,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.security import hash_password  # noqa: E402
@@ -60,8 +58,6 @@ BASE = "http://localhost:8000/api/v1"
 SEED_PASSWORD = "campus123"
 TEST_PASSWORD = "check-password-123"
 
-# Exactly what scripts/seed.py writes. Restored at the end, so a run of
-# this script is not allowed to change policy for the next one.
 SEEDED_QUOTAS = [
     (Role.STUDENT, ResourceType.GPU, 2),
     (Role.FACULTY, ResourceType.GPU, 10),
@@ -208,12 +204,6 @@ finally:
 
 reset_state()
 
-# --- ROOM QUOTA: the same mechanism on a second resource ----------------
-# STUDENT room quota is 2. The third booking must be refused by the quota
-# gate and not by the exclusion constraint, so every slot below is
-# distinct -- a conflicting interval would produce the right status code
-# for the wrong reason, which is the failure mode this project keeps
-# finding in its own tests.
 r = book(student, r1, 0)
 check("room 1 of 2 -> 201", r.status_code == 201, str(r.status_code))
 first_hold = r.json().get("id")
@@ -226,9 +216,6 @@ check("room 3 -> 409", r.status_code == 409, str(r.status_code))
 check("room 3 -> QUOTA_EXCEEDED", code_of(r) == "QUOTA_EXCEEDED", str(code_of(r)))
 check("the refused booking created nothing", held_rooms(seed_student_id) == 2, str(held_rooms(seed_student_id)))
 
-# Distinct from the interval conflict, which is a different invariant with
-# a different remedy. A build that returned QUOTA_EXCEEDED for both would
-# pass every assertion above.
 r = book(faculty, r1, 0)
 check(
     "faculty booking the SAME slot -> INTERVAL_CONFLICT, not QUOTA",
@@ -236,9 +223,6 @@ check(
     f"{r.status_code} {code_of(r)}",
 )
 
-# Cancelling frees quota -- the reason cancel_reservation now takes the
-# user lock. Without that lock this passes anyway (it is sequential); the
-# concurrency trial at the bottom is what needs it.
 r = httpx.delete(
     f"{BASE}/rooms/{r1}/reservations/{first_hold}", headers=bearer(student), timeout=30
 )
@@ -246,14 +230,10 @@ check("cancel a hold -> 200", r.status_code == 200, str(r.status_code))
 r = book(student, r1, 30)
 check("after cancelling, a new booking succeeds", r.status_code == 201, str(r.status_code))
 
-# ADMIN has max_units = NULL, which is a policy that says yes -- not a
-# missing row, which fails closed. Three bookings is already past the
-# STUDENT and FACULTY caps.
 for i in range(3):
     r = book(admin, r2, 40 + i)
     check(f"admin unlimited: booking {i + 1} -> 201", r.status_code == 201, str(r.status_code))
 
-# --- GET /me/quota ------------------------------------------------------
 reset_state()
 r = httpx.get(f"{BASE}/me/quota", headers=bearer(student), timeout=30)
 check("GET /me/quota -> 200", r.status_code == 200, str(r.status_code))
@@ -271,9 +251,6 @@ r = httpx.get(f"{BASE}/me/quota", headers=bearer(student), timeout=30)
 by_type = {row["resource_type"]: row for row in r.json()["quotas"]}
 check("me/quota reflects a real holding", by_type["ROOM"]["held"] == 1, str(by_type["ROOM"]["held"]))
 
-# The unseeded pair. `limit_for` fails CLOSED inside a transaction, which
-# is right there and wrong here: a faculty member asking what their limits
-# are must not get an error because one pair is unconfigured.
 r = httpx.get(f"{BASE}/me/quota", headers=bearer(faculty), timeout=30)
 check("faculty me/quota -> 200 despite an unseeded pair", r.status_code == 200, str(r.status_code))
 by_type = {row["resource_type"]: row for row in r.json()["quotas"]}
@@ -290,9 +267,6 @@ check(
     str(by_type["GPU"]),
 )
 
-# **The assertion that proves it takes no lock.** Hold the seed student's
-# user row FOR UPDATE in a separate session and call the endpoint. If it
-# locked, this would block until the timeout; it must answer immediately.
 locker = SessionLocal()
 try:
     from sqlalchemy import select as _select
@@ -313,7 +287,6 @@ finally:
 r = httpx.get(f"{BASE}/me/quota", timeout=30)
 check("me/quota with no token -> 401", r.status_code == 401, str(r.status_code))
 
-# --- ADMIN QUOTA POLICY -------------------------------------------------
 r = httpx.get(f"{BASE}/admin/quotas/STUDENT/GPU", headers=bearer(student), timeout=30)
 check("student reading policy -> 403", r.status_code == 403, str(r.status_code))
 r = httpx.put(
@@ -335,15 +308,12 @@ check("the refused write changed nothing", unchanged == 2, str(unchanged))
 r = httpx.get(f"{BASE}/admin/quotas/STUDENT/GPU", headers=bearer(admin), timeout=30)
 check("admin reads policy -> 200, max_units 2", r.status_code == 200 and r.json()["max_units"] == 2, str(r.json() if r.status_code == 200 else r.status_code))
 
-# A MISSING row is a 404, not a row with a null limit. Absent and NULL are
-# different, which is the whole reason QuotaNotConfigured exists.
 r = httpx.get(f"{BASE}/admin/quotas/FACULTY/COURSE", headers=bearer(admin), timeout=30)
 check("unseeded pair -> 404, not a null limit", r.status_code == 404, str(r.status_code))
 
 r = httpx.get(f"{BASE}/admin/quotas/WIZARD/GPU", headers=bearer(admin), timeout=30)
 check("nonsense role -> 422 from the enum, before the query", r.status_code == 422, str(r.status_code))
 
-# PUT upserts, which is how a missing policy gets fixed in-band.
 r = httpx.put(
     f"{BASE}/admin/quotas/FACULTY/COURSE", json={"max_units": 3}, headers=bearer(admin), timeout=30
 )
@@ -363,8 +333,6 @@ r = httpx.put(
 )
 check("PUT negative -> 422", r.status_code == 422, str(r.status_code))
 
-# **Lowering a quota does not evict.** The rule from §13, and the
-# implementation of it is that nothing here looks at anyone's holdings.
 reset_state()
 book(student, r1, 0)
 book(student, r2, 0)
@@ -378,10 +346,6 @@ r = book(student, r1, 50)
 check("but a new booking is refused", r.status_code == 409 and code_of(r) == "QUOTA_EXCEEDED", f"{r.status_code} {code_of(r)}")
 set_quota_direct(Role.STUDENT, ResourceType.ROOM, 2)
 
-# --- COURSE-LOAD QUOTA --------------------------------------------------
-# Driven through the admin endpoint rather than by seeding seven
-# offerings: the policy write is itself under test, and a load limit of 1
-# proves the gate exactly as well as a limit of 6 does.
 reset_state()
 r = httpx.put(
     f"{BASE}/admin/quotas/STUDENT/COURSE", json={"max_units": 1}, headers=bearer(admin), timeout=30
@@ -390,8 +354,6 @@ check("set the course load limit to 1 -> 200", r.status_code == 200, str(r.statu
 
 db = SessionLocal()
 try:
-    # A second, non-clashing offering, so the refusal below is the quota
-    # and not the schedule check. Different days entirely.
     extra = CourseOffering(
         course_id=course_id,
         instructor_id=faculty_id,
@@ -417,19 +379,15 @@ r = httpx.post(f"{BASE}/offerings/{extra_id}/register", headers=bearer(student),
 check("course 2 -> 409", r.status_code == 409, str(r.status_code))
 check("course 2 -> QUOTA_EXCEEDED, not SCHEDULE_CONFLICT", code_of(r) == "QUOTA_EXCEEDED", str(code_of(r)))
 
-# Already-enrolled beats quota: a caller asking about a seat they hold
-# should be told that, not told they are at their limit.
 r = httpx.post(f"{BASE}/offerings/{base_offering}/register", headers=bearer(student), timeout=30)
 check("re-registering the SAME offering -> ALREADY_ENROLLED, not QUOTA", code_of(r) == "ALREADY_ENROLLED", str(code_of(r)))
 
-# Dropping frees load; a DROPPED row must not keep counting.
 r = httpx.delete(f"{BASE}/offerings/{base_offering}/drop", headers=bearer(student), timeout=30)
 check("drop -> 200", r.status_code == 200, str(r.status_code))
 r = httpx.post(f"{BASE}/offerings/{extra_id}/register", headers=bearer(student), timeout=30)
 check("after dropping, the other offering succeeds", r.status_code == 201, str(r.status_code))
 set_quota_direct(Role.STUDENT, ResourceType.COURSE, 6)
 
-# --- ADMIN RESOURCE STATUS ----------------------------------------------
 reset_state()
 r = httpx.patch(f"{BASE}/rooms/{r1}", json={"status": "BLOCKED"}, headers=bearer(student), timeout=30)
 check("student PATCH /rooms -> 403", r.status_code == 403, str(r.status_code))
@@ -448,7 +406,6 @@ check("bookable again", r.status_code == 201, str(r.status_code))
 r = httpx.patch(f"{BASE}/rooms/999999", json={"status": "BLOCKED"}, headers=bearer(admin), timeout=30)
 check("PATCH a nonexistent room -> 404", r.status_code == 404, str(r.status_code))
 
-# --- ADMIN GPU CAPACITY, and the constraint that contradicts §13 --------
 reset_state()
 r = httpx.post(f"{BASE}/gpus/{c1}/reservations", json={"gpu_count": 2}, headers=bearer(student), timeout=30)
 check("setup: 2 units held on the cluster", r.status_code == 201, str(r.status_code))
@@ -471,8 +428,6 @@ check("the shrunk cluster is now full", r.status_code == 409 and code_of(r) == "
 r = httpx.patch(f"{BASE}/gpus/{c1}", json={"gpu_count": c1_count}, headers=bearer(admin), timeout=30)
 check("grow it back -> 200", r.status_code == 200, str(r.status_code))
 
-# `allocated` is not a field on the update model, so a caller cannot set
-# derived state directly. Pydantic ignores the extra key.
 r = httpx.patch(f"{BASE}/gpus/{c1}", json={"allocated": 0}, headers=bearer(admin), timeout=30)
 db = SessionLocal()
 try:
@@ -483,17 +438,6 @@ finally:
 r = httpx.patch(f"{BASE}/gpus/{r1}", json={"status": "BLOCKED"}, headers=bearer(admin), timeout=30)
 check("PATCH a room id via /gpus -> 404", r.status_code == 404, str(r.status_code))
 
-# --- ROOM QUOTA UNDER CONCURRENCY ---------------------------------------
-# The only assertion here that a resource-lock-only build fails.
-#
-# One student already holding 1 of 2 fires two bookings at two DIFFERENT
-# rooms simultaneously. Neither room is contended -- each takes its own
-# resource lock and the exclusion constraint sees two separate resources
-# -- so nothing but the USER row can serialize them. Without that lock
-# both read held=1, both pass a limit of 2, and the student ends with 3.
-#
-# Counted over trials, per the Deadline 4 lesson: the corruption window is
-# sub-millisecond and one race is a coin flip, not an instrument.
 TRIALS = 20
 over_quota = 0
 held_seen: collections.Counter = collections.Counter()
@@ -502,7 +446,7 @@ succeeded_seen: collections.Counter = collections.Counter()
 for _ in range(TRIALS):
     reset_state()
     _, uid, token = make_student()
-    book(token, r1, 0)  # 1 of 2 held
+    book(token, r1, 0)
 
     barrier = threading.Barrier(2)
     results: list[int] = []
@@ -539,7 +483,6 @@ print()
 check(f"room quota race: zero over-quota trials in {TRIALS}", over_quota == 0, f"{over_quota} trials ended with held > 2")
 check("room quota race: exactly one booking succeeded each time", set(succeeded_seen) <= {1}, str(dict(succeeded_seen)))
 
-# --- cleanup ------------------------------------------------------------
 reset_state()
 db = SessionLocal()
 try:

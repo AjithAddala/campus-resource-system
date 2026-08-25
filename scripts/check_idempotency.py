@@ -35,8 +35,6 @@ from pathlib import Path
 
 import httpx
 
-# Running a file inside scripts/ puts scripts/ on sys.path, not the repo
-# root, so `app` would not import. Same job as alembic.ini's prepend_sys_path.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.core.security import hash_password  # noqa: E402
@@ -172,11 +170,6 @@ finally:
 
 reset_state()
 
-# --- the unkeyed path still works, and still double-allocates -----------
-# This is the BROKEN column of Benchmark 3 and it is supposed to pass.
-# Two identical requests with no key are two requests, because nothing
-# told the server otherwise. Deleting this behaviour would delete the
-# comparison the benchmark is built on.
 r1 = reserve(student, c1, 1)
 r2 = reserve(student, c1, 1)
 check("no key: first request -> 201", r1.status_code == 201, str(r1.status_code))
@@ -188,7 +181,6 @@ check(
     f'{r1.json()["id"]} vs {r2.json()["id"]}',
 )
 
-# --- the keyed path: one allocation, identical response -----------------
 reset_state()
 k = new_key()
 r1 = reserve(student, c1, 1, key=k)
@@ -221,32 +213,19 @@ check(
     str(row.endpoint if row else None),
 )
 
-# A third retry, well after the fact, still replays rather than allocating.
 r3 = reserve(student, c1, 1, key=k)
 check("key: a third retry still replays", r3.status_code == 201 and r3.json() == r1.json(), "")
 check("key: still exactly ONE reservation", reservation_count() == 1, str(reservation_count()))
 
-# --- same key, DIFFERENT request -> 422 ---------------------------------
-# The dangerous alternative is replaying the first response, which would
-# tell the caller their NEW request succeeded when nothing was done for
-# it. Refusing is the only answer that cannot mislead.
 r = reserve(student, c1, 2, key=k)
 check("same key, different body -> 422", r.status_code == 422, str(r.status_code))
 check("same key, different body -> IDEMPOTENCY_KEY_REUSED", code_of(r) == "IDEMPOTENCY_KEY_REUSED", str(code_of(r)))
 check("the rejected reuse allocated nothing", reservation_count() == 1, str(reservation_count()))
 
-# Same body, DIFFERENT cluster is also a different request -- this is what
-# folding gpu_id into the fingerprint buys. Hashing the body alone would
-# let a key claimed for c1 replay a response naming c1 while the caller
-# asked about c2.
 r = reserve(student, c2, 1, key=k)
 check("same key, same body, different cluster -> 422", r.status_code == 422, str(r.status_code))
 check("cross-cluster reuse allocated nothing", reservation_count() == 1, str(reservation_count()))
 
-# --- UNIQUE is on the PAIR, not the key ---------------------------------
-# Two users who independently generate the same key string must not
-# collide. A UNIQUE on `key` alone would make one user's retry silently
-# replay another user's reservation -- a data leak, not just a bug.
 reset_state()
 shared = new_key()
 rs = reserve(student, c1, 1, key=shared)
@@ -261,15 +240,8 @@ check(
 )
 check("two key rows share the key string", key_count(shared) == 2, str(key_count(shared)))
 
-# --- a FAILED request leaves no key -------------------------------------
-# The design consequence of committing key and allocation together, and
-# the one worth stating out loud: "exactly once" is a promise about
-# SUCCESSES. A request refused by the quota gate rolls the key back with
-# everything else, so the caller may retry it for real once they are
-# under quota. The alternative -- a key that outlives its rollback --
-# would forbid retrying a request that never happened.
 reset_state()
-r = reserve(student, c1, 2)  # STUDENT quota is 2 units; now exhausted
+r = reserve(student, c1, 2)
 check("setup: student holds 2 of 2 units", r.status_code == 201, str(r.status_code))
 
 kf = new_key()
@@ -282,8 +254,6 @@ check(
     f"{key_count(kf)} rows",
 )
 
-# Free the quota, then retry the SAME key. It must allocate for real --
-# not replay, and not be refused as reused.
 db = SessionLocal()
 try:
     held = db.query(GPUReservation).filter(GPUReservation.status == ReservationStatus.ACTIVE).all()
@@ -302,23 +272,6 @@ r = reserve(student, c1, 1, key=kf)
 check("retrying the failed key now ALLOCATES, not replays", r.status_code == 201, str(r.status_code))
 check("the retry created a key row this time", key_count(kf) == 1, str(key_count(kf)))
 
-# --- CONCURRENT retries -------------------------------------------------
-# BENCHMARK 3's concurrent half, and the only assertion here that a
-# split-commit implementation fails. Everything above passes when the key
-# is inserted in its own transaction, because sequential retries never
-# race.
-#
-# The mechanism under test is not a lock we take. It is the UNIQUE index:
-# N simultaneous INSERTs of one (key, user) pair, one proceeds and the
-# rest BLOCK on the index entry until it commits, then read the response
-# it stored. That works before the row exists, which is the window a
-# retry actually arrives in and the reason a row lock could not do this
-# job.
-#
-# Counted over trials, not asserted once. The corruption window is
-# sub-millisecond and one run is a coin flip -- the lesson Benchmark 2
-# taught at Deadline 4, applied here before writing the test rather than
-# after it lied.
 TRIALS = 15
 RETRIES = 8
 over_allocated = 0
@@ -386,7 +339,6 @@ check(
     str(dict(status_seen)),
 )
 
-# --- cleanup ------------------------------------------------------------
 reset_state()
 db = SessionLocal()
 try:

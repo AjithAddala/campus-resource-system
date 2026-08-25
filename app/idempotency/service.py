@@ -175,10 +175,6 @@ def claim(
             )
         ).scalar_one()
 
-        # Endpoint is compared as well as the fingerprint. The same key
-        # reused on a different route is a different request even if the
-        # bodies happen to hash alike, and `endpoint` is the only column
-        # that can tell those apart.
         if existing.endpoint != endpoint or existing.request_hash != fingerprint:
             raise KeyReuse(key)
 

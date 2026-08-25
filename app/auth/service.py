@@ -50,18 +50,9 @@ def register(db: Session, payload: RegisterRequest) -> User:
     try:
         db.commit()
     except IntegrityError as exc:
-        # Rollback before anything else: the session is in a failed state
-        # and any further statement on it would raise PendingRollbackError,
-        # which would surface as a 500 and bury the real 409.
         db.rollback()
         raise EmailAlreadyRegistered(payload.email) from exc
 
-    # `expire_on_commit=False` keeps the object readable after commit, but
-    # `id` and `created_at` are server-generated and `created_at` was
-    # never loaded — so serialising UserRead would emit a lazy SELECT from
-    # inside the response layer. Refresh explicitly instead. The session
-    # settings exist to stop statements appearing at surprising points;
-    # relying on one here would spend that.
     db.refresh(user)
     return user
 

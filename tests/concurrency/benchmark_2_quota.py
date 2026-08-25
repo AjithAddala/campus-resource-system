@@ -98,18 +98,11 @@ from tests.concurrency.harness import (  # noqa: E402
     tool_session_factory,
 )
 
-# NOT the application's SessionLocal. That engine is sized for the server
-# (40 + 10) and a benchmark importing it opens a second pool of the same
-# size against a Postgres that allows 100 connections total.
 SessionLocal = tool_session_factory()
 
-# Block-buffered stdout makes a hung benchmark look like a slow one.
 print = functools.partial(print, flush=True)  # noqa: A001
 
 TRIALS = 25
-# One racer per cluster. Two is the shape the plan names; the knob exists
-# because the race is probabilistic, and a wider fan-out widens the window
-# without changing what is being shown.
 RACERS = 2
 
 made_users: list[int] = []
@@ -237,9 +230,6 @@ def cleanup() -> None:
             GPUReservation.user_id.in_(made_users)
         ).delete(synchronize_session=False)
         db.flush()
-        # Joined-table inheritance: two rows per cluster, `resources` and
-        # `gpu_clusters`. A bulk delete on the subclass leaves the parent
-        # behind, so delete mapped objects and let the ORM emit both.
         for cluster in db.query(GPUCluster).filter(GPUCluster.id.in_(made_clusters)):
             db.delete(cluster)
         db.query(User).filter(User.id.in_(made_users)).delete(synchronize_session=False)
@@ -305,11 +295,6 @@ def run(trials: int, racers: int) -> int:
             f"409-QUOTA={refused} peak_db_conns={obs.peak.max_active:<3} "
             f"median={latency(results).get('median_ms', 0)}ms"
         )
-        # The FULL tally whenever anything lands outside the three reported
-        # buckets. Benchmark 1 once reported `201=0 409=0 err=0` for 500
-        # requests, because every response had fallen into a bucket that did
-        # not exist. A benchmark that can silently drop responses is not an
-        # instrument.
         accounted = created + refused + errors
         if accounted != len(results):
             print(f"           responses: {dict(counts)}")
