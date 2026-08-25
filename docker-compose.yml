@@ -26,5 +26,19 @@ services:
       db:
         condition: service_healthy
 
+  frontend:
+    build: ./frontend
+    environment:
+      # Inside the compose network the API is reachable by service name.
+      # Override to http://localhost:8000/api/v1 when running Streamlit
+      # outside Docker.
+      API_BASE_URL: http://app:8000/api/v1
+    ports:
+      - "8501:8501"
+    volumes:
+      - ./frontend:/code
+    depends_on:
+      - app
+
 volumes:
   pgdata:

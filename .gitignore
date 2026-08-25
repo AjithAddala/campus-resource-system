@@ -2,7 +2,7 @@
 .claude/settings.local.json
 __pycache__/
 *.pyc
-.venv/
+venv/
 .pytest_cache/
 .idea/
 .vscode/

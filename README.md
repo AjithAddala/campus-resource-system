@@ -64,6 +64,9 @@ docker compose exec app alembic upgrade head
 docker compose exec app python scripts/seed.py
 ```
 
+Web UI: <http://localhost:8501> — a Streamlit frontend, described under
+*The web frontend* below.
+
 API and Swagger UI: <http://localhost:8000/docs> — click **Authorize** and
 log in as any seeded account (login is the OAuth2 password flow, so the
 button works without pasting headers).
@@ -931,6 +934,61 @@ it is not what this gap was.
 
 ---
 
+## The web frontend
+
+A Streamlit app at <http://localhost:8501>, brought up by the same
+`docker compose up`. It signs in through the OAuth2 password flow, holds
+the token for the session, and shows only what the caller's role permits
+— the Admin section is absent for a student rather than present and
+refused.
+
+```bash
+docker compose up -d --build          # API, database and UI together
+```
+
+To run it outside Docker against a stack that is already up:
+
+```bash
+pip install -r frontend/requirements.txt
+API_BASE_URL=http://localhost:8000/api/v1 streamlit run frontend/app.py
+```
+
+**It is an HTTP client and nothing more.** It opens no database
+connection and reimplements no rule: capacity, quota, exactly-once and
+schedule conflicts are all decided inside a transaction on the server,
+and the page renders whatever comes back. That is deliberate — a
+frontend that pre-checks a quota is a frontend that disagrees with the
+server the moment two people click at once.
+
+Three things it surfaces on purpose, because they are the parts of this
+system worth seeing:
+
+- **Error codes, not just messages.** A failure renders as its code —
+  `QUOTA_EXCEEDED`, `CAPACITY_EXHAUSTED`, `OFFERING_FULL`,
+  `OFFERING_NOT_FULL` — because the code is the contract and the prose is
+  not. `CAPACITY_EXHAUSTED` and `QUOTA_EXCEEDED` are both `409` with
+  opposite remedies, and the UI has to be able to tell them apart for the
+  same reason any other client does.
+- **The `Idempotency-Key` header, exposed rather than hidden.** The GPU
+  reservation form shows the key it will send and lets you regenerate it.
+  Press **Reserve** twice with the same key and the second press returns
+  the *first* reservation — same id, same body. Untick the box and the
+  second press books again, which is the honest unkeyed behaviour and the
+  other column of Benchmark 3.
+- **Waitlist position, computed on read.** The queue view marks your own
+  row. Leaving does not renumber anybody: positions are derived when
+  read, so everyone behind a departing student moves up by itself.
+
+**One limitation, and it is the API's rather than the UI's.** There is no
+`GET /me/reservations` — a reservation id is only ever returned once, in
+the `201` that creates it. The page therefore remembers what *this
+browser session* created, and offers a manual id field for anything made
+earlier. Room bookings have a partial way around it, since checking
+availability returns the ids of conflicting reservations. A listing
+endpoint is the right fix and does not exist yet.
+
+---
+
 ## Repository map
 
 ```
@@ -950,6 +1008,7 @@ app/
 alembic/versions/  5 revisions, head 1ca8b85b7626
 scripts/           seed.py + 10 gate scripts
 tests/concurrency/ harness.py, its own tests, and the 4 benchmarks
+frontend/          Streamlit UI — HTTP client only, no database access
 ```
 
 `quotas/` and `idempotency/` are **helpers called from inside other
