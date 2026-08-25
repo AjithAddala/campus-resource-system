@@ -1,6 +1,6 @@
 import logging
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
@@ -266,6 +266,39 @@ def register(db: Session, offering_id: int, student: User) -> Enrollment | None:
         enrollment = existing
 
     locked.enrolled_count += 1
+
+    # --- clear any queue place for THIS offering ------------------------
+    # **A seat and a place in the queue are mutually exclusive states**, an
+    # invariant `join_waitlist` states and enforces on its own side but
+    # which this path could violate: registering directly for a seat that
+    # fell free left the student's waitlist entry behind.
+    #
+    # It was reachable and it lost a seat. Found reviewing the promotion
+    # transaction at Deadline 7, reproduced end to end:
+    #
+    #   X queues for a full offering; a drop frees the seat but promotion
+    #   SKIPS X (schedule clash); X clears the clash and registers
+    #   directly; X now holds a seat AND a queue place; the next drop
+    #   promotes X again -- `enrolled_count` 2 against 1 ACTIVE row.
+    #
+    # The seat was gone: the counter said taken and no student held it,
+    # and Deadline 8's reconciliation query is what would eventually have
+    # reported it, long after the cause.
+    #
+    # Deleted here rather than guarded in promotion alone, because this is
+    # the path that CREATES the inconsistent state -- `_promote_one` also
+    # skips an already-enrolled candidate now, but that is a backstop, not
+    # the fix. Safe under the locks this transaction already holds: the
+    # user row from step (1) blocks a concurrent join by the same student,
+    # and joins take the offering FOR SHARE, which this FOR UPDATE
+    # excludes.
+    db.execute(
+        delete(WaitlistEntry).where(
+            WaitlistEntry.student_id == student.id,
+            WaitlistEntry.course_offering_id == offering_id,
+        )
+    )
+
     db.commit()
     db.refresh(enrollment)
     return enrollment
@@ -749,6 +782,44 @@ def _promote_one(db: Session, offering: CourseOffering) -> Enrollment | None:
             .where(User.id == entry.student_id)
             .execution_options(populate_existing=True)
         ).scalar_one()
+
+        # --- already holds a seat here? -------------------------------
+        # A queue place for a seat you already hold is meaningless, and
+        # promoting on it increments `enrolled_count` for a student who
+        # was already counted -- losing the seat silently.
+        #
+        # `register` is what used to create this state and now clears it,
+        # so on a correct build this branch is unreachable. It stays as a
+        # BACKSTOP, and it repairs rather than merely skipping: the stale
+        # entry is deleted, because it describes a queue place that cannot
+        # ever be honoured. Then the loop continues, so the seat goes to a
+        # candidate who can actually use it.
+        #
+        # Note the quota gate does NOT cover this. It shielded the bug in
+        # the first reproduction attempt -- the candidate was at their cap
+        # only BECAUSE the seat they already held counted toward it -- and
+        # a candidate below their cap sails straight through. Nor does the
+        # schedule check: `_conflicting_offering` excludes the target
+        # offering itself, so a student's own enrollment in it is never a
+        # clash. Two gates that look like they would catch this, neither
+        # of which does.
+        seated = db.execute(
+            select(Enrollment).where(
+                Enrollment.student_id == candidate.id,
+                Enrollment.course_offering_id == offering.id,
+                Enrollment.status == EnrollmentStatus.ACTIVE,
+            )
+        ).scalar_one_or_none()
+        if seated is not None:
+            log.warning(
+                "waitlist: entry %s (student %s) on offering %s describes a "
+                "seat the student already holds -- deleting stale entry",
+                entry.id,
+                entry.student_id,
+                offering.id,
+            )
+            db.delete(entry)
+            continue
 
         try:
             quotas.enforce_course_quota(db, candidate.id, candidate.role)

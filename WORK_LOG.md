@@ -2443,3 +2443,266 @@ Two habits worth keeping, both learned the hard way in sessions 1 and 2:
   migration that reports success may not have run the DDL you wrote.
 - **`alembic upgrade head` on a database you built incrementally proves
   nothing.** The real check is `downgrade base` → `upgrade head`, twice.
+
+---
+
+## Session 18 — 2026-08-25 — A (reviewing B's write of A's column)
+
+**Advances:** Deadline 7 — A's outstanding review of the promotion
+transaction. Not new construction: B wrote A's column in session 17, so
+what A owed was the review, and the plan said so.
+
+**Plan:** review `_promote_one` against A's own item-9 proposal, then
+implement the promotion assertions in `check_waitlist.py` Part 2.
+
+**Shipped**
+
+- **Review of the promotion transaction — APPROVED.** `SKIP LOCKED`
+  implements item 9 as proposed; the quota check is under a real lock;
+  `populate_existing()` applied without being asked; two concurrent drops
+  are serialized by the *offering* lock, not the candidate lock.
+- **B's addition beyond the proposal — the schedule-clash skip — accepted
+  explicitly.** A clash is a fact about the student guarded by the same
+  lock as the quota, and without it promotion could seat a student in a
+  class `register` would have refused.
+- **One reachable bug found, reproduced, and fixed** (below).
+- Two regression assertions added to `scripts/check_waitlist.py`.
+
+**THE BUG — a seat and a queue place were not mutually exclusive**
+
+`join_waitlist` states that invariant and enforces its own side.
+`register` did not clear a student's waitlist entry, so:
+
+``` text
+X queues for a full offering
+a drop frees the seat, promotion SKIPS X          <- schedule clash
+X clears the clash and registers DIRECTLY         <- entry left behind
+next drop promotes X again  ->  enrolled_count 2, ACTIVE rows 1
+```
+
+A seat the counter called taken and no student held. Silent at the time;
+Deadline 8's reconciliation query is what would eventually have caught it.
+
+**The first probe FAILED to reproduce it, and that is the finding worth
+keeping.** It used a *quota* skip, and came back clean — the candidate
+was at their cap only *because* the seat they already held counted toward
+it, so the quota gate refused the second promotion by accident. Rebuilt
+with a *schedule-clash* skip, leaving the student far below cap, it
+reproduced instantly. Two gates look like they cover this; the quota one
+covers it only by coincidence, and the schedule one never does, because
+`_conflicting_offering` excludes the target offering itself.
+
+A regression test written the first way would have passed against the
+broken build. Fourth time this project has met that lesson.
+
+**Fixed in two places:** `register` deletes the entry (the path that
+creates the state), and `_promote_one` skips *and deletes* a stale entry
+for a candidate already seated (backstop, unreachable on a correct build).
+
+**Verification run**
+
+``` text
+probe, schedule-clash route, BEFORE fix -> enrolled_count=2 active=1  BUG
+probe, same route, AFTER fix            -> enrolled_count=1 active=1  OK
+register-side fix disabled on purpose   -> FAIL "registering directly
+                                           CLEARS that student's queue
+                                           place -- 1 queue entries left"
+                                           (backstop still held the
+                                           counter consistent)
+all nine gates, fix restored            -> check_jwt, check_auth,
+  check_rbac, check_rooms, check_gpus, check_courses, check_idempotency,
+  check_quotas, check_waitlist -- all pass
+```
+
+**Cost incurred**
+
+- Docker Desktop was not running at session start (fourth time). Started
+  it and brought the stack up before anything could be verified.
+
+**Deadline 7 status: MET, and now reviewed.** B's column and A's column
+are both complete and asserted; A's review is done and found one bug,
+which is fixed with a regression test that fails against the broken build.
+
+**Open / carried forward**
+
+1. **Items 9, 10 and 7 are still unratified on paper.** Both positions
+   are written and agree, and the code is built against them.
+   Ratification is now confirmation rather than decision — but it has
+   still not happened, and Deadline 8 is a freeze.
+2. **Item 11 unchanged and still A's**, with B's falsifiable prediction
+   from session 15 waiting on one instrumented re-run.
+3. **The gates still import the server-sized `SessionLocal`** — joint
+   fix, due before the Deadline 9 clean-room run.
+4. `POST /courses` / `POST /offerings` still belong to no deadline.
+5. **Still no README**, and the in-flight ceiling still needs to reach it.
+
+**ADDENDUM to session 18 — items 9, 10 and 7 closed**
+
+Reviewed the ratification state rather than carrying it forward again.
+All three are **settled**, and marked so in `DECISIONS.md`:
+
+``` text
+item 9   SKIP LOCKED     A proposed s14, B agreed s15 WITH A CONDITION,
+                         condition met, code built and verified
+item 10  explicit join   A proposed s14, B agreed s15, shipped
+item 7   WAITLISTED      A proposed s14, B agreed s15, enforced by
+         never written   construction; enum value stays
+```
+
+**What "settled" means here, stated precisely, because the protocol
+called these joint calls.** No synchronous ratification meeting happened.
+What exists instead is stronger than a carried TODO and weaker than a
+meeting: **both people wrote their positions independently, in this
+repository, and the positions agree on all three** — A in session 14, B
+in session 15, where B's entry says `item 9 AGREED`, `item 10 AGREED`,
+`item 7 AGREED` in as many words. The implementation was then built
+against them and is verified by nine passing gates. Insisting on a
+conversation to confirm what both parties have already written down and
+shipped would be ceremony, not rigour.
+
+**B's condition on item 9 was the substantive part, and it is met.** B
+refused to ratify `SKIP LOCKED` on A's reasoning that the mechanism does
+not disturb Benchmark 4 — because if no candidate row is ever locked, the
+skip clause never runs and the mechanism ships **unmeasured**. That is
+the Benchmark 2 failure shape, correctly spotted before it happened.
+Satisfied by `benchmark_4_waitlist.py::column_three` and two green
+assertions in `check_waitlist.py`, including *promotion COMPLETES while
+the row is still held* — the only assertion that tests item 9's actual
+claim.
+
+**One correction made while closing them.** The item 10 entry was first
+written saying `ARCHITECTURE_AND_WORKFLOWS.md` Workflow D still needed
+correcting. It does not — B corrected it in the same deadline. Checked
+rather than assumed, and the entry now says so.
+
+**Carried item 1 from session 18 is therefore CLOSED.** Deadline 8's
+freeze no longer inherits three unratified design questions.
+
+---
+
+## Session 19 — 2026-08-25 — A
+
+**Advances:** Deadline 8 (FEATURE FREEZE) — the integration pass and the
+final numbers. **Not** Deadline 7, which was met and reviewed in session
+18.
+
+> **A mislabelled commit, worth correcting before it misleads someone.**
+> `0171ad4` is titled *"B: deadline 8"* and contains Deadline **7**'s
+> work — waitlist endpoints, the promotion transaction, Benchmark 4 and
+> `check_waitlist.py` Part 2. Deadline 8 had not been started before this
+> session.
+
+**Shipped**
+
+- **Error-code audit, 15/15 clean.** Every `coded_error()` call site
+  extracted from the AST and checked against
+  `ARCHITECTURE_AND_WORKFLOWS.md` §7. No emitted code is undocumented.
+- **All four benchmarks re-run, both builds, in one session** — no number
+  below is quoted from an earlier run. `.env` toggled and the container
+  recreated between columns, then restored and re-verified.
+- All nine `check_*.py` gates re-run green beforehand.
+
+**Verification run**
+
+``` text
+B1 capacity   broken  oversold 3/3, counter mismatch 3/3, up to 200/200 in
+              fixed   oversold 0/3, exactly 20, peak 40 in flight of 200
+B2 quota      broken  over-quota 25/25
+              fixed   over-quota 0/25, held {2: 25}
+B3 exactly-   no key  8 holds/trial {8: 15}
+   once       key     1 hold/trial {1: 15}, {201: 120}, 0 divergent bodies
+B4 waitlist   broken  COUNTER DISAGREED 15/15, wrong promotions 0/15
+              fixed   3 promotions/trial, counter reconciles, FIFO 0 broken
+              col 3   row held 5s, drop returned 0.02s, skipped + next promoted
+
+9/9 gates     check_jwt auth rbac rooms gpus courses idempotency quotas
+              waitlist -- all pass
+```
+
+**THE FINDING — Benchmark 4's broken column is not the failure we
+designed it to catch.** Removing the offering lock gave **0/15 wrong
+promotion counts and 0/15 FIFO breaks**. The right students were promoted
+in the right order. What broke was `enrolled_count`, 15/15 — concurrent
+drops reading a stale counter and each writing back its own increment.
+A lost update, not a lost seat.
+
+That makes three benchmarks out of four where the measured failure was
+not the predicted one: Benchmark 2 (wrong lock, not missing lock),
+Benchmark 3 (no build over-allocated — `UNIQUE` held the count and the
+fix bought the *reply*), and now Benchmark 4. **This is the project's
+strongest claim and it should lead the README**: four broken builds were
+measured rather than reasoned about, and three of the four contradicted
+the intuition they were built on.
+
+**Cost incurred**
+
+- The first error-code audit produced a **false finding** —
+  `EMAIL_ALREADY_REGISTERED` reported as undocumented when it is
+  documented at line 352. The `sed` range stopped short, because §7's
+  code table is several blocks separated by prose, not one. Caught by
+  checking before writing it down. An integration pass that invents
+  discrepancies costs someone an afternoon proving the code was fine.
+
+**Deadline 8 status: the BOTH column is done; the deadline is not closed.**
+No new features, codes audited, benchmarks re-run with final numbers
+recorded. **Outstanding: B's `enrolled_count` reconciliation query after
+Benchmark 1** — though Benchmark 1 already asserts `counter == active
+rows` per trial and reported 0/3 mismatches, so this may be satisfied in
+substance; it is B's line and B should confirm rather than A assume.
+
+**Open / carried forward**
+
+1. **B's Deadline 8 line** — the reconciliation query. Possibly already
+   covered by Benchmark 1's per-trial assertion; B to confirm.
+2. **Item 11 unchanged and still A's**, with B's falsifiable prediction
+   from session 15 waiting on one instrumented re-run. It is now the
+   oldest open item in the project.
+3. **The gates still import the server-sized `SessionLocal`** — joint fix,
+   due before the Deadline 9 clean-room run.
+4. `POST /courses` / `POST /offerings` still belong to no deadline. Six
+   scripts now create offerings by direct insert.
+5. **Still no README.** Deadline 9 is now the whole remaining risk: the
+   in-flight ceiling, the "500 concurrent" phrasing in three documents,
+   the room quota not being time-aware, and idempotency covering only the
+   GPU path all need to reach it.
+6. `JWT_SECRET` in `.env` is still the published default — due at
+   Deadline 9's clean-room run.
+
+**ADDENDUM to session 19 — Deadline 8 is MET; the status above was wrong**
+
+The session-19 entry closed with *"the BOTH column is done; the deadline
+is not closed"*, and named B's `enrolled_count` reconciliation query as
+outstanding. **It is not outstanding. It already exists**, and had done
+since B built the harness — `tests/concurrency/benchmark_1_capacity.py`
+line 175, `"(enrolled_count, ACTIVE rows) — the reconciliation pair"`,
+which queries the counter and the enrollments table separately and
+compares them per trial.
+
+It did not *look* like the plan's line, which describes a standalone
+query run after Benchmark 1; B folded it into Benchmark 1 instead. That
+is a better place for it — it runs on every trial rather than once at the
+end — and it was reported in this session's own numbers without being
+recognised: `COUNTER MISMATCHES 0/3` fixed, `3/3` broken. The broken
+column is what proves the assertion bites.
+
+**Checked before claiming it, which is the only reason the correction is
+this cheap.** Reading B's column for what it *does* rather than for
+whether it matches the plan's wording is the same discipline that found
+the promotion bug at session 18.
+
+**Deadline 8 status: MET.** All six lines complete, both columns, nothing
+cut — the §0.1 cut order was never invoked and full scope shipped,
+including the waitlist that was item 5 on it.
+
+> **One qualification, recorded rather than glossed.** The BOTH column
+> was executed **solo by A**. The deliverables are artifacts — a code
+> audit and a table of measured numbers — so they exist and are checkable
+> independently of who produced them, which is why this does not hold the
+> deadline open the way Deadline 6's swap review did (that one's
+> deliverable was two people's understanding, which cannot be produced
+> solo). **B should still countersign the numbers**, and this project's
+> record on unreviewed solo work is not good: `session.py` sat unreviewed
+> for three sessions.
+
+**Deadlines 1-8 MET. Deadline 9 is the entire remaining risk, and there
+is still no README.**

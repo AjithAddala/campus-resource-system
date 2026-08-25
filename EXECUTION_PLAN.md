@@ -10,22 +10,32 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-7 MET.** Deadline 6 closed on the joint SWAP
-> REVIEW being held, after B session 13 (Benchmarks 2 and 3) and A
-> session 14 (quota rollout, admin endpoints, `GET /me/quota`, plus A's
-> review of B's solo change to `session.py` — approved, two findings).
+> **Status: Deadlines 1-8 MET. Deadline 9 is the entire remaining risk,
+> and there is still no README.**
 >
-> Deadline 7 turned on outstanding items 7, 9 and 10 in `DECISIONS.md`,
-> all joint calls, item 9 — the global lock order versus waitlist
-> promotion — being the load-bearing one.
+> Deadline 7's three design questions — outstanding items 7, 9 and 10,
+> all joint calls — were settled on both sides in writing (A session 14,
+> B session 15, agreeing) and are now marked RATIFIED in `DECISIONS.md`.
+> The code was built against them *before* they were closed on paper,
+> which is the wrong way round and is recorded as such. A's review of the
+> promotion transaction is done (session 18) and **found one reachable
+> bug**: `register` did not clear a student's waitlist entry, so a seat
+> could be promoted twice and lost. Fixed, with a regression test that
+> fails against the old build.
 >
-> **Both positions are written** (A session 14, B session 15) and they
-> agree on all three. **Deadline 7 was then built against that agreement
-> without the ratifying conversation having happened** (B, sessions 16
-> and 17) — endpoints, promotion transaction and Benchmark 4. The three
-> items are therefore settled in code and unratified on paper, which is
-> the wrong way round. Ratifying them now is confirmation rather than
-> decision, and A still owes a review of the promotion transaction.
+> Deadline 8 closed in session 19: 15/15 error codes audited, all four
+> benchmarks re-run on both builds with final numbers recorded, and B's
+> reconciliation line found already built into Benchmark 1. **Nothing was
+> cut — the §0.1 cut order was never invoked and full scope shipped**,
+> including the waitlist that was item 5 on it.
+>
+> Two qualifications carried into Deadline 9: the Deadline 8 BOTH column
+> was executed **solo by A** and B has not countersigned the numbers; and
+> `pytest-asyncio` is in `requirements.txt` but was missing from the
+> long-lived container, so the six harness tests had been **silently
+> skipping** until session 19 caught it. A fresh build fixes it, which is
+> what the clean-room test does — but it is the exact failure mode
+> `pytest.ini` was configured to prevent.
 
 ## 0. Scope
 
@@ -541,7 +551,7 @@ double-promotes under concurrent drops. — **All three verified**
 > transaction before Deadline 10**, where the cross-presentation assumes
 > each person has modules of their own to be questioned on.
 
-### Deadline 8 - FEATURE FREEZE
+### Deadline 8 - FEATURE FREEZE  ✅ MET (session 19)
 
 ``` text
 BOTH   no new features from here. None.

@@ -419,7 +419,18 @@ models, not the plan: `users.name` (not `full_name`),
    permission. The GPU half of the gate lands with that transaction at
    Deadline 4; the PATCH endpoints that *write* the flag are at Deadline
    6, and they had no deadline at all before session 5.
-7. Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
+7. ~~Confirm whether `EnrollmentStatus.WAITLISTED` is ever used.~~
+   **RATIFIED at Deadline 7: it is never written, and the enum value
+   stays.** A proposed (session 14), B agreed (session 15), and it is
+   enforced by construction — no code path writes it. A queued student
+   has a row in `waitlist_entries` and nothing else. The value is left in
+   the enum because removing it means recreating a Postgres type and
+   rewriting the column: a migration and a `models/` change buying zero
+   behavioural difference. Revisit only if Deadline 8's integration pass
+   wants the enum clean, and then with both people present.
+   *(Original text below.)*
+
+   Confirm whether `EnrollmentStatus.WAITLISTED` is ever used. Waitlist
    entries live in their own table, so a student on the waitlist should
    have a row there, not an enrollment. Matters for Deadline 7 promotion.
 8. **`DELETE /reservations/{id}` names a row in two different tables.**
@@ -440,7 +451,30 @@ models, not the plan: `users.name` (not `full_name`),
    documentation. Both services verify the reservation really belongs to
    the resource named in the path, so the id there is load-bearing, and
    both checks are asserted. See the Deadline 4 section below.
-9. **The global lock order and the waitlist promotion contradict each
+9. ~~**The global lock order and the waitlist promotion contradict each
+   other.**~~ **RATIFIED at Deadline 7: promotion never waits.**
+   A proposed `SKIP LOCKED` (session 14); B agreed (session 15) **with
+   one condition**; the condition is met; the code is built and verified.
+   A transaction that never blocks on a user row cannot appear in a wait
+   cycle, so §14's "every path" claim needs no exception written into it.
+   The cost is stated rather than hidden: the promise is *oldest
+   ELIGIBLE*, not *oldest*.
+
+   **B's condition, and why it mattered.** A's proposal offered as
+   reassurance that `SKIP LOCKED` does not disturb Benchmark 4, because
+   its three waitlisted students are idle. B identified that as the
+   problem: if no candidate row is ever locked, **the skip clause never
+   executes and the mechanism ships unmeasured** — the same shape as
+   Benchmark 2 passing against the build it indicts. B required a third
+   column holding a candidate's row on purpose.
+   **Satisfied:** `benchmark_4_waitlist.py::column_three` (deterministic,
+   one run — holding a lock is not a race) and two assertions in
+   `check_waitlist.py`, both green: *a candidate whose user row is LOCKED
+   is skipped, not waited for*, and *promotion COMPLETES while the row is
+   still held*.
+   *(Original text below.)*
+
+   **The global lock order and the waitlist promotion contradict each
    other.** `INIT_PLAN.md` §14 says every path takes key → user row →
    resource row, naming *"allocation, cancellation, course registration,
    and waitlist promotion alike."* Deadline 7 in `EXECUTION_PLAN.md` has
@@ -464,7 +498,27 @@ models, not the plan: `users.name` (not `full_name`),
    candidate row is ever locked. It gains a third column that holds a
    candidate's row and asserts promotion *completes* while it is held.
    Ratifying still needs both people saying so.
-10. **Is joining a waitlist automatic or explicit?**
+10. ~~**Is joining a waitlist automatic or explicit?**~~
+    **RATIFIED at Deadline 7: EXPLICIT** — `POST /offerings/{id}/waitlist`,
+    never a fall-through from a full `register`. A proposed (session 14),
+    B agreed (session 15), shipped in B's endpoints.
+    The argument that settled it: auto-waitlisting would make one `201`
+    from `register` mean either "you have a seat" or "you are queued",
+    distinguishable only by reading the body — the same defect Deadline 5
+    refused when it settled the idempotent-replay status. A client that
+    branches on the status code must not be sent down the wrong branch.
+    **B added the evidence A's section lacked:** auto-waitlisting would
+    not land on untested ground, it would turn a currently-green
+    assertion red — `full offering -> 409 CAPACITY_EXHAUSTED, not a
+    silent waitlist`, and `the refused registration created NO waitlist
+    row`.
+    **Workflow D was corrected in the same deadline** — it used to read
+    `enrolled_count < capacity ✓ else → waitlist`, and now records the
+    explicit-join decision with the reasoning. No doc debt outstanding on
+    this item.
+    *(Original text below.)*
+
+    **Is joining a waitlist automatic or explicit?**
     `ARCHITECTURE_AND_WORKFLOWS.md` Workflow D falls through to the
     waitlist when an offering is full (`else → waitlist`);
     `INIT_PLAN.md` §12 has the student call
@@ -3627,3 +3681,210 @@ lose their seat to someone who happened to be refreshing the page.
 That is also why the reconciliation assertion is the sharp one: the seat
 moving atomically means `enrolled_count` and the ACTIVE row count must
 agree after every trial, and the broken build is caught precisely there.
+
+---
+
+# Deadline 7 — A's review of the promotion transaction
+
+A owns the promotion transaction in the ownership split; **B wrote it**
+(session 17, "writing A's column") because A was unavailable and the
+critical path ran through it. This is A's review, which the plan says is
+still owed. **Verdict: the implementation is faithful and correct. One
+reachable bug found, outside the transaction, reproduced and fixed.**
+
+## What was checked and holds
+
+- **`SKIP LOCKED` implements item 9 as proposed.** Candidates are read
+  under the offering lock the caller already holds, and each candidate's
+  user row is attempted `FOR UPDATE SKIP LOCKED`. A transaction that
+  never blocks on a user row cannot appear in a wait cycle, so §14's
+  "every path" claim needs no exception — which was the point.
+- **Two concurrent drops cannot double-promote**, and the mechanism is
+  the *offering* lock, not the candidate lock: both droppers serialize on
+  it, so the second reads a queue the first has already modified.
+- **The quota check is under a real lock** — the half of item 9 that
+  mattered. `enforce_course_quota` runs after `SKIP LOCKED` acquired the
+  row.
+- **`populate_existing()` on the candidate read**, and on the offering
+  read in `drop`. Item 11's lesson applied without being asked.
+- **`enrollment_unique` is unconditional**, so promotion UPDATEs a
+  DROPPED row rather than INSERTing beside it. Both branches reachable.
+- **B's one addition beyond A's proposal — the schedule-clash skip — is
+  correct and A agrees with it explicitly.** A clash is a fact about the
+  student guarded by the same user lock as the quota. Without it,
+  promotion could seat a student in a class that clashes with one they
+  hold, a state `register` refuses outright — the same invariant reached
+  through a different door. It widens the eligibility rule item 9
+  ratified, and widening it is right.
+
+## The bug: a seat and a queue place were not mutually exclusive
+
+`join_waitlist` states the invariant and enforces its own side. `register`
+did not: **registering directly for a seat never cleared the student's
+waitlist entry.** Reachable, and it lost a seat silently.
+
+``` text
+X queues for a full offering
+a drop frees the seat, but promotion SKIPS X        <- schedule clash
+X clears the clash and REGISTERS directly           <- entry left behind
+X now holds a SEAT and a QUEUE PLACE
+the next drop promotes X again
+    -> enrolled_count = 2, ACTIVE rows = 1
+```
+
+The counter said the seat was taken and no student held it. Nothing
+surfaces it at the time; **Deadline 8's reconciliation query is what would
+eventually have reported it**, long after the cause.
+
+### The first reproduction attempt failed, and why that matters
+
+The probe was first built with a **quota** skip. It came back clean, and
+the reason is worth keeping: the candidate was at their cap *only
+because the seat they already held counted toward it*, so the quota gate
+refused the second promotion **by accident**. Rebuilt with a
+**schedule-clash** skip, which leaves the student far below their cap,
+it reproduced immediately.
+
+Two gates look like they would catch this and neither does:
+
+- the **quota** gate catches it only when the student is coincidentally
+  at their cap;
+- the **schedule** gate never catches it, because
+  `_conflicting_offering` excludes the target offering itself, so a
+  student's own enrollment in it is not a clash.
+
+A regression test written the first way would have passed against the
+broken build — this project's oldest lesson, arriving for the fourth
+time.
+
+## The fix, in two places
+
+1. **`register` deletes any waitlist entry for that offering.** This is
+   the path that creates the inconsistent state, so this is the fix.
+   Safe under locks it already holds: the user row blocks a concurrent
+   join by the same student, and joins take the offering `FOR SHARE`,
+   which its `FOR UPDATE` excludes.
+2. **`_promote_one` skips a candidate who already holds an ACTIVE
+   enrollment**, and *deletes* the stale entry rather than merely
+   passing over it — a queue place for a seat you already hold can never
+   be honoured. A backstop, not the fix; unreachable on a correct build.
+
+Verified both ways: with the register-side fix disabled the gate reports
+`FAIL registering directly CLEARS that student's queue place -- 1 queue
+entries left`, and the promotion backstop holds the counter consistent
+even then. With both in place, all nine gates pass.
+
+## Two assertions added to `scripts/check_waitlist.py`
+
+``` text
+registering directly CLEARS that student's queue place
+no double-promotion: enrolled_count == ACTIVE rows
+```
+
+The second is Deadline 8's reconciliation query run early, on the
+narrowest path that breaks it.
+
+## Still outstanding after this review
+
+- **Items 9, 10 and 7 remain unratified on paper.** Both positions were
+  written and agree, and the code is built against them. Ratifying is now
+  confirmation rather than decision, but it has still not happened.
+- **Item 11** is unchanged and still A's.
+
+---
+
+# Deadline 8 — the integration pass and the final numbers
+
+## The error-code audit: no drift
+
+Every code the application can emit was extracted from the **AST** rather
+than by grepping — `coded_error()` calls span several lines, and a
+line-oriented grep silently missed them (it reported an empty set and
+made every documented code look orphaned). Parsed properly:
+
+``` text
+coded_error() call sites : 15 distinct codes
+emitted but undocumented : NONE
+```
+
+All fifteen appear in `ARCHITECTURE_AND_WORKFLOWS.md` §7. The two 409s
+the deadline names specifically — `CAPACITY_EXHAUSTED` and
+`QUOTA_EXCEEDED` — remain distinct, on distinct remedies.
+
+> **A false finding, caught before it was written down.** The first pass
+> reported `EMAIL_ALREADY_REGISTERED` as undocumented. It is documented,
+> at line 352; the `sed` range used to read §7 stopped short of it,
+> because §7's code table is not one block but several separated by
+> prose. The audit was wrong, not the docs. Recorded because an
+> integration pass that invents discrepancies is worse than none — it
+> costs someone an afternoon proving the code was fine all along.
+
+## Final numbers — all four benchmarks, both builds
+
+Every row below was run **in this session**, not quoted from an earlier
+one. `.env` was toggled and the container recreated between columns, then
+restored and re-verified.
+
+``` text
+BENCHMARK 1  capacity     200 students, 20 seats, 3 trials
+  broken (no offering lock)   oversold 3/3,  counter mismatch 3/3,
+                              up to 200 of 200 succeeded
+  fixed                       oversold 0/3,  exactly 20 every trial,
+                              peak DB concurrency 40 of 200 submitted
+
+BENCHMARK 2  quota        1 student, 2 clusters, 25 trials
+  broken (no user lock)       over-quota 25/25
+  fixed                       over-quota 0/25,  held {2: 25}
+
+BENCHMARK 3  exactly-once  8 simultaneous retries, 15 trials
+  no key                      8 holds per trial  {8: 15}
+  with key                    1 hold per trial   {1: 15}, 1 key row,
+                              {201: 120}, divergent bodies 0/15
+
+BENCHMARK 4  waitlist      3 queued, concurrent drops, 15 trials
+  broken (no offering lock)   COUNTER DISAGREED 15/15
+  fixed                       3 promotions/trial, counter reconciles 15/15,
+                              FIFO broken 0/15
+  column 3 (SKIP LOCKED)      candidate row held 5s; drop returned in
+                              0.02s, held candidate skipped, next promoted
+```
+
+## The Benchmark 4 broken column says something we did not predict
+
+Removing the offering lock produced **`WRONG PROMOTION COUNT 0/15` and
+`FIFO BROKEN 0/15`** — the right students were promoted, in the right
+order. What broke was `enrolled_count`: **15/15 counter mismatches.**
+
+So the double-promotion the benchmark was designed to catch **did not
+happen**, and the damage landed on the counter instead — concurrent drops
+reading a stale `enrolled_count` and each writing back its own
+increment, which is a lost update rather than a lost seat.
+
+This is the third time this project has measured a broken build and found
+the failure was not the one predicted:
+
+``` text
+Benchmark 2   the lock was not missing, it was the WRONG LOCK
+Benchmark 3   no build over-allocated; UNIQUE held the row count, and
+              what the fix bought was the REPLY, not the uniqueness
+Benchmark 4   no build double-promoted; the offering lock protects the
+              COUNTER, and the queue was never the fragile part
+```
+
+The pattern is worth naming in the README, because it is the project's
+most defensible claim: **every one of these was measured rather than
+reasoned about, and in each case the measurement contradicted the
+intuition the benchmark was built on.** A table of four predictions that
+all came true would be a weaker artifact, not a stronger one.
+
+## Deadline 8's own checkpoint
+
+``` text
+no new features                          held -- nothing added this session
+every endpoint returns the agreed codes  15/15 audited, no drift
+CAPACITY_EXHAUSTED vs QUOTA_EXCEEDED     distinct, distinct remedies
+bugs surfaced by the benchmarks          one, found in review at Deadline
+                                         7 and fixed with a regression
+                                         test that fails on the old build
+re-run all four, record final numbers    done, above, both builds
+```

@@ -833,6 +833,82 @@ else:
         )
         holder_thread.join(timeout=HOLD_SECONDS + 2)
 
+        # ---- REGRESSION: a seat and a queue place are exclusive --------
+        #
+        # Found while reviewing the promotion transaction, reproduced end
+        # to end, and it lost a seat silently:
+        #
+        #   X queues for a full offering. A drop frees the seat but
+        #   promotion SKIPS X -- here by schedule clash, and the choice of
+        #   skip reason matters. X clears the clash and registers for the
+        #   free seat DIRECTLY. `register` did not clear the queue entry,
+        #   so X held a seat AND a place. The next drop promoted X again:
+        #   enrolled_count 2 against 1 ACTIVE row, a seat the counter
+        #   called taken and no student held.
+        #
+        # **Why the skip reason matters, and why this test uses a clash.**
+        # The first attempt to reproduce it used a QUOTA skip and came
+        # back clean -- the candidate was at their cap only *because* the
+        # seat they already held counted toward it, so the quota gate
+        # refused the second promotion by accident. A clash-based skip
+        # leaves the student far below their cap and nothing shields it.
+        # A regression test that reproduced it the first way would pass
+        # against the broken build, which is this project's oldest lesson.
+        reg_off = make_offering(capacity=1, start="09:00", end="10:00", days="M")
+        reg_clash = make_offering(capacity=5, start="09:00", end="10:00", days="M")
+        rx_id, rx_tok = make_student()
+        rh_id, rh_tok = make_student()
+        rz_id, rz_tok = make_student()
+
+        httpx.post(f"{BASE}/offerings/{reg_off}/register", headers=bearer(rh_tok))
+        httpx.post(f"{BASE}/offerings/{reg_off}/waitlist", headers=bearer(rx_tok))
+        httpx.post(f"{BASE}/offerings/{reg_clash}/register", headers=bearer(rx_tok))
+        httpx.delete(f"{BASE}/offerings/{reg_off}/drop", headers=bearer(rh_tok))
+        httpx.delete(f"{BASE}/offerings/{reg_clash}/drop", headers=bearer(rx_tok))
+        r = httpx.post(f"{BASE}/offerings/{reg_off}/register", headers=bearer(rx_tok))
+
+        db = SessionLocal()
+        try:
+            still_queued = db.query(WaitlistEntry).filter(
+                WaitlistEntry.student_id == rx_id,
+                WaitlistEntry.course_offering_id == reg_off,
+            ).count()
+        finally:
+            db.close()
+        check(
+            "registering directly CLEARS that student's queue place",
+            r.status_code == 201 and still_queued == 0,
+            f"register={r.status_code}, {still_queued} queue entries left",
+        )
+
+        # Drive the second promotion that used to double-count.
+        db = SessionLocal()
+        try:
+            o = db.get(CourseOffering, reg_off)
+            o.capacity = 2
+            db.commit()
+        finally:
+            db.close()
+        httpx.post(f"{BASE}/offerings/{reg_off}/register", headers=bearer(rz_tok))
+        httpx.delete(f"{BASE}/offerings/{reg_off}/drop", headers=bearer(rz_tok))
+
+        db = SessionLocal()
+        try:
+            o = db.get(CourseOffering, reg_off)
+            active = db.query(Enrollment).filter(
+                Enrollment.course_offering_id == reg_off,
+                Enrollment.status == EnrollmentStatus.ACTIVE,
+            ).count()
+            counter = o.enrolled_count
+        finally:
+            db.close()
+        check(
+            "no double-promotion: enrolled_count == ACTIVE rows",
+            counter == active,
+            f"counter={counter} active={active} "
+            "-- Deadline 8's reconciliation query, run early",
+        )
+
 
 # ===========================================================================
 # cleanup
