@@ -32,11 +32,13 @@ So every entry names the Deadline it advanced, and says whether that
 Deadline is now met. A deadline may take several sessions; a session may
 touch more than one deadline; neither implies the other.
 
-**As of session 12 (2026-08-24): Deadlines 1-5 MET. Deadline 6 next.**
+**Final: 21 sessions, 10 deadlines, all MET (session 21, 2026-08-25).**
 
-It took four sessions to meet the first of ten deadlines. That is the
-number worth looking at, and it was invisible while sessions and
-deadlines shared a numbering scheme.
+It took four sessions to meet the first of ten deadlines, and twenty-one
+to meet all ten. Those are the numbers worth looking at, and both were
+invisible while sessions and deadlines shared a numbering scheme — the
+first because it looked like "Day 4", the second because it would have
+looked like ten days of work.
 
 ---
 
@@ -2830,3 +2832,154 @@ now matches what the commands print.
    the README now states their absence as a known limit rather than
    leaving it to be discovered.
 5. Deadline 10 is cross-presentation and demo. Nothing blocks it.
+
+## Session 21 — 2026-08-25 — JOINT
+
+**Advances:** Deadline 10 (Cross-Presentation & Demo) — the whole column,
+and it is the last one. Also discharges both qualifications Deadline 9
+left open in session 20.
+
+**Plan:** run the deadline literally. Each of us presents the other's
+modules cold, the other corrects, and **the corrections get written down
+rather than absorbed**. Then the four questions answered independently
+before comparing, the demo rehearsed against the live stack rather than
+sketched, a final README pass, and the résumé bullet.
+
+Before any of that: settle who presents promotion, because the plan's
+assignment and the code's authorship disagree.
+
+**Shipped**
+
+- **`CROSS_PRESENTATION.md`** — both presentations with every correction
+  in place (§1, §2), both independent answers to each of the four
+  questions (§3), the rehearsed five-minute demo (§4), the résumé bullet
+  in LaTeX and plain text (§5), and the close (§6).
+- **The clone-level re-run**, which is the confirmation session 20 said
+  was the last thing standing between "verified content" and "verified
+  repository". Details under *Verification run*.
+- **B's countersignature on Deadlines 8 and 9**, given as a re-run rather
+  than a reading — the AST error-code audit re-derived, all four
+  benchmarks re-run on both builds.
+- **README final pass**: the fresh-clone claim made true, the Benchmark 1
+  broken-column range corrected, item 11 promoted into *Known limits*
+  where it had never appeared, `CROSS_PRESENTATION.md` added to *Further
+  reading*.
+- **`EXECUTION_PLAN.md` closed** — Deadline 10 marked MET, Deadline 9's
+  two qualifications marked discharged, and the promotion reassignment
+  recorded under the deadline rather than fixed in the plan.
+
+**Verification run**
+
+A real `git clone` of this repository into a scratch directory, then the
+quickstart exactly as the README prints it — `cp .env.example .env`, own
+`JWT_SECRET`, `docker compose up -d --build` against a new volume.
+
+``` text
+git clone                87 files; README and scripts/_db.py present
+alembic upgrade head     5 revisions -> 1ca8b85b7626
+scripts/seed.py          exit 0; 3 users, 2 clusters, 2 rooms,
+                         1 offering, 8 quota rows
+9 gate scripts           ALL exit 0 -- jwt, auth, rbac, rooms, gpus,
+                         courses, idempotency, quotas, waitlist
+pytest tests/ -v         6 passed in 1.89s, ZERO skipped
+                         (asyncio-0.25.0, mode=STRICT)
+
+benchmark 1 FIXED    0/5 oversold, 0/5 counter, exactly 50 every trial,
+                     peak DB concurrency 39 of 40 in flight
+benchmark 2 FIXED    0/25 over-quota, held {2: 25}, 0 transport errors
+benchmark 3          no key {8: 15}, with key {1: 15}, 1 key row,
+                     {201: 120}, divergent bodies 0/15
+benchmark 4 FIXED    2v3 {2: 15} / {(2,2): 15};  8v3 {3: 15} / {(3,3): 15}
+                     column 3: drop returned in 0.06s against a 5s hold
+
+benchmark 1 BROKEN   5/5 oversold, 5/5 counter, 500 of 500 seated EVERY
+                     trial, enrolled_count 15-26
+benchmark 2 BROKEN   25/25 over-quota, held {4: 25}
+benchmark 4 BROKEN   2v3 {2: 15} / {(2,2): 15} -- PASSES, as documented
+                     8v3 {3: 15} / {(7,3):15}, counter disagrees 15/15
+```
+
+**Nineteen of twenty published numbers reproduced exactly.** The
+twentieth is Benchmark 1's broken-column `enrolled_count`, published as
+**14-21** from session 20's single run and measured at **15-26** here.
+The 5/5 oversold and the 500-of-50 — the half that indicts the build —
+are identical across both runs; only the counter's landing point moves.
+Corrected in the README by stating both runs. Why it is a rule and not a
+typo is in `DECISIONS.md`.
+
+**The presentations, and what they cost each of us**
+
+``` text
+A on rooms        wrong on FOR SHARE; wrong on what enforces overlap
+A on courses      right, in detail -- populate_existing(), A's own scar
+A on waitlist     weakest section in either presentation: wrong on
+                  WAITLISTED, wrong on stored positions, missed
+                  OFFERING_NOT_FULL and the delete/flag asymmetry
+A on harness      opened with "500 concurrent"; missed the pool trap;
+                  missed that the harness is tested at all
+A on promotion    deadlock argument and its cost correct and unprompted;
+                  credited the offering lock for what SKIP LOCKED does
+
+B on auth         presented the Deadline 1 role-in-the-claim tradeoff
+                  that Deadline 3 reversed; missed the timing oracle and
+                  the InvalidHashError/ValueError trap
+B on quota        nailed the thesis; would have added a lock that
+                  serializes the whole system for no invariant
+B on idempotency  right about the claim's position, wrong about its
+                  mechanism; missed the SAVEPOINT and the hash() salt
+B on the GPU txn  strongest section in either presentation
+```
+
+**The pattern is the finding, and it is not flattering to either of us:
+neither was wrong about a mechanism they had personally measured, and
+every correction is about one they had only read.** A had reviewed
+`_promote_one` closely enough to find a reachable bug in it and still
+attributed double-promotion protection to the wrong lock — the one thing
+about that function only Benchmark 4 can tell you. Written up in
+`DECISIONS.md`.
+
+**Cost incurred**
+
+- **Benchmark 1 is unusable in a demo and we found that by rehearsing
+  it.** 8-9 seconds median per request, five trials of 500 — over a
+  minute of scrolling for the project's most dramatic result. The demo
+  was rebuilt backwards from Benchmark 2 rather than trimmed.
+- The clone run cost a full rebuild and roughly twenty minutes of
+  benchmarks. Worth stating that this is what the session-20
+  qualification was actually worth: twenty minutes, deferred four
+  sessions.
+
+**Deadline 10 status: MET.**
+Both presentations given and corrected, both sets of answers written
+independently and compared, demo rehearsed against the live stack, README
+pass complete, résumé bullet written. **Deadline 9's two qualifications
+are also now discharged** — the clone-level confirmation and B's
+countersignature — so nothing is left carried against any deadline.
+
+**ALL TEN DEADLINES MET. The plan is closed.**
+
+**Open / carried forward — and there is no session after this to carry
+them to, so they ship**
+
+1. **Item 11 closes UNRESOLVED.** The oldest item in the project, open
+   since session 10, A's. The two-session probe says the GPU path's
+   `FOR UPDATE` read is stale without `populate_existing()`; the 12-racer
+   race says the invariant holds without it. They cannot both mean what
+   they appear to and we never established which is misleading us. The
+   keyword stays, and the item is now in the README's known limits rather
+   than only in this log — a deliberate choice to ship it visible.
+2. **`POST /courses` / `POST /offerings` do not exist**, belong to no
+   deadline, and are a gap rather than a decision. Stated as a known
+   limit in the README, and named as a gap — not dressed as a design
+   choice — in `CROSS_PRESENTATION.md` §3, Q4.
+3. **Items 7, 9 and 10 were ratified on paper after the code was built
+   against them.** Both positions agree and the code matches, so nothing
+   is wrong; the order was wrong, and every entry from session 15 on says
+   so.
+4. **The working tree is uncommitted again** as of this entry — this
+   session's five changed files. The clone run above was made from
+   commit `3ca2057`, so it verifies the repository as it stood *before*
+   these documentation changes. Nothing in them touches `app/`,
+   `tests/`, `scripts/` or `alembic/`, so no benchmark or gate result is
+   affected; the code that produced every number above is the code that
+   is committed. **Commit, and the record is closed.**

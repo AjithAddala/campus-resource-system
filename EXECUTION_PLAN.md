@@ -10,8 +10,7 @@
 > apart is the point: the log had drifted into implying that three
 > deadlines were met because three dated sessions existed.
 >
-> **Status: Deadlines 1-9 MET. Only Deadline 10 (cross-presentation and
-> demo) remains.**
+> **Status: ALL TEN DEADLINES MET. The plan is closed.**
 >
 > Deadline 7's three design questions — outstanding items 7, 9 and 10,
 > all joint calls — were settled on both sides in writing (A session 14,
@@ -43,12 +42,33 @@
 > oversold, all 500 seated in a 50-seat section, every trial). See
 > `DECISIONS.md`.
 >
-> **Two qualifications still open.** The clean room was built from a
-> fresh *tree* — the exact 87-file set a clone receives after commit —
-> not a fresh *clone*, because the work is still uncommitted. Committing
-> and re-running the quickstart from a real clone is the last
-> confirmation. And the Deadline 8 **and** Deadline 9 BOTH columns were
-> both executed **solo by A**; B has countersigned neither.
+> Deadline 10 closed in session 21, and it **discharged both of the
+> qualifications Deadline 9 left open.** The clean room had been built
+> from a fresh *tree* — the exact 87-file set a clone receives — because
+> the work was uncommitted at the time. The commit landed, and the
+> quickstart was re-run from a real `git clone` against a new volume:
+> five migrations, seed, nine gates, `6 passed`, and all four benchmarks
+> on both builds. **Nineteen of twenty published numbers reproduced
+> exactly.** The twentieth was Benchmark 1's broken-column
+> `enrolled_count` range — published as 14-21 from one run, and 15-26
+> from the clone — corrected in the README. B countersigned Deadlines 8
+> and 9 on that basis, which is the second qualification closed.
+>
+> The cross-presentation itself is in `CROSS_PRESENTATION.md`, with the
+> corrections kept in place: a cross-presentation with none in it either
+> was not done or was not done honestly. Its finding is that **each of us
+> was wrong about a mechanism we had only read, and right about every
+> mechanism we had personally measured** — including A, who had found a
+> reachable bug in the promotion transaction and still credited the wrong
+> lock for preventing double-promotion.
+>
+> **What ships open, stated rather than tidied away:** item 11 (the
+> stale locked read on the GPU path, open since session 10, A's, and the
+> oldest item in the project) closes **unresolved**; `POST /courses` and
+> `POST /offerings` do not exist and are a gap rather than a decision;
+> and items 7, 9 and 10 were ratified on paper *after* the code was built
+> against them. All three are in the README's known limits or in
+> `CROSS_PRESENTATION.md` §6.3.
 
 ## 0. Scope
 
@@ -580,7 +600,8 @@ B      enrolled_count reconciliation query after Benchmark 1 -- prove the
 If you are behind here, apply the Section 0.1 cut order. Do not extend
 the freeze.
 
-### Deadline 9 - Docs & Clean-Room Test
+### Deadline 9 - Docs & Clean-Room Test  ✅ MET (session 20; clone-level
+confirmation and B's countersignature completed in session 21)
 
 ``` text
 A      README: architecture, three serialization points, lock ordering,
@@ -595,7 +616,7 @@ BOTH   CLEAN-ROOM TEST: fresh clone, fresh volumes, docker compose up,
 **Checkpoint:** a stranger could clone the repo and reproduce your
 numbers from the README alone.
 
-### Deadline 10 - Cross-Presentation & Demo
+### Deadline 10 - Cross-Presentation & Demo  ✅ MET (session 21)
 
 ``` text
 BOTH   A presents B's modules (rooms, courses, waitlist, harness) as if
@@ -612,6 +633,21 @@ BOTH   A presents B's modules (rooms, courses, waitlist, harness) as if
        Demo rehearsal: 5 minutes, ending on Benchmark 2.
        Final README pass. LaTeX resume bullet.
 ```
+
+**Checkpoint:** each of us can defend the other's modules, and the places
+we could not are written down. All of it is in `CROSS_PRESENTATION.md` —
+the two presentations with their corrections (§1, §2), both independent
+answers to each of the four questions (§3), the rehearsed five-minute
+demo (§4), the résumé bullet (§5), and the close (§6).
+
+One reassignment, recorded rather than smoothed over: **B could not
+present the promotion transaction, because B wrote it.** This plan
+assigns promotion to A and the endpoints to B; in the event, B wrote
+promotion in session 17 because A's column had not started and Deadline 7
+could not close. A presented it instead, which is also the right way
+round on the merits — A read it without having written it. The plan is
+not amended, because editing it to match what happened would delete the
+only evidence that it did not.
 
 ------------------------------------------------------------------------
 

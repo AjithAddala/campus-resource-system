@@ -3945,3 +3945,171 @@ prediction is now measured rather than assumed — which matters, because
 every benchmark number in the README rests on that harness genuinely
 overlapping its requests.
 
+
+---
+
+# Deadline 10 — the cross-presentation, and what it measured
+
+The presentations themselves, with every correction kept in place, are in
+`CROSS_PRESENTATION.md`. This entry is the part that belongs here: the
+decisions the exercise forced, and the one measurement that came back
+different.
+
+## The finding: we were wrong about what we had read, never about what we had measured
+
+Both presentations were scored, and the errors do not sit where effort
+sat. They sit exactly where *measurement* was absent.
+
+``` text
+A on B's modules            wrong on FOR SHARE, wrong on what enforces
+                            room overlap, wrong on WAITLISTED, wrong on
+                            stored positions, wrong on "500 concurrent"
+A on courses                RIGHT, in detail -- populate_existing(), which
+                            A found at Deadline 4 by losing a deadline to it
+B on A's modules            presented the Deadline 1 role-in-the-claim
+                            tradeoff that Deadline 3 reversed; missed the
+                            SAVEPOINT; missed the hash() salt trap
+B on the GPU transaction    RIGHT, all four steps and their independence --
+                            the transaction B had raced from the outside
+                            in four benchmarks
+```
+
+**Neither of us was wrong about a mechanism we had personally measured.**
+Every correction is about a mechanism one of us had only read.
+
+The sharpest instance is A on promotion. A had reviewed that transaction
+in session 18 closely enough to find a **reachable bug** in it — the
+seat-and-a-queue-place inconsistency — and still credited the offering
+lock for preventing double-promotion. It does not. `SKIP LOCKED`
+prevents it, and the offering lock protects the *counter*; that is
+Benchmark 4's finding and it is the one thing about that function no
+amount of re-reading the source can tell you. Reading it carefully enough
+to find a bug was not enough to get the mechanism right.
+
+This is the same lesson as Deadline 5's and it arrives from a new
+direction. There, a regression test written the intuitive way passed
+against the broken build. Here, a careful reading produced a confident
+and wrong attribution. **In both cases the only thing that separated true
+from plausible was running it.**
+
+## Decision: A presents promotion, and the plan is not amended
+
+`EXECUTION_PLAN.md` assigns promotion to A. B wrote it, in session 17,
+because A's column had not started and Deadline 7 could not close.
+Deadline 10 as written would therefore have had B present B's own code,
+which measures nothing.
+
+**Reassigned for the exercise; the plan left alone.** The plan records
+who *should* have written it and the log records who *did*, and editing
+the first to agree with the second deletes the only evidence of the gap.
+This is the second time this project has chosen to leave a document
+disagreeing with events on purpose — the first was refusing to let three
+dated sessions imply three met deadlines.
+
+## Decision: the countersignature is a re-run, not a reading
+
+Deadline 8 and Deadline 9's BOTH columns were executed solo by A. B
+signed both, and the form matters: **B re-derived the error-code audit
+from the AST and re-ran all four benchmarks on both builds from a real
+clone**, rather than reading A's numbers and agreeing with them.
+
+A countersignature that is a reading is worth nothing here, because the
+failure mode this project has actually suffered is not arithmetic — it is
+a number measured under conditions the document does not state. Only a
+re-run under the documented conditions can catch that, and it did.
+
+## The one number that did not reproduce, and the rule it yields
+
+``` text
+                                  session 20 (fresh tree)   session 21 (real clone)
+--------------------------------------------------------------------------------
+B1 broken, oversold trials        5/5                       5/5
+B1 broken, seats sold             500 of 50, every trial    500 of 50, every trial
+B1 broken, enrolled_count         14 - 21                   15 - 26     <- differs
+B2 broken                         25/25, held {4: 25}       25/25, held {4: 25}
+B4 broken 8v3                     {3:15} / {(7,3):15}       {3:15} / {(7,3):15}
+B4 column 3                       0.10s                     0.06s
+all fixed columns                 as published              as published
+```
+
+Nineteen of twenty. The exception is a **range**, and that is the point:
+`enrolled_count` under a lost-update storm is not a property of the
+build, it is the residue of whichever interleaving happened. We published
+one run's spread as though it characterised the failure.
+
+**The rule from Deadline 9 was:** a number goes in the README only from a
+run of the exact command the README prints. **Deadline 10 adds:** and a
+*range* needs more than one run before it is written as a range. A single
+run gives you a point, not an interval, however many trials are inside
+it.
+
+Corrected in the README by stating both runs rather than replacing one
+with the other — the two together are the honest description, and they
+also make the actual claim clearer: **5/5 oversold and 500-of-50 are
+stable, and only the counter's landing point moves.** The stable half was
+always the damning half.
+
+## The Deadline 9 qualification is discharged
+
+Session 20's clean room was assembled from `git ls-files` because the
+tree was uncommitted — verified *content*, unverified *repository*. The
+commit landed, and the quickstart ran from an actual `git clone` into a
+scratch directory against a new volume, with its own `JWT_SECRET`:
+
+``` text
+git clone                87 files; README and scripts/_db.py present
+alembic upgrade head     5 revisions -> 1ca8b85b7626
+scripts/seed.py          exit 0
+9 gate scripts           ALL exit 0
+pytest tests/ -v         6 passed, 0 skipped, asyncio-0.25.0, STRICT
+4 benchmarks, both builds  as tabulated above
+```
+
+Worth stating plainly because it was the risk: **a stranger cloning this
+repository now gets a README, nine gate scripts that import cleanly, and
+four benchmarks that reproduce.** Before the commit they got none of
+those, and the clean-room test that "passed" could not have caught it.
+
+## Decision: item 11 ships open
+
+Item 11 — the two-session probe says the GPU path's `FOR UPDATE` read is
+stale without `populate_existing()`, and the 12-racer capacity race says
+the invariant holds without it — is the oldest item in the project, open
+since session 10, and it closes **unresolved**.
+
+The decision at Deadline 10 was whether to keep it open or quietly drop
+it, since nothing depends on it and no benchmark fails. **Kept open, and
+promoted into the README's known limits**, where it had not been. The
+argument for dropping it is that we cannot make it fail; the argument
+against is that "we could not make it fail today" is not the same claim
+as "the read is correct", and this project's entire thesis is that those
+two are different sentences. Dropping it would contradict the thing we
+are claiming to have learned.
+
+## Decision: the demo never shows Benchmark 1
+
+Benchmark 1 is the most visually dramatic result — 500 students in a
+50-seat section — and it is unusable on stage. Measured on the clone
+stack: **8-9 seconds median per request**, five trials of 500. Over a
+minute of scrolling.
+
+So the five-minute demo is built **backwards from Benchmark 2**, which is
+25 trials in well under a minute and is also the argument the project is
+actually about. Benchmark 1's result goes on a slide. The full script,
+with the rehearsal notes, is `CROSS_PRESENTATION.md` §4.
+
+The rehearsal produced one rule worth keeping beyond this project:
+**nothing that requires a rebuild happens on stage.** Both `.env` states
+are prepared and both containers recreated before the demo starts; the
+live portion is two commands that print a number.
+
+## Decision: what the résumé bullet leaves out
+
+No throughput number, no latency number, no line count, no endpoint
+count. The bullet leads on **"three independent serialization points"**
+and on **"building each build broken first"**, because those are the two
+phrases most likely to earn a follow-up question, and the follow-ups are
+the strongest material we have.
+
+A throughput number would be the opposite: we never optimised for it, so
+it invites a question whose honest answer is "nothing".

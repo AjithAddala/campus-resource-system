@@ -110,7 +110,11 @@ nothing — rebuild rather than believe it.
 
 Everything on this page — the quickstart, the nine gates, the harness
 suite, and both columns of all four benchmark tables — was run end to end
-from a fresh clone against fresh volumes before it was written down.
+against fresh volumes, and then **re-run from a real `git clone` at
+Deadline 10** with nothing cached, nothing pre-migrated and no arguments
+remembered. Nineteen of the twenty published numbers reproduced exactly;
+the twentieth is flagged where it appears, in Benchmark 1's broken
+column. See `CROSS_PRESENTATION.md` §6.2 for that run.
 
 ---
 
@@ -133,12 +137,14 @@ other logic — in particular `populate_existing()` stays, so the broken
 builds read a **fresh** value and still corrupt. The bug is never a stale
 read; it is a correct read of a number nothing was holding still.
 
-**Every number below — both columns — was measured in a single
-clean-room session**: fresh clone, fresh volumes, `docker compose up -d
---build`, migrate, seed, then each benchmark at the exact command printed
-beside it and with no arguments. The broken columns were re-measured by
-setting the flag above and changing nothing else. Zero `5xx` or transport
-errors in any fixed-build run.
+**Every number below — both columns — was measured in a clean-room
+session**: fresh volumes, `docker compose up -d --build`, migrate, seed,
+then each benchmark at the exact command printed beside it and with no
+arguments. The broken columns were re-measured by setting the flag above
+and changing nothing else. Zero `5xx` or transport errors in any
+fixed-build run. **All of it was then re-run from a real `git clone`** at
+Deadline 10, which reproduced every number below except the one noted in
+Benchmark 1's broken column.
 
 Because the commands take no arguments, the trial counts here are the
 benchmarks' own defaults — 5, 25, 15 and 15 — and a stranger running them
@@ -171,8 +177,16 @@ in flight. The broken column is that same command against the unlocked
 build, and it is worse than the Deadline 5 measurement it replaces:
 **all five trials seated all 500 students in a 50-seat section** — 500 ×
 `201`, not a single `CAPACITY_EXHAUSTED` — while `enrolled_count`
-recorded between 14 and 21 of them. The counter is not just wrong, it is
-wrong in the *reassuring* direction: a 50-seat section reporting 21 seats
+recorded a low double-digit number of them: **14 to 21** in the
+clean-room run, **15 to 26** when the same command was re-run from a
+fresh clone at Deadline 10. That spread is the one number on this page
+that did not reproduce as written, and the correction is the same rule
+twice over: a range needs more than one run before it is published as a
+range. The 5/5 oversold and the 500-of-50 are stable across both runs;
+only the counter's landing point moves.
+
+The counter is not just wrong, it is wrong in the *reassuring*
+direction: a 50-seat section calmly reporting fifteen or twenty seats
 filled while holding 500 enrollments. Lost updates, every transaction
 incrementing the same stale number.
 
@@ -808,6 +822,18 @@ Three things that are easy to get wrong here and cost us time:
   lock and is what has to be right.
 - **There is no `POST /courses` or `POST /offerings`.** Offerings are
   created by the seed script and by the gate scripts directly.
+- **One unresolved observation, carried openly to the end.** On the GPU
+  path, a two-session probe shows a `FOR UPDATE` read returning stale
+  attributes without `populate_existing()` — and the 12-racer capacity
+  race does *not* reproduce it: removing the call still gives a correct
+  8/8, with `allocated` matching `SUM(active)` exactly. Both were run
+  more than once and **they cannot both mean what they appear to.** We
+  never established which is misleading us. The keyword stays, because
+  relying on a read a probe says is wrong — to protect an invariant that
+  merely happens to hold — is not a position we can defend. In `register`
+  the same line is a measured fix (20 concurrent registrations for 5
+  seats, counter landing on 3); here it is a precaution, and the
+  difference is stated rather than blurred. `CROSS_PRESENTATION.md` §6.3.
 
 ### Designed, not implemented
 
@@ -855,6 +881,7 @@ which is what makes the guarantees atomic.
 |---|---|
 | `DECISIONS.md` | what we tried, what we measured, what we chose — including every reversal |
 | `ARCHITECTURE_AND_WORKFLOWS.md` | the system as built, in detail |
+| `CROSS_PRESENTATION.md` | each of us defending the other's modules, and being corrected — plus the fresh-clone verification and what ships open |
 | `EXECUTION_PLAN.md` | the ten deadlines and what "met" required |
 | `WORK_LOG.md` | when work actually happened, and what it cost |
 | `INIT_PLAN.md` | the original proposal, synced to the schema at head |
